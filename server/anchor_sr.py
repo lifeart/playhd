@@ -315,3 +315,97 @@ def build_anchor_cache_prescan(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive",
         "t_scan_s": round(t_scan, 4), "t_build_s": round(time.perf_counter() - t0, 4),
     }
     return cache, info
+
+
+# --------------------------------------------------------------------------- #
+# R3-E3: HF-only temporal-EMA soft-occlusion fallback (default-OFF, output-only). REPLACES the hard
+# patch_high_fallback SR-patch on the instant path. Per non-anchor frame keep ONE HD-float EMA of
+# (sr - bicubic) [reset at every I-frame / scene-cut / chunk start] and blend
+#   R[i]['recon'] = (1-a)*recon + a*(bicubic + ema_HF),   a = gain*feather(mask)*conf
+# -> low-freq stays fresh (tOF-safe), only flickery HF is temporally smoothed. Escapes the
+# high-motion tOF<->fallback% frontier (eff-bic 7.70->6.35% at tOF +2.0% vs the hard switch's +20%;
+# verified experiments/r3_e3_softocc_wire). Output-only: runs AFTER reconstruct, never feeds R[]'s
+# reference role (GOTCHA #16). Cost ~1 compact-SR call per non-anchor frame -> a quality knob, not
+# real-time; bound with motion_gate. Returns patch_high_fallback-compatible stats keys.
+# --------------------------------------------------------------------------- #
+_SOFTOCC_CONF_LO, _SOFTOCC_CONF_HI = 6.0, 26.0   # reactive-residual confidence ramp
+
+
+def softocc_reset_indices(frames, extra_cuts=()):
+    """Indices where the HF-EMA MUST reset: chunk start (0) + every I-frame + any scene cut.
+    A missed reset -> pre-cut HF bleeds across = cross-cut ghost (verified 4.6-RMS in R3-E3)."""
+    return {0} | {i for i in range(len(frames)) if frames[i][0] == "I"} | set(extra_cuts)
+
+
+def _softocc_feather(mask_bool, k):
+    if k < 3:
+        return mask_bool.astype(np.float32)
+    k = int(k) | 1
+    return cv2.GaussianBlur(mask_bool.astype(np.float32), (k, k), 0)
+
+
+def _softocc_mean_mv(mvs, h_lr, w_lr):
+    if mvs is None or len(mvs) == 0:
+        return 0.0
+    fx, fy = derisk.build_lr_flow(mvs, h_lr, w_lr, want="all")
+    mag = np.sqrt(fx * fx + fy * fy)
+    return float(np.nanmean(mag)) if np.isfinite(mag).any() else 0.0
+
+
+def _softocc_conf(frames, i, w_hd, h_hd):
+    """HD confidence-to-use-SR in [0,1] from the reactive residual (the same signal
+    occlusion_mask_lr's reactive term forms). P -> residual vs prev backbone; B/no-MV -> ones."""
+    pt, lr_cur, mvs = frames[i]
+    h_lr, w_lr = lr_cur.shape[:2]
+    prev_bb = max([b for b in derisk.backbone_indices(frames) if b < i], default=None)
+    if pt != "P" or prev_bb is None or mvs is None or len(mvs) == 0:
+        return np.ones((h_hd, w_hd), np.float32)
+    fx, fy = derisk.build_lr_flow(mvs, h_lr, w_lr, want="past")
+    pred = derisk.warp_lr(frames[prev_bb][1], fx, fy).astype(np.float32)
+    react = np.abs(lr_cur.astype(np.float32) - pred).mean(axis=2)
+    c = np.clip((react - _SOFTOCC_CONF_LO) / (_SOFTOCC_CONF_HI - _SOFTOCC_CONF_LO), 0.0, 1.0)
+    c[~np.isfinite(fx)] = 1.0
+    return cv2.resize(c, (w_hd, h_hd), interpolation=cv2.INTER_LINEAR)
+
+
+def softocc_patch(frames, R, w_hd, h_hd, sr_mode, *, anchors, backbone, reset_idx,
+                  gain=0.6, beta=0.85, feather_k=31, occ_mode="reactive", skip=None,
+                  motion_gate=None):
+    """HF-EMA soft-occlusion on the GPU-resident recon chain (drop-in for patch_high_fallback; same
+    return keys). R[i]['recon'] = [1,3,H,W] float device tensor; R[i]['mask'] = HxW bool device
+    tensor (download_output=False). In place, output-only. The EMA advances on every RUN frame
+    (anchors always seed it, reusing the cache's SR -> no extra call); each non-anchor RUN frame
+    costs ONE compact-SR call. `motion_gate` (e.g. 1.0): run only where mean|MV| exceeds it (fewer
+    calls, shallower escape); None = every non-anchor frame (the full verified escape)."""
+    import torch
+    import gpu_ops as G
+    import sr as _srmod
+    h_lr, w_lr = frames[0][1].shape[:2]
+    dev = G.device()
+    skip = set(skip or ()) | set(anchors)
+    ema, blended, n_sr_runs = None, [], 0
+    for i in range(len(frames)):
+        if i in reset_idx:
+            ema = None
+        pt, lr_cur, mvs = frames[i]
+        is_anchor = i in anchors or R[i].get("mask") is None
+        run = is_anchor or motion_gate is None or _softocc_mean_mv(mvs, h_lr, w_lr) > motion_gate
+        if run:
+            bic_t = G.img_to_dev(cv2.resize(lr_cur, (w_hd, h_hd), interpolation=cv2.INTER_CUBIC))
+            hf = G.img_to_dev(_srmod.upscale_to(lr_cur, w_hd, h_hd, model=sr_mode)) - bic_t
+            ema = hf if ema is None else (beta * ema + (1.0 - beta) * hf)
+            if not is_anchor:
+                n_sr_runs += 1
+        if is_anchor or not run or ema is None:
+            continue
+        m = R[i]["mask"]
+        m_np = m.detach().to("cpu").numpy().astype(bool) if torch.is_tensor(m) else np.asarray(m, bool)
+        a_np = np.clip(gain * _softocc_feather(m_np, feather_k) * _softocc_conf(frames, i, w_hd, h_hd),
+                       0.0, 1.0).astype(np.float32)
+        a_t = torch.from_numpy(np.ascontiguousarray(a_np)).to(dev)[None, None]
+        R[i]["recon"] = ((1.0 - a_t) * R[i]["recon"] + a_t * (bic_t + ema)).clamp(0, 255)
+        blended.append(i)
+    n_cache_sr = len(skip)
+    return {"softocc": True, "leaf_upgrades": blended, "n_softocc_sr_runs": n_sr_runs,
+            "n_adaptive_upgrades": len(blended), "n_sr_calls": n_cache_sr + n_sr_runs,
+            "sr_calls_per_frame": round((n_cache_sr + n_sr_runs) / max(1, len(frames)), 4)}

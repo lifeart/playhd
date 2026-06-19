@@ -60,14 +60,17 @@ import background_plate as bp        # noqa: E402  (L2: plate build + heavy SR +
 import layered_pipeline as lp        # noqa: E402  (L3: alpha_to_hd / composite / fg budgets)
 import sr                            # noqa: E402  (compact + x4plus nets)
 
-# R3-E4 matte-source flag. LAYERED_MATTE selects which matte feeds the WHOLE layered path (PASS A
-# plate gates AND PASS B per-frame composite). Default "rvm" keeps the current best-visual demo
-# BYTE-IDENTICAL (Robust Video Matting, CC BY-NC-SA 4.0, NON-COMMERCIAL). "deeplab"/"lraspp" REBIND
-# `matting` to the BSD-3 permissive (COMMERCIAL-OK) seg adapter (R2-E1 + R3-E4: plate matches RVM
-# cov~74%/hole~26%, RVM-parity temporal stability via the display-order alpha-EMA, 0.8-1.0x latency;
-# loses only wispy hair). The adapter re-exports fg_mask_lr/composite/auto_downsample_ratio VERBATIM
-# from matting and implements matte_sequence (PASS A) + matte_frame (PASS B) with the SAME shapes, so
-# this ONE rebind makes every `matting.*` call site consistent.
+# --------------------------------------------------------------------------- #
+# R3-E4 matte-source flag. LAYERED_MATTE selects which matte feeds the WHOLE layered path
+# (PASS A plate gates AND PASS B per-frame composite). Default "rvm" keeps the current
+# best-visual demo BYTE-IDENTICAL (Robust Video Matting, CC BY-NC-SA 4.0, NON-COMMERCIAL).
+# "deeplab"/"lraspp" REBIND `matting` to the BSD-3 permissive (COMMERCIAL-OK) seg adapter
+# (R2-E1 + R3-E4: plate matches RVM cov~75%/hole~25%, RVM-parity temporal stability via the
+# display-order alpha-EMA, 0.8-1.0x latency; loses only wispy hair). The adapter re-exports
+# fg_mask_lr/composite/auto_downsample_ratio VERBATIM from matting and implements
+# matte_sequence (PASS A) + matte_frame (PASS B, the R2-E1 gap) with the SAME shapes, so this
+# ONE rebind makes every `matting.*` call site (downsample_ratio/build_scene_plates/
+# matte_frame_np) consistent. Drop seg_matte_layered.py next to this file (server/).
 LAYERED_MATTE = os.environ.get("LAYERED_MATTE", "rvm").strip().lower()
 LAYERED_MATTE_EMA = float(os.environ.get("LAYERED_MATTE_EMA", "0.5"))
 _SEG_VARIANTS = {"deeplab": "deeplabv3_mobilenetv3", "lraspp": "lraspp_mobilenetv3"}
@@ -183,9 +186,9 @@ def sample_indices(s0, s1, cap=PLATE_SAMPLE_CAP):
 # --------------------------------------------------------------------------- #
 def load_matting_model():
     """Load the layered-path matte model on MPS (CPU fallback). Source = LAYERED_MATTE:
-    "rvm" (default) -> Robust Video Matting (CC BY-NC-SA 4.0, NON-COMMERCIAL; byte-identical to the
-    pre-R3-E4 demo). "deeplab"/"lraspp" -> BSD-3 torchvision person-seg + alpha-EMA (LAYERED_MATTE_EMA)
-    via the seg_matte_layered rebind (COMMERCIAL-OK; R2-E1/R3-E4)."""
+    "rvm" (default) -> Robust Video Matting (CC BY-NC-SA 4.0, NON-COMMERCIAL; byte-identical
+    to the pre-R3-E4 demo). "deeplab"/"lraspp" -> BSD-3 torchvision person-seg + alpha-EMA
+    (LAYERED_MATTE_EMA) via the seg_matte_layered rebind (COMMERCIAL-OK; R2-E1/R3-E4)."""
     if LAYERED_MATTE in _SEG_VARIANTS:
         return matting.load_seg(_device(), _SEG_VARIANTS[LAYERED_MATTE], ema=LAYERED_MATTE_EMA)
     return matting.load_rvm(_device())

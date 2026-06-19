@@ -34,6 +34,17 @@
 >   high-motion adaptive re-anchor / QHD-instant escalation (E2, wrong lever / breaks real-time). On high
 >   motion **tOF↔fallback% are in tension** (bicubic fallback is already tOF-optimal) — the motion-keyed
 >   threshold @0.20 is a documented default-OFF opt-in (halves window-A weak spot, zero cost on talking-head).
+>
+> **UPDATE — research rounds R2 + R3 (see `handoff.md` → "## Research round R2/R3"):**
+> - ✅ **V4 layered seam halo — DONE (R2-E3, `LAYERED_SEAM_FIX`).**
+> - ✅ **Commercial matte — DONE/flag (R3-E4, `LAYERED_MATTE`):** BSD-3 DeepLab-mv3+EMA replaces non-commercial RVM, no plate regression → layered ships commercially. Default `"rvm"` byte-identical.
+> - ✅ **High-motion frontier ESCAPE — DONE/flag (R3-E3, `INSTANT_SOFTOCC`, default-OFF):** HF-only temporal-EMA fallback (eff-bic 7.70→6.35% at +2% tOF). Quality knob (~1 SR/non-anchor frame).
+> - ◻ **MV frame interpolation (R3-E1, GO, ready-to-wire):** optional "smooth 2×" output, +3.6–8.9 dB vs baselines, ~17 ms/inserted-frame. Needs intra-hole-only routing + a scene-cut guard.
+> - 🐞 **#1 OPEN BUG (R3-E2, HIGH):** LAYERED paints the WRONG background over a whole scene when a
+>   similar-luma scene cut is MISSED (LR-consistency 33.8→14.7 dB; tOF is blind to it). Fix: per-frame
+>   plate-validity guard (composite-vs-LR consistency → auto-fallback) + a chroma/structural term in the
+>   cut detector. Other modes unaffected. Quality cliffs: instant on low-light noise (3.6× slower) and on
+>   high motion (tOF 3.18). See `experiments/r3_e2_robustness/REPORT.md`.
 
 Performance + visual-quality "poke", 2026-06-19. Read-only analysis of existing code, the
 documented Step 6/7 profiling, and the shipped `server/outputs/*.mp4`, plus light new

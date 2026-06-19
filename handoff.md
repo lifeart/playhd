@@ -711,6 +711,61 @@ the only honest temporal headline). The escape is **bounded** (only persistent d
 revealed pixels must stay bicubic). Default-OFF, instant-only spec (replaces `patch_high_fallback`'s
 hard SR with a feathered HF-EMA blend; reset the EMA buffer on I-frames/cuts) in the E2 report.
 
+## Research round R3 — 4 parallel Opus experiments (2026-06-20)
+
+Same loop + discipline. Reports in `experiments/r3_*/REPORT.md`. Two new frontiers + two
+"convert-to-shippable" experiments that turn R2's validated-ready findings into landed, tested code.
+
+| # | experiment | verdict | status |
+|---|---|---|---|
+| **R3-E1** | MV-reuse frame interpolation (2× fps) | **GO** | validated, integration sketch ready (not wired) |
+| **R3-E2** | Content-robustness QA sweep (8 clips × 3 modes) | **found a real HIGH bug** | bug documented (top open item) |
+| **R3-E3** | Wire+verify the E2 HF-EMA soft-occlusion | **PASS** | **INTEGRATED** (`INSTANT_SOFTOCC`, default-OFF) |
+| **R3-E4** | Wire+verify the E1 commercial matte | **PASS** | **INTEGRATED** (`LAYERED_MATTE`, default `"rvm"`) |
+
+**R3-E4 — INTEGRATED (commercial matte, flag-gated, default-preserving).** The R2-E1 adapter completed
+with the missing per-frame `matte_frame` (the PASS-B gap) → `server/seg_matte_layered.py`; a
+`LAYERED_MATTE` env flag (default `"rvm"` → byte-identical RVM demo; `"deeplab"`/`"lraspp"` → the
+BSD-3 permissive commercial path) rebinds the `matting` module once so every call site is consistent.
+Verified live: both branches produce valid QHD layered output (plate builds, PASS A + PASS B run); the
+permissive matte's plate matches RVM (cov 73.7% vs 75.1%, hole 26.3% vs 24.9%), and the display-order
+alpha-EMA recovers RVM-parity temporal stability (a|ΔF| 0.0068 vs 0.0065). **Layered can now ship
+commercially.** Production target remains MediaPipe Selfie (Apache-2.0, isolated env per the protobuf
+conflict); DeepLab-mv3+EMA is the runnable same-license-tier pick.
+
+**R3-E3 — INTEGRATED (HF-EMA soft-occlusion, default-OFF, instant-only).** The R2-E2 frontier escape,
+wired into `server/anchor_sr.py` (`softocc_patch` + helpers, replacing the hard `patch_high_fallback`
+SR-patch when `INSTANT_SOFTOCC=True`) + `server/pipeline_api.py` flags. Verified through the real
+`derisk.reconstruct`: window A OFF tOF 0.756 / eff-bic 7.70% → ON 0.771 / 6.35% (the escape reproduces
+exactly), the EMA reset is proven safe (a deliberately-missed reset = a 4.6-RMS decaying cross-cut
+ghost; the reset eliminates it), torch parity 0.18/255 MAE. Lead-verified OFF → instant byte-identical
+(`n_sr_calls=2`); ON → the pass runs (48 SR / 46 blends). It costs ~1 compact-SR call per non-anchor
+frame → a **quality knob, not a real-time default** (DEFAULT-OFF); `SOFTOCC_MOTION_GATE=1.0` bounds the
+cost for a shallower escape.
+
+**R3-E1 — GO, validated, ready to wire (not integrated).** MV-reuse motion-compensated frame
+interpolation: warp each neighbour by the codec MVs we already extract + occlusion-aware (intra-hole)
+blend → synthesize midpoints. Beats frame-dup / linear-blend by **+3.6 to +8.9 dB PSNR / +0.06–0.10
+SSIM**, cuts tOF 2–4× (verified vs exact held-out real frames + visually removes the linear-blend ghost
+on fast motion), at **~17 ms/inserted-frame on MPS** (2 warps + blend, zero SR, zero new flow; ~2.3×
+cheaper than a real frame → 2× output fps for ~+42% compute). Ships as an **optional "smooth 2×"
+output**, NOT free real-time 50 fps (the base recon already saturates one GPU at 25 fps). Two
+ship-blockers: use **intra-hole routing only** (the project's full Ruder/reactive mask over-flags →
+re-introduces ghosting), and a **scene-cut guard** (intra-hole fraction > 0.5 → fall back to
+duplication). Output-only integration sketch (reuse `build_lr_flow` + `gpu_ops.warp_hd`) in the E1 report.
+
+**R3-E2 — robustness sweep: zero crashes across 24 runs, but found a real HIGH bug (TOP OPEN ITEM).**
+**Layered paints the WRONG background over an entire scene when a similar-luma scene cut is missed** —
+`segment_scenes` (luma-only) misses the cut → one temporal-median plate spans two scenes → scene-A
+plate composited over scene-B (LR-consistency collapses 33.8 → 14.7 dB). **tOF is BLIND to it** (the
+wrong plate is temporally stable) — only fidelity-vs-LR caught it. Two more cliffs: **instant collapses
+to per-frame-SR on low-light noise** (95% fallback → 24/24 SR upgrades → 3.6× slower, real-time broken),
+and **instant softens/flickers on high motion** (tOF 3.18 vs 0.39). Plus a per-content
+mode-recommendation + cheap auto-select signals (motion mag / graphic-edge density / plate safety). The
+layered missed-cut corruption is the **#1 robustness fix** — see `experiments/r3_e2_robustness/REPORT.md`
+(fix: a per-frame plate-validity guard cross-checking composite-vs-LR consistency + a chroma/structural
+term in the cut detector). Other modes are unaffected by a missed cut (per-frame source is correct).
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a

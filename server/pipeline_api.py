@@ -119,6 +119,18 @@ INSTANT_TILE_SR = False
 # cv2.resize + a full 9.8 MB HD host->device upload per frame -> kills reconstruct's upload_perframe.
 INSTANT_GPU_CACHE = True
 
+# R3-E3 -- HF-only temporal-EMA soft-occlusion (default OFF). Replaces the hard patch_high_fallback
+# SR-patch with a feathered, temporally-smoothed HF injection that escapes the high-motion
+# tOF<->fallback% frontier (eff-bic 7.70->6.35% at tOF +2.0% vs the hard switch's +20%; verified
+# experiments/r3_e3_softocc_wire). OFF -> byte-identical to today. ON runs ~1 compact-SR call per
+# non-anchor frame (a quality knob, NOT real-time) -> bound with SOFTOCC_MOTION_GATE (None = every
+# frame = full escape; 1.0 = fewer SR calls, shallower escape). Instant-only.
+INSTANT_SOFTOCC = False
+SOFTOCC_GAIN = 0.6
+SOFTOCC_BETA = 0.85
+SOFTOCC_FEATHER = 31
+SOFTOCC_MOTION_GATE = None
+
 SAMPLE_MP4 = os.path.join(_REPO, "sample.mp4")
 OUTPUTS_DIR = os.path.join(_HERE, "outputs")
 UPLOADS_DIR = os.path.join(_HERE, "uploads")
@@ -913,10 +925,21 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     #    leaf is never a reference): SR-patch any B frame's fallback pixels above
                     #    threshold. hole_frac is exact + anchor-invariant -> no extra mask scan.
                     ts = time.perf_counter()
-                    p_info = anchor_sr.patch_high_fallback(
-                        chunk, R, w_hd, h_hd, cfg["sr_mode"],
-                        fallback_thresh=INSTANT_FALLBACK_THRESH, skip=sr_set, tile=INSTANT_TILE_SR,
-                        thresh_fn=tfn)
+                    if INSTANT_SOFTOCC:
+                        # R3-E3: HF-EMA soft-occlusion (escapes the high-motion frontier) instead of
+                        # the hard SR-patch. Output-only; resets the EMA at every I-frame/cut/chunk start.
+                        _anch, _bb = anchor_sr.anchor_indices(chunk)
+                        p_info = anchor_sr.softocc_patch(
+                            chunk, R, w_hd, h_hd, cfg["sr_mode"],
+                            anchors=_anch, backbone=_bb,
+                            reset_idx=anchor_sr.softocc_reset_indices(chunk),
+                            gain=SOFTOCC_GAIN, beta=SOFTOCC_BETA, feather_k=SOFTOCC_FEATHER,
+                            occ_mode=cfg["occ"], skip=sr_set, motion_gate=SOFTOCC_MOTION_GATE)
+                    else:
+                        p_info = anchor_sr.patch_high_fallback(
+                            chunk, R, w_hd, h_hd, cfg["sr_mode"],
+                            fallback_thresh=INSTANT_FALLBACK_THRESH, skip=sr_set,
+                            tile=INSTANT_TILE_SR, thresh_fn=tfn)
                     t_sr += time.perf_counter() - ts
                     n_sr_calls += p_info["n_sr_calls"]
                     n_upgrades += p_info["n_adaptive_upgrades"]
