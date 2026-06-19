@@ -17,6 +17,8 @@ prototype/models/
 # Generated experiment artifacts (regenerable via the scripts)
 out*/
 prototype/out*/
+server/outputs/
+server/uploads/
 *.log
 
 # scratch backups

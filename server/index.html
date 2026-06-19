@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>playhd — upscaler console</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    background: #0e1117; color: #e6edf3; padding: 28px;
+  }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: #8b949e; margin: 0 0 22px; font-size: 13px; }
+  .panel {
+    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
+    padding: 18px 20px; max-width: 880px; margin: 0 auto 18px;
+  }
+  label { display: block; font-weight: 600; margin: 14px 0 6px; font-size: 13px; }
+  select, input[type=number], input[type=file] {
+    width: 100%; padding: 8px 10px; background: #0d1117; color: #e6edf3;
+    border: 1px solid #30363d; border-radius: 6px; font-size: 14px;
+  }
+  .row { display: flex; gap: 16px; }
+  .row > div { flex: 1; }
+  .modes { display: flex; gap: 12px; margin-top: 6px; }
+  .mode {
+    flex: 1; border: 1px solid #30363d; border-radius: 8px; padding: 12px;
+    cursor: pointer; background: #0d1117; transition: border-color .15s, background .15s;
+  }
+  .mode.sel { border-color: #2f81f7; background: #11203a; }
+  .mode .t { font-weight: 700; }
+  .mode .d { color: #8b949e; font-size: 12px; margin-top: 4px; }
+  button {
+    margin-top: 20px; width: 100%; padding: 12px; font-size: 15px; font-weight: 700;
+    background: #238636; color: #fff; border: 0; border-radius: 8px; cursor: pointer;
+  }
+  button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+  #status { margin-top: 14px; font-size: 13px; color: #8b949e; min-height: 18px; }
+  #status.err { color: #f85149; }
+  video { width: 100%; border-radius: 8px; margin-top: 10px; background: #000; }
+  .stats { font-size: 12px; color: #8b949e; margin-top: 10px; white-space: pre-wrap;
+           font-family: ui-monospace, SFMono-Regular, monospace; }
+  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid #30363d;
+          border-top-color: #2f81f7; border-radius: 50%; animation: s .8s linear infinite;
+          vertical-align: -2px; margin-right: 6px; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  small.hint { color: #6e7681; font-weight: 400; }
+</style>
+</head>
+<body>
+  <h1>playhd — server-side video upscaler</h1>
+  <p class="sub">Pick a source, choose a mode, then Process &amp; Play. SD → HD (x4) via motion-propagated SR.</p>
+
+  <div class="panel">
+    <div class="row">
+      <div>
+        <label>Source clip <small class="hint">(server-side)</small></label>
+        <select id="source"></select>
+      </div>
+      <div>
+        <label>…or upload an mp4</label>
+        <input type="file" id="file" accept="video/mp4,.mp4" />
+      </div>
+    </div>
+
+    <label>Quality mode</label>
+    <div class="modes" id="modes"></div>
+
+    <div class="row">
+      <div>
+        <label>Start frame</label>
+        <input type="number" id="start" value="5000" min="0" step="1" />
+      </div>
+      <div>
+        <label>Frames <small class="hint">(window length)</small></label>
+        <input type="number" id="n" value="48" min="2" max="240" step="1" />
+      </div>
+    </div>
+
+    <button id="go">Process &amp; Play</button>
+    <div id="status"></div>
+  </div>
+
+  <div class="panel" id="playerPanel" style="display:none">
+    <video id="player" controls autoplay playsinline></video>
+    <div class="stats" id="stats"></div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let selectedMode = "instant";
+
+async function loadSources() {
+  const r = await fetch("/api/sources");
+  if (!r.ok) { setStatus("failed to load sources", true); return; }
+  const data = await r.json();
+
+  const sel = $("source");
+  sel.innerHTML = "";
+  for (const s of data.sources) {
+    const o = document.createElement("option");
+    o.value = s.name;
+    o.textContent = `${s.name} (${s.size_mb} MB)`;
+    sel.appendChild(o);
+  }
+
+  const modes = $("modes");
+  modes.innerHTML = "";
+  for (const m of data.modes) {
+    const div = document.createElement("div");
+    div.className = "mode" + (m.id === selectedMode ? " sel" : "");
+    div.dataset.id = m.id;
+    div.innerHTML = `<div class="t">${m.label}</div><div class="d">${m.desc}</div>`;
+    div.onclick = () => {
+      selectedMode = m.id;
+      [...modes.children].forEach((c) => c.classList.toggle("sel", c.dataset.id === m.id));
+    };
+    modes.appendChild(div);
+  }
+}
+
+function setStatus(html, isErr) {
+  const s = $("status");
+  s.className = isErr ? "err" : "";
+  s.innerHTML = html;
+}
+
+$("go").onclick = async () => {
+  const btn = $("go");
+  btn.disabled = true;
+  const t0 = performance.now();
+  setStatus(`<span class="spin"></span>Processing in <b>${selectedMode}</b> mode… `
+    + (selectedMode === "quality" ? "(heavy x4plus anchor — this can take a while)" : "(fast path)"));
+
+  const fd = new FormData();
+  fd.append("mode", selectedMode);
+  fd.append("source", $("source").value);
+  fd.append("start", $("start").value);
+  fd.append("n", $("n").value);
+  const f = $("file").files[0];
+  if (f) fd.append("file", f);
+
+  try {
+    const r = await fetch("/api/process", { method: "POST", body: fd });
+    if (!r.ok) {
+      const txt = await r.text();
+      setStatus("Error: " + txt, true);
+      btn.disabled = false;
+      return;
+    }
+    const data = await r.json();
+    const wall = ((performance.now() - t0) / 1000).toFixed(1);
+    setStatus(`Done in ${wall}s wall. Loading player…`);
+
+    $("playerPanel").style.display = "";
+    const v = $("player");
+    v.src = data.url;
+    v.load();
+    v.play().catch(() => {});
+
+    const s = data.stats || {};
+    $("stats").textContent =
+      `source       : ${data.source}\n` +
+      `mode         : ${s.label || s.mode}\n` +
+      `window       : start ${s.start_frame}, ${s.n_frames} frames @ ${s.fps} fps\n` +
+      `resolution   : ${s.src_resolution} -> ${s.out_resolution} (x${s.scale})\n` +
+      `server time  : ${s.t_total_s}s total  (sr ${s.t_sr_s}s, recon ${s.t_recon_s}s, ` +
+      `encode ${s.t_encode_s}s)  = ${s.ms_per_frame} ms/frame`;
+    setStatus(`Done — ${s.out_resolution}, ${s.n_frames} frames in ${s.t_total_s}s server-side.`);
+  } catch (e) {
+    setStatus("Request failed: " + e, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+loadSources();
+</script>
+</body>
+</html>
