@@ -25,6 +25,9 @@ sample.mp4             # real test clip: H.264 640x320 25fps ~34min (~50k frames
 prototype/derisk.py    # the de-risk experiment (self-contained; see prototype/README.md)
 prototype/sr.py        # real SR nets: SRVGGNetCompact/realesr-general-x4v3 (compact) + RRDBNet/RealESRGAN_x4plus (heavy, Step 8), x4, MPS
 prototype/grain.py     # Step 8 per-frame film-grain pass (temporally independent, luma-modulated)
+prototype/region_quality.py # Step 9 Stream-1: per-pixel motion-aware detail gating (WIRED into derisk as --region-aware)
+prototype/anchor_pipeline.py # Step 9 Stream-2 ANALYSIS: heavy-anchor pipelining/buffer scheduler model (standalone)
+prototype/sr_diffusion.py    # Step 9 Stream-3 ANALYSIS: MPS diffusion-SR feasibility probe + loud-fail hook (standalone, NO-GO)
 prototype/detail_drift.py  # Step 8 KEY EXPERIMENT: heavy-anchor detail survival vs distance-from-anchor
 prototype/ab_anchor.py # Step 8 compact-vs-x4plus A/B visual; grain_demo.py = grain before/after + temporal-independence proof
 prototype/anchor_sweep.py   # Step 4 quality-vs-anchor-fraction sweep driver
@@ -239,6 +242,47 @@ NR-sharpness-vs-temporal tradeoff the research warned about. Artifacts: `prototy
 (`detail_drift.png`+`.csv`, `ab_anchor_*`, `grain_{ab,consec,field}.png`), `prototype/{sr.py,
 grain.py,ab_anchor.py,detail_drift.py,grain_demo.py}`, `models/RealESRGAN_x4plus.pth`.
 
+**Step 9 — three parallel quality streams + a seam-verification/integration pass.** Each stream
+was a NEW module importing the shared `derisk.py`/`sr.py` API READ-ONLY; a SEAM-VERIFICATION pass
+then checked every cross-module call (name / arg-shape / return-shape) and INTEGRATED the viable one.
+**Seam result: all interfaces matched — zero caller/handler mismatches** (the parallel-agent failure
+mode did not occur here). region_quality→derisk (`build_lr_flow`(→2-tuple), `build_perframe_cache`,
+`decode_lr_and_mvs`, `_farneback`, `reconstruct`(→`(rows,R)`)), anchor_pipeline→sr
+(`upscale(model=)`, `load_model`, `*_latency_ms`), and sr_diffusion (standalone, mirrors
+`sr.upscale`) all line up; all 3 import clean; `sr_diffusion` is import-safe with diffusion weights
+absent and loud-fails only when actually called.
+(1) **Stream-1 `region_quality.py` — INTEGRATED as `--region-aware`** (default OFF => byte-identical
+regression). Acts on the Step-8 finding (heavy detail propagates on static content, erodes+flickers
+on motion). Wired as an **OUTPUT-ONLY final pass, exactly like grain**: the propagation chain stays
+single-model (heavy); the per-output-frame blend `out = a_hd*recon_heavy + (1-a_hd)*compact_source`
+(a_hd = temporally-stable, widely-feathered motion gate, lo=0.2/hi=1.0/feather=61 LR px from the free
+per-frame MV magnitude; compact_source = the per-frame compact SR) re-paints the OUTPUT copy only and
+**NEVER enters the reference chain `R[]`**. On-GPU it is a single `torch.lerp` (~1–2 ms) in
+`reconstruct_torch` (new optional `region_gate` arg on `reconstruct`/`reconstruct_torch`); the numpy
+twin reuses `region_quality.blend_region_aware` (no math duplicated). RESULT (talking-head, start
+5000, 48f, x4): region-aware **recovers 95% of the heavy STATIC-region detail** (var-Lap 118.4 vs
+x4plus 119.5, compact 96.2) while **overall tOF stays at the compact floor** (0.211 vs compact 0.209,
+far below x4plus 0.231) — static detail without the uniform-x4plus flicker. Matches
+`region_quality.py` standalone `ra-wide` (static 118.4, recovers 95%); the standalone's lower overall
+tOF (0.201) is from blending a fully-propagated compact chain vs the integration's cheaper per-frame
+compact source (per the hook). torch==numpy within tolerance (region-aware recon PSNR 53.3 dB;
+`torch.lerp` == numpy `blend_region_aware` 55.2 dB). Synthetic default-off byte-identical
+(41.08→31.45, 23/23, 5.84%, 0.091/0.106). Artifacts: `region_quality.py`, `out_region/`,
+`out_region_e2e/`.
+(2) **Stream-2 `anchor_pipeline.py` — ANALYSIS ARTIFACT (pipelining = buffered-only).** Lookahead/
+buffer scheduler model + threaded demo for the ~2.2 s x4plus anchor. VERDICT (single Apple-Silicon
+GPU): you can **buffer the LATENCY** (B_min = ceil(L*F) ≈ L s of pre-rendered output) **but cannot
+beat the THROUGHPUT ceiling** `r + L/K ≤ 1/F` — recon already eats most of the 40 ms budget, so live
+x4plus at 25 fps is NOT feasible at a useful anchor interval on one GPU. Feasible only via a dedicated
+anchor accelerator (2nd GPU/ANE), F=15 + reactive recon, or a cheaper heavy anchor. Standalone (no
+derisk edits). Artifacts: `anchor_pipeline.py`, `out_pipeline/`.
+(3) **Stream-3 `sr_diffusion.py` — ANALYSIS ARTIFACT (diffusion NO-GO on this box).** MPS feasibility
+probe of the SD2/OSEDiff one-step UNet+VAE-decode per-tile graph (random weights → valid timing/op-
+coverage/memory, no download) + an import-safe, **loud-on-failure** real-anchor hook (raises, never
+silently no-ops). No real diffusion SR is wired on this box (basicsr + multi-GB gated weights + disk),
+so `--sr diffusion` is NO-GO; the probe is retained for the record. Standalone. Artifacts:
+`sr_diffusion.py`.
+
 ## GOTCHAS (read before touching anything)
 
 1. **System `ffmpeg` is BROKEN** on this machine: `dyld: Library not loaded:
@@ -330,6 +374,15 @@ grain.py,ab_anchor.py,detail_drift.py,grain_demo.py}`, `models/RealESRGAN_x4plus
     (warps near-identity), high-motion loses it in ~1 frame (warp-blur + occlusion → bicubic). Pick
     the all-P chain by STARTING ON the I-frame (`--start-frame` exactly on an I) so the only anchor
     is dist 0 — `start 5031` gave `PIPPP…` (a 2nd anchor at the I), `start 5032` gives clean `IPPP…`.
+
+16. **`--region-aware` is an OUTPUT-ONLY pass — never feed the blend into `R[]`** (Step 9). Like
+    grain, the region-aware blend `a_hd*recon_heavy + (1-a_hd)*compact` is applied AFTER both
+    reconstruction passes complete (the heavy recon's reference role is over), into the OUTPUT copy
+    only. If you blend it into `R[i]["recon"]` *before* a later frame warps from it, the
+    compact/heavy seam propagates and the gate stops being a pure per-output detail policy. In
+    `reconstruct_torch` the lerp writes a FRESH tensor, leaving the resident GPU reference untouched.
+    Also: `--region-aware` REQUIRES `--sr realesrgan-x4plus` (the propagation chain is the single
+    heavy model; the compact source is a separate per-frame compact SR). Default OFF = byte-identical.
 
 ## Known limitations / done since (Steps 1–4) and still NOT done
 

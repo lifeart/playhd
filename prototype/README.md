@@ -42,6 +42,7 @@ python3 anchor_sweep.py
 | `--occ {naive,full,reactive,adaptive}` | occlusion mask: `naive`=intra blocks only; `full`=+softmax-splat fwd-bwd+reactive; `reactive`=intra+reactive only (drops the fwd-bwd splat); `adaptive`=reactive + fwd-bwd only on motion-stressed directions (Step 7, `ADAPTIVE_TAU=0.06`) |
 | `--sr {bicubic,realesrgan,realesrgan-x4plus}` | anchor/fallback upscaler. **Default `bicubic` is byte-identical to prior synthetic runs.** `realesrgan` = `realesr-general-x4v3` (compact, 1.21M params, ~130 ms/frame MPS); `realesrgan-x4plus` = `RealESRGAN_x4plus` (RRDBNet x23, 16.7M params, **heavy perceptual anchor, Step 8**, ~2.1–2.25 s/frame MPS). All x4 (use `--scale 4`); weights auto-download to `models/`, run on MPS |
 | `--grain {off,low,med,high}` | per-frame film-grain final pass (**Step 8**, default `off`). Regenerated per output frame from the frame index (temporally independent), spatially-correlated Gaussian template, luma-modulated via a LUT, added to luma in gamma space AFTER reconstruction. Never warped / propagated / fed to references |
+| `--region-aware` | **Step 9 (Stream-1)** OUTPUT-ONLY region-aware detail gating (default OFF => byte-identical regression). **Requires `--sr realesrgan-x4plus`.** The propagation chain stays single-model (heavy); the final per-output-frame blend is `out = a_hd*recon_heavy + (1-a_hd)*compact_source`, where `a_hd` is a temporally-stable, widely-feathered motion gate (lo=0.2, hi=1.0, feather=61 LR px) from the free per-frame MV magnitude, and `compact_source` is the per-frame compact SR. Static regions keep the heavy detail (propagates well); dynamic regions fall to the temporally-stable compact. Applied to the OUTPUT copy only (single `torch.lerp` on the GPU path), never into the propagation reference chain `R[]`. Reuses `region_quality.py` |
 | `--reanchor {none,interval:K,adaptive}` | anchor policy: `none`=I-frames only; `interval:K`=every K-th backbone frame; `adaptive`=greedy re-anchoring |
 | `--quality-margin` | (adaptive `--adapt-metric psnr`) dB floor on PSNR(prop, per-frame-SR) |
 | `--fallback-budget` / `--adapt-metric {fallback,psnr}` | adaptive driver knobs (default `fallback` is content-fair) |
@@ -238,6 +239,57 @@ compact 0.33) — the NR/sharpness gain trades against temporal stability, as th
 ~1–2). No diffusion anchor tried (MPS-unverified — future work). Artifacts: `out_quality/`,
 `sr.py` (RRDBNet), `grain.py`, `ab_anchor.py`, `detail_drift.py`, `grain_demo.py`.
 
+## Result — Step 9 (3 parallel quality streams: region-aware INTEGRATED; pipelining; diffusion)
+
+Three parallel streams each acted on the Step-8 motion-dependent-detail finding. Each was a NEW
+module importing the shared code READ-ONLY; a seam-verification + integration pass then wired the
+viable one and verified every interface (all seams matched — no caller/handler mismatches).
+
+**(1) Stream-1 `region_quality.py` — INTEGRATED as `--region-aware`.** The Step-8 finding: a heavy
+x4plus anchor adds real HF detail that PROPAGATES well on static content but is eroded in ~1 frame
+on motion AND flickers (uniform x4plus tOF 0.66 vs compact 0.33). So gate detail PER PIXEL by a
+motion map from the (free) codec MVs: static -> keep heavy, dynamic -> temporally-stable compact.
+Wired as an **OUTPUT-ONLY final pass** (like grain): the propagation chain stays single-model
+(heavy); the per-output-frame blend `out = a_hd*recon_heavy + (1-a_hd)*compact_source` is applied
+to the OUTPUT copy only — a single `torch.lerp` (~1–2 ms) in `reconstruct_torch`, the numpy twin
+reusing `region_quality.blend_region_aware`. `a_hd` is the temporally-stable, widely-feathered
+(lo=0.2/hi=1.0/feather=61 LR px) gate; `compact_source` is the per-frame compact SR. **It NEVER
+enters the reference chain `R[]`** (verified). Default OFF keeps the synthetic regression
+**byte-identical** (41.08→31.45, 23/23, 5.84%, 0.091/0.106). Talking-head window (start 5000, 48f,
+x4), region-split sharpness (var-Laplacian) / overall tOF:
+
+| method | STATIC sharp | OVERALL tOF |
+|---|---|---|
+| uniform compact | 96.2 | 0.209 |
+| uniform x4plus (heavy) | 119.5 | 0.231 |
+| **region-aware** | **118.4** | **0.211** |
+
+Region-aware **recovers 95% of the heavy static-region detail** (118.4 vs heavy 119.5, ≈ x4plus
+sharpness) while keeping **overall tOF at the compact floor** (0.211 vs compact 0.209, far below
+x4plus's 0.231) — i.e. the static-detail benefit without the uniform-x4plus flicker. These match
+`region_quality.py`'s standalone `ra-wide` result (static 118.4, recovers 95%); the standalone's
+slightly lower overall tOF (0.201) comes from blending a fully-propagated compact chain, whereas
+the integration blends the cheaper already-computed per-frame compact SR per the hook. torch matches
+numpy within the standing tolerance (region-aware recon PSNR 53.3 dB; `torch.lerp` == the numpy
+`blend_region_aware` at 55.2 dB). Artifacts: `region_quality.py`, `out_region/`, `out_region_e2e/`.
+
+**(2) Stream-2 `anchor_pipeline.py` — analysis artifact (buffered-only verdict).** A lookahead/
+pipelining scheduler MODEL + threaded producer/consumer demo for the ~2.2 s x4plus anchor. Verdict
+(single Apple-Silicon GPU): you can **buffer the LATENCY** (`B_min = ceil(L*F)` ≈ L seconds of
+pre-rendered output) **but cannot beat the THROUGHPUT ceiling** `r + L/K ≤ 1/F` — per-frame recon
+already consumes most of the 40 ms budget, so live x4plus at 25 fps is **not feasible at a useful
+anchor interval** on one GPU. Feasible only with a dedicated anchor accelerator (2nd GPU/ANE,
+K_min = L*F ≈ GOP), F=15 fps + reactive recon, or a cheaper heavy anchor. Kept standalone (no
+derisk edits). Artifacts: `anchor_pipeline.py`, `out_pipeline/`.
+
+**(3) Stream-3 `sr_diffusion.py` — analysis artifact (diffusion NO-GO on this box).** A feasibility
+spike for a one-step real-world diffusion SR anchor (OSEDiff/SD2): an MPS probe of the exact SD2.1
+UNet + VAE-decode per-tile compute graph (random weights = valid timing/op-coverage/memory, no
+multi-GB download), plus a real-anchor hook that **raises loudly if no real model is wired** (never
+a silent no-op). On this box no real diffusion SR is wired (basicsr dep + multi-GB gated weights +
+disk), so it is import-safe but `--sr diffusion` is **NO-GO**; the probe quantifies the MPS cost for
+the record. Use `--sr realesrgan-x4plus` for the heavy anchor. Artifacts: `sr_diffusion.py`.
+
 ## Known limitations / next
 
 - ✅ **DONE — upscaling quality** (Step 8): heavy `realesrgan-x4plus` anchor + per-frame film grain
@@ -275,6 +327,9 @@ What every output dir / scratch script holds. **Keep all `out*/` dirs, the helpe
 | `out_anchor_sweep/` | 4 | `anchor_curve.png`, `sweep_A.csv`, `sweep_C.csv`, `summary.txt` — the quality-vs-anchor-fraction curve |
 | `out_quality/` | 8 | `ab_anchor_*` (compact vs x4plus A/B crops), `detail_drift.png` + `detail_drift.csv` (heavy-anchor detail-survival vs distance), `grain_ab.png` / `grain_consec.png` / `grain_field.png` (film-grain visuals) |
 | `out_x4plus_e2e/` | 8 | end-to-end x4plus + torch-backend + grain run on a real window (no-crash evidence) |
+| `out_region/` | 9 | **Stream-1** standalone region-aware run: `region_split.png`/`.csv` (sharpness+tOF by region), `crops_*`, `motionmap_*`, `region_masks.png`, `mean_motion.png`; `cache/` = memoized heavy/compact SR `.npy` |
+| `out_region_e2e/` | 9 | end-to-end `--region-aware --backend torch` run on the real talking-head window (integration no-crash evidence) |
+| `out_pipeline/` | 9 | **Stream-2** scheduler model: `sweep.csv`, `pipeline_overview.png`, `summary.txt` (buffered-only verdict), `threaded_demo.txt` |
 | `out_regcheck/`, `out_regcheck2/`, `out_regcheck_step8*/` | verify | synthetic regression-guard runs (confirm each step's edits stayed byte-identical) |
 
 ### Helper scripts
@@ -287,6 +342,9 @@ What every output dir / scratch script holds. **Keep all `out*/` dirs, the helpe
 | `ab_anchor.py` | **Step 8** — A/B visual of compact vs x4plus on a real anchor frame → `out_quality/ab_anchor_*` |
 | `detail_drift.py` | **Step 8** KEY EXPERIMENT — heavy-anchor detail survival vs distance-from-anchor (pure warp propagation, both models, two windows) → `out_quality/detail_drift.png` + `.csv` |
 | `grain_demo.py` | **Step 8** — film-grain before/after + 3-consecutive-frame temporal-independence proof on real recon frames → `out_quality/grain_*` |
+| `region_quality.py` | **Step 9 / Stream-1** — per-pixel motion-aware detail gating (the module wired into derisk as `--region-aware`). `region_masks`/`window_static_weight`/`blend_region_aware` are reused by derisk; standalone `main` measures region-split sharpness+tOF → `out_region/` |
+| `anchor_pipeline.py` | **Step 9 / Stream-2** ANALYSIS ARTIFACT — heavy-anchor lookahead/pipelining scheduler model + threaded demo (buffered-LATENCY-yes / throughput-ceiling-no verdict). Standalone, not wired into derisk → `out_pipeline/` |
+| `sr_diffusion.py` | **Step 9 / Stream-3** ANALYSIS ARTIFACT — MPS feasibility probe for a one-step diffusion SR anchor + import-safe, loud-on-failure hook. Diffusion NO-GO on this box (no real model wired); not exposed as `--sr` |
 | `anchor_sweep.py` | Step 4 driver — sweeps anchor density on windows A & C, caches SR once per window (warp-only sweep), writes `out_anchor_sweep/` |
 | `before_fallback.py` | recomputes the **pre-fix (Step 1)** reconstruction exactly, to get a clean BEFORE for fallback% and LR-consistency |
 | `probe_gop.py` | probes a real clip's GOP structure, MV `source` signs, `|source|` range, and duplicate frames |

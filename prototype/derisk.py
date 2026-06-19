@@ -487,8 +487,21 @@ def backbone_indices(frames):
     return [i for i, (pt, _, _) in enumerate(frames) if pt in ("I", "P")]
 
 
+def _apply_region_gate_np(R, N, region_gate, scale):
+    """Stream-1 OUTPUT-ONLY region-aware blend (numpy): out = a_hd*recon_heavy + (1-a_hd)*compact.
+    Applied to R[i]['recon'] AFTER both reconstruction passes are complete -- the propagation
+    chain has already consumed the un-blended heavy recon as its reference, so this NEVER feeds
+    back into R[]'s reference role (exactly like the grain final pass). a_hd is region_quality's
+    temporally-stable, widely-feathered motion gate; compact[i] is the per-frame COMPACT SR (the
+    same fallback-source family). Reuses region_quality.blend_region_aware -- no math duplicated."""
+    import region_quality as _rq
+    a_lr, compact = region_gate["a_lr"], region_gate["compact"]
+    for i in range(N):
+        R[i]["recon"] = _rq.blend_region_aware(R[i]["recon"], compact[i], a_lr, scale)
+
+
 def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache, anchor_set,
-                backend="numpy", collect_metrics=True, download_output=True):
+                backend="numpy", collect_metrics=True, download_output=True, region_gate=None):
     """Pure backbone+B reconstruction for an arbitrary ANCHOR SET (Step 4 re-anchoring).
 
     `backend`: 'numpy' (default, the regression guard) or 'torch' (the MPS fast path -- the
@@ -513,7 +526,7 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
     if backend == "torch":
         return reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode,
                                  perframe_cache, anchor_set, collect_metrics=collect_metrics,
-                                 download_output=download_output)
+                                 download_output=download_output, region_gate=region_gate)
     h_lr, w_lr = frames[0][1].shape[:2]
     w_hd, h_hd = w_lr * scale, h_lr * scale
     has_true = hd_frames is not None
@@ -609,6 +622,10 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
         R[i] = dict(recon=recon, oracle=oracle, perframe=perframe,
                     mask=none, hole_frac=float(none.mean()), dist=i, type=pt, is_anchor=False)
 
+    # ----------------- Stream-1 region-aware OUTPUT-ONLY final pass (never into R[] refs) -----
+    if region_gate is not None:
+        _apply_region_gate_np(R, N, region_gate, scale)
+
     # ----------------- assemble rows (display order) -----------------
     # collect_metrics=False (timing-only) skips the expensive per-frame SSIM/PSNR/LR-consistency
     # so a clean propagation-path wall-clock can be measured without metric overhead.
@@ -644,7 +661,7 @@ def _assemble_rows(frames, hd_frames, R, N, has_true):
 
 
 def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache, anchor_set,
-                      collect_metrics=True, download_output=True):
+                      collect_metrics=True, download_output=True, region_gate=None):
     """Torch/MPS fast-path twin of reconstruct(): identical structure & semantics, but the
     warp/mask/blend run on-device and the I/P recon chain stays RESIDENT on the GPU across
     frames (no per-frame host<->device round-trips for the HD references -- a warped recon is
@@ -778,6 +795,17 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
         R[i] = dict(recon=recon, oracle=oracle, perframe=pf, mask=none,
                     hole_frac=hf, dist=i, type=pt, is_anchor=False)
 
+    # ----------------- Stream-1 region-aware gate (HD weight, built ONCE: temporally stable) ---
+    # The gate a_lr is the SAME map for every frame (window_static_weight), so upsample it to HD
+    # once and reuse it. Bilinear upsample == region_quality.blend_region_aware's cv2.INTER_LINEAR
+    # (matches within GPU-float tolerance, the standing gpu_ops convention).
+    gate_hd = None
+    if region_gate is not None:
+        import torch.nn.functional as _F
+        g = torch.from_numpy(np.ascontiguousarray(region_gate["a_lr"])).to(dev)
+        gate_hd = _F.interpolate(g[None, None], scale_factor=scale, mode="bilinear",
+                                 align_corners=False)            # [1,1,Hhd,Whd], a=1->heavy, 0->compact
+
     # ----------------- download -> numpy, then assemble rows (numpy metrics) -----------------
     # Step-7: in the DEPLOYABLE path the reconstructed HD frame stays RESIDENT on the GPU (it is
     # handed to a Metal/texture display, not read back), so `download_output=False` skips the HD
@@ -788,9 +816,20 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
     for i in range(N):
         d = R[i]
         PROF.ftype, PROF.fidx = d["type"], i
+        # Stream-1 OUTPUT-ONLY region-aware blend (single torch.lerp, ~1-2 ms): applied AFTER the
+        # whole resident chain is built, into a FRESH tensor -> the heavy recon stored in R[] (its
+        # reference role already over) is never mutated. a=1 keeps heavy detail (static), a=0 the
+        # temporally-stable compact (dynamic).  out = lerp(compact, heavy, a) = compact + a*(heavy-compact).
+        out_t = d["recon"]
+        if gate_hd is not None:
+            with PROF.time("region_blend"):
+                cpt = G.img_to_dev(region_gate["compact"][i])
+                out_t = torch.lerp(cpt, d["recon"], gate_hd)
         if collect_metrics or download_output:
             with PROF.time("download"):
-                d["recon"] = G.img_to_host(d["recon"])
+                d["recon"] = G.img_to_host(out_t)
+        elif gate_hd is not None:
+            d["recon"] = out_t                  # deployable: region-aware frame stays GPU-resident
         if not collect_metrics:
             continue
         d["perframe"] = G.img_to_host(d["perframe"])
@@ -899,9 +938,28 @@ def _tof_from_R(frames, hd_frames, R, w_lr, h_lr):
             "perframe_vs_lr": tof(seq_pf, seq_lr)}
 
 
+def _build_region_gate(frames, w_hd, h_hd, scale, lo=0.2, hi=1.0, feather=61,
+                       compact_model="realesrgan", compact_cache=None):
+    """Build the Stream-1 region-aware gate + compact source for the OUTPUT-only blend.
+    REUSES region_quality (no math duplicated):
+      * region_masks() -> the (free) per-frame MV-magnitude temporal-mean map `meanmag`,
+      * window_static_weight(meanmag, lo, hi, feather) -> the TEMPORALLY-STABLE, widely-feathered
+        motion gate a_lr in [0,1] (1=static->heavy detail; 0=dynamic->stable compact). hi=1.0 LR
+        px/frame is the physical 'can't carry heavy HF stably under warp' threshold.
+    `compact` = the per-frame COMPACT SR (the same fallback-source family used for occlusion).
+    Pass compact_cache to reuse a precomputed cache (the heavy chain stays single-model)."""
+    import region_quality as _rq
+    h_lr, w_lr = frames[0][1].shape[:2]
+    if compact_cache is None:
+        compact_cache = build_perframe_cache(frames, w_hd, h_hd, compact_model)
+    _, _, meanmag, _ = _rq.region_masks(frames, h_lr, w_lr, 45.0, 80.0)
+    a_lr = _rq.window_static_weight(meanmag, lo, hi, feather=feather)
+    return dict(a_lr=a_lr, compact=compact_cache)
+
+
 def run(frames, hd_frames, scale, use_residual, out_dir, occ_mode="full", sr_mode="bicubic",
         reanchor="none", quality_margin=1.0, fallback_budget=1.0, adapt_metric="fallback",
-        perframe_cache=None, anchor_set=None, backend="numpy", grain="off"):
+        perframe_cache=None, anchor_set=None, backend="numpy", grain="off", region_aware=False):
     """Single-run entry point: build the per-frame-SR cache, resolve the re-anchoring policy
     into an anchor set, reconstruct, then write CSV/samples/plots and compute tOF. Defaults
     (reanchor='none', anchor_set=None, backend='numpy') reproduce the Step-3 backbone exactly."""
@@ -923,8 +981,12 @@ def run(frames, hd_frames, scale, use_residual, out_dir, occ_mode="full", sr_mod
         anchor_set = compute_anchor_set(frames, reanchor, quality_margin, fallback_budget,
                                         adapt_metric, hd_frames, scale, use_residual, occ_mode,
                                         perframe_cache, backend=backend)
+    # Stream-1 region-aware (Step 9): OUTPUT-ONLY blend of the propagated HEAVY recon with a
+    # per-frame COMPACT source via the temporally-stable motion gate. The propagation chain stays
+    # single-model (heavy = perframe_cache); the gate/compact only re-paint the OUTPUT copy.
+    region_gate = (_build_region_gate(frames, w_hd, h_hd, scale) if region_aware else None)
     rows, R = reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache,
-                          anchor_set, backend=backend)
+                          anchor_set, backend=backend, region_gate=region_gate)
 
     # ----------------- samples for the visual spot check -----------------
     backbone_idx = backbone_indices(frames)
@@ -1109,6 +1171,13 @@ def main():
                     help="per-frame film-grain final pass (Step 8): off (default) | low | med | "
                          "high. Regenerated per output frame (temporally independent), luma-only, "
                          "applied AFTER reconstruction; never warped/propagated/fed to references")
+    ap.add_argument("--region-aware", action="store_true",
+                    help="Stream-1 region-aware detail gating (Step 9): OUTPUT-ONLY final pass that "
+                         "blends the propagated HEAVY recon with a per-frame COMPACT SR by a "
+                         "temporally-stable, widely-feathered motion gate (static->heavy detail, "
+                         "dynamic->stable compact). Requires --sr realesrgan-x4plus (heavy chain). "
+                         "Never fed into the propagation reference chain. Default OFF => "
+                         "byte-identical regression.")
     ap.add_argument("--reanchor", default="none",
                     help="anchor policy: none (I-frames only; default, Step-3 behaviour) | "
                          "interval:K (anchor every K-th I/P backbone frame; K=inf => none) | "
@@ -1126,6 +1195,9 @@ def main():
     if args.sr in ("realesrgan", "realesrgan-x4plus") and args.scale != 4:
         print(f"  NOTE: {args.sr} is an x4 model; running at --scale {args.scale} "
               f"will resize SR output to the target (use --scale 4 for native x4).")
+    if args.region_aware and args.sr != "realesrgan-x4plus":
+        raise SystemExit("--region-aware requires --sr realesrgan-x4plus (the heavy propagation "
+                         "chain + a compact source); see prototype/README.md Step 9.")
 
     if args.input:
         lr_path, hd_frames = args.input, None
@@ -1144,7 +1216,7 @@ def main():
     rows, tof_res = run(frames, hd_frames, args.scale, not args.no_residual, args.out, args.occ,
                         args.sr, reanchor=args.reanchor, quality_margin=args.quality_margin,
                         fallback_budget=args.fallback_budget, adapt_metric=args.adapt_metric,
-                        backend=args.backend, grain=args.grain)
+                        backend=args.backend, grain=args.grain, region_aware=args.region_aware)
     n_anch = sum(1 for r in rows if r.get("is_anchor"))
     print(f"reanchor: {args.reanchor}  anchors: {n_anch}/{len(rows)} "
           f"(anchor-fraction {100*n_anch/len(rows):.1f}%)")
