@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>playhd E1 — progressive play-while-processing</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font:15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background:#0e1117; color:#e6edf3; padding:24px; }
+  h1 { font-size:19px; margin:0 0 2px; }
+  .sub { color:#8b949e; margin:0 0 18px; font-size:13px; }
+  .panel { background:#161b22; border:1px solid #30363d; border-radius:10px;
+           padding:16px 18px; max-width:920px; margin:0 auto 16px; }
+  label { font-weight:600; font-size:13px; margin-right:6px; }
+  select, button { background:#0d1117; color:#e6edf3; border:1px solid #30363d;
+                   border-radius:6px; padding:7px 10px; font-size:14px; }
+  button { cursor:pointer; }
+  button.go { background:#238636; color:#fff; border:0; font-weight:700; padding:9px 16px; }
+  .row { display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
+  video { width:100%; border-radius:8px; margin-top:14px; background:#000; }
+  #log { font:12px ui-monospace, SFMono-Regular, monospace; color:#8b949e;
+         white-space:pre-wrap; margin-top:12px; background:#0d1117; border:1px solid #30363d;
+         border-radius:6px; padding:10px; min-height:90px; max-height:260px; overflow:auto; }
+  .big { font-size:15px; color:#3fb950; font-weight:700; }
+</style>
+</head>
+<body>
+  <h1>playhd E1 — progressive play-while-processing</h1>
+  <p class="sub">Fragmented MP4 over chunked HTTP. Playback starts after the first lead buffer
+     while the server is still upscaling the rest. SD → 720p, with interleaved source audio.</p>
+
+  <div class="panel">
+    <div class="row">
+      <div><label>Source</label>
+        <select id="source"><option>short.mp4</option><option>tiny.mp4</option><option>sample.mp4</option></select>
+      </div>
+      <div><label>Mode</label>
+        <select id="mode">
+          <option value="instant">instant (real SR, GPU)</option>
+          <option value="bicubic">bicubic (GPU-free delivery demo)</option>
+        </select>
+      </div>
+      <div><label>Frames cap</label>
+        <select id="frames">
+          <option value="150">150</option><option value="96">96</option>
+          <option value="300">300</option><option value="">all</option>
+        </select>
+      </div>
+      <div><label>Delivery</label>
+        <select id="delivery">
+          <option value="src">progressive &lt;video src&gt; (least machinery)</option>
+          <option value="mse">MSE SourceBuffer (manual buffer control)</option>
+        </select>
+      </div>
+      <button class="go" id="go">Play while processing</button>
+      <button id="base">Time the whole-clip baseline</button>
+    </div>
+    <video id="v" controls playsinline></video>
+    <div id="log"></div>
+  </div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const v = $("v");
+function log(s, big){ const el=$("log"); el.innerHTML += (big?`<span class="big">${s}</span>`:s)+"\n"; el.scrollTop=el.scrollHeight; }
+
+let t0 = 0, firstFrameLogged = false;
+function wireFirstFrame(){
+  firstFrameLogged = false;
+  const mark = (ev) => {
+    if (firstFrameLogged) return;
+    firstFrameLogged = true;
+    const ttff = ((performance.now() - t0)/1000).toFixed(2);
+    log(`▶ FIRST FRAME painted (event=${ev}) — TTFF = ${ttff}s while server still processing`, true);
+  };
+  v.addEventListener("loadeddata", () => mark("loadeddata"), { once:true });
+  v.addEventListener("playing",    () => mark("playing"),    { once:true });
+  v.addEventListener("error", () => log("video error: " + (v.error && v.error.message)));
+  v.addEventListener("ended", () => log("playback ended (whole stream consumed)"));
+}
+
+function streamUrl(){
+  const src = $("source").value, mode = $("mode").value, fr = $("frames").value;
+  return `/stream?source=${encodeURIComponent(src)}&mode=${mode}` + (fr?`&frames=${fr}`:"");
+}
+
+// --- Delivery A: plain progressive <video src> (the recommended least-machinery path) ---
+function playProgressiveSrc(){
+  t0 = performance.now(); wireFirstFrame();
+  log(`requesting ${streamUrl()} as progressive <video src> …`);
+  v.src = streamUrl();
+  v.play().catch(e => log("autoplay blocked — press ▶ : " + e));
+}
+
+// --- Delivery B: MSE — fetch the same fragmented stream, append chunks to one SourceBuffer ---
+async function playMSE(){
+  t0 = performance.now(); wireFirstFrame();
+  const candidates = [
+    'video/mp4; codecs="avc1.640028, mp4a.40.2"',
+    'video/mp4; codecs="avc1.4d4028, mp4a.40.2"',
+    'video/mp4; codecs="avc1.42E01E, mp4a.40.2"',
+  ];
+  const mime = candidates.find(c => MediaSource.isTypeSupported(c));
+  if (!mime){ log("MSE: no supported codec string — falling back to progressive src"); return playProgressiveSrc(); }
+  log(`MSE: using ${mime}`);
+  const ms = new MediaSource();
+  v.src = URL.createObjectURL(ms);
+  ms.addEventListener("sourceopen", async () => {
+    const sb = ms.addSourceBuffer(mime);
+    const res = await fetch(streamUrl());
+    const reader = res.body.getReader();
+    const queue = [];
+    let done = false;
+    sb.addEventListener("updateend", pump);
+    function pump(){
+      if (sb.updating) return;
+      if (queue.length){ sb.appendBuffer(queue.shift()); return; }
+      if (done){ try { ms.endOfStream(); } catch(e){ /* already ended */ } }
+    }
+    v.play().catch(e => log("autoplay blocked — press ▶ : " + e));
+    while(true){
+      const { value, done:d } = await reader.read();
+      if (d){ done = true; pump(); break; }
+      queue.push(value); pump();
+    }
+  });
+}
+
+$("go").onclick = () => {
+  $("log").innerHTML = "";
+  ($("delivery").value === "mse" ? playMSE : playProgressiveSrc)();
+};
+
+$("base").onclick = async () => {
+  const src = $("source").value, fr = $("frames").value;
+  log(`timing whole-clip baseline (process_clip) for ${src}, frames=${fr||"all"} …`);
+  const r = await fetch(`/baseline?source=${encodeURIComponent(src)}`+(fr?`&frames=${fr}`:""));
+  if (!r.ok){ log("baseline error: " + await r.text()); return; }
+  const d = await r.json();
+  log(`baseline: whole-clip server time = ${d.whole_clip_server_s}s for ${d.n_frames} frames `
+      + `(${d.ms_per_frame} ms/frame). First frame is playable only AFTER that.`, true);
+};
+</script>
+</body>
+</html>

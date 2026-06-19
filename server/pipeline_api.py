@@ -38,6 +38,7 @@ from fractions import Fraction
 
 import numpy as np
 import av
+import cv2
 
 # --------------------------------------------------------------------------- #
 # Import the prototype READ-ONLY. The prototype modules import each other by bare
@@ -155,6 +156,12 @@ MODE_CONFIG = {
                     occ="adaptive",
                     region_aware=True,             # OUTPUT-only motion-gated heavy/compact blend
                     grain="med",
+                    fp16=True,                     # E4: fp16 x4plus anchor (~1.24x faster, PSNR 72-76
+                                                   # dB vs fp32 = visually identical). GPU-guarded in
+                                                   # sr.load_model (no-op/fp32 on CPU).
+                    grain_motion=True,             # E3 V2: freeze grain on static (region-gated) pixels,
+                                                   # fresh per-frame grain only on motion -> removes the
+                                                   # ~100% grain-induced static-region flicker.
                     label="Quality (x4plus anchor, region-aware blend, grain)"),
 }
 
@@ -621,8 +628,11 @@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
     cfg = MODE_CONFIG["quality"]
     h_lr, w_lr = sub[0][1].shape[:2]
     w_hd, h_hd = w_lr * SCALE, h_lr * SCALE
-    perframe_cache = derisk.build_perframe_cache(sub, w_hd, h_hd, cfg["sr_mode"])
+    perframe_cache = derisk.build_perframe_cache(
+        sub, w_hd, h_hd, cfg["sr_mode"], half=cfg.get("fp16", False))   # E4 fp16 anchor
     region_gate = derisk._build_region_gate(sub, w_hd, h_hd, SCALE)
+    grain_static_hd = (cv2.resize(region_gate["a_lr"], (w_hd, h_hd), interpolation=cv2.INTER_LINEAR)
+                       if cfg.get("grain_motion") else None)            # E3 V2 motion gate
     _, R = derisk.reconstruct(
         sub, None, SCALE, True, cfg["occ"], perframe_cache, set(),
         backend=cfg["backend"], collect_metrics=False, download_output=True,
@@ -631,7 +641,10 @@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
     for i in range(len(sub)):
         recon = R[i]["recon"]
         if cfg["grain"] != "off":
-            recon = _grain.apply_grain(recon, done, cfg["grain"])
+            if grain_static_hd is not None:
+                recon = _grain.apply_grain_motion(recon, done, grain_static_hd, cfg["grain"])
+            else:
+                recon = _grain.apply_grain(recon, done, cfg["grain"])
         writer.write(recon)
         done += 1
         _emit_frame_progress(done, total, t0, t_passB)
@@ -890,14 +903,22 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     _free_gpu()
                     continue
 
-                # ---- QUALITY (region-aware) path -- original full-SR pipeline, untouched ----
-                # 1) per-frame SR cache for this chunk (anchor / fallback / baseline source)
+                # ---- QUALITY (region-aware) path -- full-SR pipeline ----
+                # 1) per-frame SR cache for this chunk (anchor / fallback / baseline source).
+                #    fp16 (E4) speeds the x4plus anchor ~1.24x, visually identical (default fp16=OFF
+                #    on instant keeps that path byte-identical).
                 ts = time.perf_counter()
-                perframe_cache = derisk.build_perframe_cache(chunk, w_hd, h_hd, cfg["sr_mode"])
+                perframe_cache = derisk.build_perframe_cache(
+                    chunk, w_hd, h_hd, cfg["sr_mode"], half=cfg.get("fp16", False))
                 # 2) region-aware gate (quality only): temporally-stable motion gate + the
                 #    per-frame COMPACT source for the OUTPUT-only blend (this chunk's frames).
                 region_gate = (derisk._build_region_gate(chunk, w_hd, h_hd, SCALE)
                                if cfg["region_aware"] else None)
+                # E3 V2: HD motion gate (1=static) for grain freezing -- reuse the region gate's a_lr.
+                grain_static_hd = None
+                if cfg.get("grain_motion") and region_gate is not None:
+                    grain_static_hd = cv2.resize(region_gate["a_lr"], (w_hd, h_hd),
+                                                 interpolation=cv2.INTER_LINEAR)
                 t_sr += time.perf_counter() - ts
 
                 # 3) reconstruct this chunk (I/P backbone + B leaves). anchor_set=set()
@@ -912,16 +933,21 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                 t_recon += time.perf_counter() - tr
 
                 # 4) grain (global frame index seed => temporally independent across chunks)
-                #    + ENCODE incrementally, then free the chunk's HD frames.
+                #    + ENCODE incrementally, then free the chunk's HD frames. E3 V2: when a motion
+                #    gate is available, freeze grain on static pixels (kills the grain-induced
+                #    static flicker) while keeping fresh per-frame grain on motion.
                 for i in range(len(chunk)):
                     recon = R[i]["recon"]
                     if cfg["grain"] != "off":
-                        recon = _grain.apply_grain(recon, done, cfg["grain"])
+                        if grain_static_hd is not None:
+                            recon = _grain.apply_grain_motion(recon, done, grain_static_hd, cfg["grain"])
+                        else:
+                            recon = _grain.apply_grain(recon, done, cfg["grain"])
                     writer.write(recon)
                     done += 1
                     _emit()
 
-                del perframe_cache, region_gate, R, chunk
+                del perframe_cache, region_gate, grain_static_hd, R, chunk
                 _free_gpu()                         # release MPS cache between chunks (see _free_gpu)
         finally:
             writer.close()

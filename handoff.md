@@ -85,7 +85,8 @@ prototype/out_quality/ # Step 8 artifacts: detail_drift.png/.csv, ab_anchor_*, g
 prototype/out_matting/ out_plate/ out_layered/  # LAYERED L1/L2/L3 artifacts
 prototype/out*/        # generated artifacts (see prototype/README.md ## Artifacts) — all gitignored
 server/                # PRODUCT LAYER — Stage-1 web app (FastAPI + browser console)
-server/app.py          #   FastAPI: GET / (console) + /api/sources, /api/process, /api/progress, /outputs/*.mp4
+server/app.py          #   FastAPI: GET / (console) + /api/sources, /api/process, /api/progress, /outputs/*.mp4, + R1: /api/stream (progressive), /api/upload
+server/progressive.py  #   R1 E1: fragmented-MP4 play-while-process core (GET /api/stream) — server-verified, browser-pending (opt-in)
 server/pipeline_api.py #   STREAMING constant-memory GOP-chunk processing of the WHOLE clip + source-audio mux + faststart (instant/quality); instant takes the Levers-1–4 fast path
 server/layered_api.py  #   the LAYERED mode (two-pass-per-scene: build+heavy-SR one bg plate/scene, composite the moving FG per frame)
 server/scene_detect.py #   IMPROVEMENT-LOOP iter1: robust scene-CUT detector (luma-diff + I-frame-corroborated + relative/hysteresis + min-scene-len). ONE StreamingCutDetector shared by stream_gops + layered segment_scenes
@@ -581,6 +582,76 @@ bounding box of a frame's occlusion-fallback region — but on this real footage
 reaches only ~46% coverage) → hundreds of tiny SR passes whose launch overhead erases the area saving.
 Kept available (set True) for content where a compact moving-edge occlusion actually holds.
 
+## Research round R1 — 4 parallel Opus experiments + seam-verified integration (2026-06-19)
+
+After the improvement loop, a research-lead pass ran **4 parallel Opus subagent experiments** (each
+importing prototype/server READ-ONLY, honest metrics only — tOF + fallback% + direct |ΔF|, never
+LR-consistency or NR-sharpness alone). Reports + scripts live in `experiments/expN_*/REPORT.md`. The
+lead then seam-verified every proposed caller/handler signature against the real pipeline and
+integrated the GO findings behind flags; the **synthetic regression stayed byte-identical**
+(41.08→31.45 dB, 23/23, 5.84%) throughout. GO/NO-GO board:
+
+| # | experiment | verdict | shipped |
+|---|---|---|---|
+| **E1** | Progressive play-while-process (fMP4 over chunked HTTP) | **GO** | `server/progressive.py` + `GET /api/stream` + `POST /api/upload` — **server-verified, browser-pending** (opt-in) |
+| **E4a** | fp16 SR net | **GO** | `--fp16`/`half=` in `sr.py`+`derisk.py`; quality mode `fp16=True` |
+| **E3-V2** | motion-modulated grain (freeze on static) | **GO** | `grain.apply_grain_motion`; quality mode `grain_motion=True` |
+| **E2** | high-motion content-adaptive fallback | GO (opt-in) | **documented, default-OFF hook ready** (`thresh_fn`); not wired |
+| **E3-V3** | graphic/text-edge detector | util ready | detector validated; **pinning NO-GO** (not wired) |
+| **E4b** | FSR2 color-box clamp (`--clamp`) | **NO-GO** | structural — see below |
+| **E2b/c** | adaptive re-anchor / QHD-instant escalation | **NO-GO** | wrong lever / breaks real-time |
+
+**Integrated + verified this round:**
+- **E4a fp16 (quality mode).** `sr.load_model(name, device=None, half=False)` casts the net to fp16 on
+  MPS/CUDA (CPU-guarded → silently fp32, never crashes); the **cache key is now `(name, half)`** so fp16
+  and fp32 nets don't collide. `upscale`/`upscale_to`/`derisk.build_perframe_cache` thread `half=`.
+  `MODE_CONFIG["quality"]["fp16"]=True`; **instant stays fp32** (`fp16` absent → byte-identical). Measured
+  A/B: x4plus **PSNR(fp16,fp32) 71.7 dB**, compact 76.1 dB (≫50 dB = visually identical), maxΔ 1–2/255, no
+  NaN; ~1.24× best-of-N speedup on x4plus (E4). End-to-end quality run: 2466 ms/frame (was ~2900).
+- **E3-V2 motion grain (quality mode).** `grain.apply_grain_motion(rgb, idx, static_w_hd, ...)` = exactly
+  `apply_grain` except the per-pixel unit field is `renorm(a·frozen + (1−a)·fresh)` gated by the
+  region-aware static weight (`region_gate["a_lr"]`, already computed for region-aware), upsampled to HD.
+  `MODE_CONFIG["quality"]["grain_motion"]=True`. Static-region |ΔF| 5.649→**2.313 ≈ the 2.307 no-grain
+  floor** (~100% of grain-induced static flicker removed); moving regions keep independent fresh grain
+  (raw-field corr 0.0010). Verified: static gate → frozen (corr 1.0000); moving gate → maxΔ=0 vs
+  `apply_grain` (degenerate case preserved). Output-only, never enters `R[]`.
+- **E1 progressive playback — SERVER-VERIFIED, BROWSER-PENDING.** `server/progressive.py` (promoted from
+  the validated prototype) builds a **fragmented MP4** (`movflags=empty_moov+frag_keyframe+default_base_moof`)
+  with the upscaled instant video + source audio interleaved in ONE container, emitted incrementally over a
+  `StreamingResponse` so playback can start after one fragment instead of the whole clip. `GET /api/stream`
+  (instant|bicubic, 409 if busy) + `POST /api/upload`. **Verified end-to-end at the HTTP/decode level**:
+  init (`ftyp`+`moov`) up front, **play-before-EOF** (a 25% byte prefix re-decodes to frames in PyAV),
+  whole stream → full frame count + synced AAC, 200/`video/mp4`/no-Content-Length, 409 under concurrency,
+  and the **client-disconnect lock-release bug fixed** (see GOTCHA #28). **NOT yet verified in a real
+  browser** — Chrome held `readyState=0` on both plain `<video src>` and an MSE `SourceBuffer`, and the
+  renderer repeatedly froze under CDP (local instability + a real open question about Chrome's consumption
+  of chunked fMP4 — see GOTCHA #29). Because of that, the UI exposes progressive streaming as an **opt-in
+  checkbox (default OFF)** so instant keeps its proven buffered path — **no regression**.
+
+**Documented, validated, NOT wired (ready for a follow-up):**
+- **E2 motion-keyed fallback** (high-motion instant weak spot). KEY honest finding: on high motion **tOF and
+  fallback% are in direct tension** — bicubic fallback is already tOF-optimal, so *no* policy improves both
+  (the task's premise was refuted, stated rather than papered over). The one shippable lever is a
+  **motion-keyed threshold @ 0.20** (escalate bicubic→compact-SR fallback only when mean·|MV|>1.0): window
+  A eff-bicubic 7.71%→3.65% (weak spot halved) at an honest tOF cost (0.847→1.214), **zero cost on
+  talking-head** (self-gating). Default-OFF `thresh_fn` hook spec'd in `experiments/exp2_highmotion/REPORT.md`.
+- **E3-V3 graphic detector** (`detect_graphic_mask`, bimodal+low-MV): 0.00% mis-fire on 32 talking-head face
+  frames, correct true-positives on the title card. Ship as a default-OFF diagnostic util; **pinning is
+  NO-GO** — the "USACHEV TODAY" card is **zero-MV skip-coded**, so the engine's identity-warp propagation
+  (edge |ΔF| 0.816) is already steadier than per-frame SR (1.009); pinning makes it 2.5× worse (2.061).
+  NEMO anchor-reuse already stabilises a static graphic; the "shimmer under warp" premise fails on this clip.
+
+**NO-GO (documented so they aren't re-litigated):**
+- **E4b color-box clamp (`--clamp`) — STRUCTURAL NO-GO.** No γ works: loose γ≥2 preserves SR detail (100%
+  var-Lap) but doesn't reduce ghosting (HF-divergence flat); tight γ=1 clips real texture (var-Lap→90%,
+  PSNR 42 dB) and still doesn't fix it. Root cause: rate-distortion MVs point to **visually-similar**
+  content, so the ghost's colours sit *inside* a box built from the same LR neighbourhood — an RGB color box
+  provably can't separate ghost from signal (FSR2 works because its ghost is a different surface; H.264
+  ghosting is same-content-misplaced). Settles the long-standing "test, don't assume" `--clamp` question.
+- **E2b adaptive re-anchor** (raises tOF, barely moves occlusion — the weak spot is disocclusion, not drift)
+  and **E2c QHD-instant escalation** (5.27× recon cost, breaks real-time, eff-bicubic% unchanged since the
+  fallback is still bicubic just higher-res).
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a
@@ -766,6 +837,32 @@ Visuals: `prototype/out_diffusion_real/`.
     `upscale_to(lr, w_hd, h_hd)` runs the x4 SR net then downscales to the 720p target — this yields a
     *sharp* 720p (the x4 net's detail, resampled down), visibly better than running a native 2× net. Do
     not "optimize" instant by swapping in a 2× model; you would lose the detail the downscale preserves.
+
+28. **A *sync* generator wrapped by StreamingResponse is NOT sent GeneratorExit on client disconnect**
+    (R1 progressive playback). The first cut acquired the single-job lock and released it in a sync
+    generator's `finally` — but on disconnect that finally never ran, so a runaway client left the GPU
+    churning the WHOLE clip and held the lock forever (a 34-min `sample.mp4` instant stream kept going
+    after `curl` was killed). FIX (`server/app.py::api_stream`): make the response body an **async**
+    generator that pulls the sync producer one fragment at a time via `run_in_threadpool`. Starlette's
+    `StreamingResponse` runs a `listen_for_disconnect` that **cancels the stream task** on
+    `http.disconnect`; the CancelledError lands at the generator's next `await` → its `finally` runs **SYNC**
+    cleanup (close the producer = flush+close the muxer + free GPU; release the lock). `run_in_threadpool`
+    finishes the in-flight chunk before the cancel lands, so a disconnect stops the GPU within ONE chunk
+    (verified: 75 frames then freed, not 50 805). **Do NOT also poll `request.is_disconnected()`** — it
+    calls `receive()` concurrently with Starlette's own disconnect listener on the same ASGI channel and
+    BREAKS the cancellation (this was the bug before the fix).
+
+29. **Chrome's consumption of chunked fragmented-MP4 is UNVERIFIED — `<video src>` likely needs MSE**
+    (R1 progressive playback). The server produces valid, progressively-decodable fMP4 (PyAV re-decodes a
+    truncated byte prefix to frames = play-before-EOF proven), but in a real Chrome both a plain
+    `<video src>` and a hand-rolled MSE `SourceBuffer` held `readyState=0` (no decoded frame), and the
+    renderer repeatedly froze under CDP automation (local instability confounds the test). So browser
+    playback is **not yet confirmed**. The UI gates progressive streaming behind an **opt-in checkbox
+    (default OFF)** so instant keeps its proven buffered `POST /api/process → /outputs` path — no regression.
+    Next step to finish E1: confirm in a real browser; if `<video src>` won't play the live fMP4 (Chrome is
+    historically flaky for fMP4 without MSE), wire an MSE `SourceBuffer` in `index.html` (the E1 report calls
+    this a zero-server-change upgrade — the *same* bytes) with codec `avc1.640028` (the stream is H.264 High)
+    + `mp4a.40.2`, and verify `currentTime` advances while `/api/progress` still reports `streaming`.
 
 ## Known limitations / done since (Steps 1–4) and still NOT done
 

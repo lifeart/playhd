@@ -454,26 +454,29 @@ def _warp_one(ref_recon, ref_oracle, lr_cur, lr_ref, mvs, want, scale,
 # --------------------------------------------------------------------------- #
 # Experiment: reference-backbone reconstruction (I/P chain) + bidirectional B leaves
 # --------------------------------------------------------------------------- #
-def build_perframe_cache(frames, w_hd, h_hd, sr_mode):
+def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False):
     """Per-frame upscale (the SR placeholder) computed ONCE for every frame and cached.
     bicubic (default; byte-identical to all prior runs) OR a real lightweight SR network
     (realesr-general-x4v3, x4). The SAME perframe image is reused for (1) the anchor
     reconstruction, (2) the disocclusion/fallback source, and (3) the per-frame-SR baseline
     -- so with --sr realesrgan, `perframe` IS per-frame SR. Caching it once is what makes the
-    anchor-placement SWEEP cheap: only warp/blend re-runs across operating points, SR runs 0x."""
+    anchor-placement SWEEP cheap: only warp/blend re-runs across operating points, SR runs 0x.
+
+    half=True runs the SR net in fp16 on a GPU (experiment E4: ~1.24x faster on the x4plus anchor,
+    visually identical). Default fp16=OFF keeps the byte-identical fp32 path."""
     N = len(frames)
     cache = {}
     if sr_mode in ("realesrgan", "realesrgan-x4plus"):
         import sr as _srmod
-        _srmod.load_model(sr_mode)
+        _srmod.load_model(sr_mode, half=half)
         # warm up MPS graph compilation on the real frame size, then reset latency stats so
         # the reported per-frame latency is steady-state (not the one-off compile cost).
-        _srmod.upscale(frames[0][1], model=sr_mode)
+        _srmod.upscale(frames[0][1], model=sr_mode, half=half)
         _srmod.reset_latency(sr_mode)
         for i in range(N):
             PROF.ftype, PROF.fidx = frames[i][0], i
             with PROF.time("sr"):
-                cache[i] = _srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode)
+                cache[i] = _srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode, half=half)
         return cache
     for i in range(N):
         PROF.ftype, PROF.fidx = frames[i][0], i

@@ -201,15 +201,24 @@ def _pick_device():
     return torch.device("cpu")
 
 
-def load_model(name="realesrgan", device=None):
-    """Build the named arch, load its published state_dict (strict=True), cache on device."""
+def load_model(name="realesrgan", device=None, half=False):
+    """Build the named arch, load its published state_dict (strict=True), cache on device.
+
+    half=True casts the net to fp16 on MPS/CUDA (experiment E4: ~1.24x faster on the x4plus anchor,
+    PSNR(fp16,fp32) ~72-76 dB = visually identical, no NaN). fp16 is GUARDED to a real GPU -- on CPU
+    it is silently kept fp32 (fp16 conv is unsupported/slow there) so the path never crashes. The
+    cache key includes precision so fp16 and fp32 nets do not collide. Default half=False keeps the
+    byte-identical fp32 path (the synthetic regression is unchanged)."""
     global _DEVICE
     if name not in MODELS:
         raise ValueError(f"unknown SR model {name!r}; choices: {SR_NAMES}")
-    if name in _MODELS:
-        return _MODELS[name]
+    dev = device or _DEVICE or _pick_device()
+    half = bool(half) and dev.type in ("mps", "cuda")   # guard: fp16 only on a real GPU
+    key = (name, half)
+    if key in _MODELS:
+        return _MODELS[key]
     path = _ensure_weights(name)
-    _DEVICE = device or _DEVICE or _pick_device()
+    _DEVICE = dev
     sd = torch.load(path, map_location="cpu")
     if isinstance(sd, dict) and "params_ema" in sd:     # x4plus ckpt wraps weights under params_ema
         sd = sd["params_ema"]
@@ -218,21 +227,29 @@ def load_model(name="realesrgan", device=None):
     model = MODELS[name]["build"]()
     model.load_state_dict(sd, strict=True)              # strict: catch arch mismatch
     model.eval().to(_DEVICE)
-    _MODELS[name] = model
+    if half:
+        model = model.half()
+    _MODELS[key] = model
     _LAT.setdefault(name, [])
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"[sr] loaded {MODELS[name]['label']} (x{UPSCALE}, {n_params/1e6:.2f}M params) on {_DEVICE}")
+    prec = "fp16" if half else "fp32"
+    print(f"[sr] loaded {MODELS[name]['label']} (x{UPSCALE}, {n_params/1e6:.2f}M params, {prec}) "
+          f"on {_DEVICE}")
     return model
 
 
 @torch.no_grad()
-def upscale(rgb_uint8, model="realesrgan"):
-    """Super-resolve an HxWx3 uint8 RGB image by x4 with `model`. Returns (4H)x(4W)x3 uint8."""
+def upscale(rgb_uint8, model="realesrgan", half=False):
+    """Super-resolve an HxWx3 uint8 RGB image by x4 with `model`. Returns (4H)x(4W)x3 uint8.
+    half=True runs the net in fp16 on a GPU (E4: visually identical, faster); default fp32."""
     global _LAST_MODEL
-    net = load_model(model)
+    net = load_model(model, half=half)
     _LAST_MODEL = model
+    use_half = next(net.parameters()).dtype == torch.float16    # reflect the CPU-guarded reality
     t = torch.from_numpy(np.ascontiguousarray(rgb_uint8)).to(_DEVICE)
     t = t.permute(2, 0, 1).unsqueeze(0).float().div_(255.0)  # 1,3,H,W in [0,1]
+    if use_half:
+        t = t.half()
     if _DEVICE.type == "mps":
         torch.mps.synchronize()
     t0 = time.perf_counter()
@@ -240,16 +257,16 @@ def upscale(rgb_uint8, model="realesrgan"):
     if _DEVICE.type == "mps":
         torch.mps.synchronize()
     _LAT.setdefault(model, []).append((time.perf_counter() - t0) * 1000.0)
-    out = out.clamp_(0.0, 1.0).mul_(255.0).round_()
+    out = out.float().clamp_(0.0, 1.0).mul_(255.0).round_()  # fp32 for the clamp/round/uint8 path
     out = out.squeeze(0).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
     return np.ascontiguousarray(out)
 
 
-def upscale_to(rgb_uint8, w_hd, h_hd, model="realesrgan"):
+def upscale_to(rgb_uint8, w_hd, h_hd, model="realesrgan", half=False):
     """x4 SR then (only if needed) resize to an explicit target. At scale 4 this is identity;
     the safety resize lets the warp pipeline stay scale-agnostic without forcing the x4 model
-    into a non-4 scale internally."""
-    out = upscale(rgb_uint8, model=model)
+    into a non-4 scale internally. half=True -> fp16 SR (E4)."""
+    out = upscale(rgb_uint8, model=model, half=half)
     if out.shape[1] != w_hd or out.shape[0] != h_hd:
         out = cv2.resize(out, (w_hd, h_hd), interpolation=cv2.INTER_CUBIC)
     return out

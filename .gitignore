@@ -19,6 +19,10 @@ out*/
 prototype/out*/
 server/outputs/
 server/uploads/
+experiments/*/artifacts/
+experiments/*/out*/
+experiments/*/*.json
+experiments/*/run.log
 *.log
 
 # scratch backups

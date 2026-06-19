@@ -111,6 +111,38 @@ def apply_grain(rgb_uint8, frame_idx, strength="med", template=None, return_grai
     return (out, grain) if return_grain else out
 
 
+def apply_grain_motion(rgb_uint8, frame_idx, static_w_hd, strength="med", template=None,
+                       frozen_idx=0, return_grain=False):
+    """MOTION-MODULATED grain (experiment E3 V2): identical to apply_grain EXCEPT the per-pixel
+    unit grain field is gated by the region-aware motion weight `static_w_hd` (HxW, 1=static,
+    0=moving, already upsampled to the HD frame size; from derisk._build_region_gate's `a_lr`):
+      * STATIC pixels (a=1) use a FROZEN grain field (fixed `frozen_idx` seed) -> spatially full
+        filmic texture but IDENTICAL every frame -> ~0 temporal flicker, so the propagation chain's
+        stability survives instead of grain re-injecting ~4.5/frame of static flicker.
+      * MOVING pixels (a=0) use FRESH per-frame grain (seed=frame_idx) -> independent, filmic.
+      * Between: a*frozen + (1-a)*fresh, RENORMALISED to unit variance so grain density is uniform
+        across the seam (no visible amplitude step).
+    Degenerate static_w_hd==0 everywhere -> exactly apply_grain. Output-only: never warp/propagate
+    this or feed it into the reference chain R[]. Measure independence on the RAW grain FIELD."""
+    sigma = STRENGTHS.get(strength, 0.0) if isinstance(strength, str) else float(strength)
+    h, w = rgb_uint8.shape[:2]
+    if sigma <= 0.0:
+        return (rgb_uint8.copy(), np.zeros((h, w), np.float32)) if return_grain else rgb_uint8.copy()
+    ycc = cv2.cvtColor(rgb_uint8, cv2.COLOR_RGB2YCrCb).astype(np.float32)
+    y = ycc[:, :, 0]
+    y_local = cv2.GaussianBlur(y, (0, 0), _LUMA_BLUR_SIGMA)
+    amp = _LUT[np.clip(y_local, 0, 255).astype(np.uint8)]
+    a = np.clip(static_w_hd, 0.0, 1.0).astype(np.float32)
+    fresh = _frame_grain(h, w, frame_idx, template)
+    frozen = _frame_grain(h, w, frozen_idx, template)
+    unit = a * frozen + (1.0 - a) * fresh
+    unit = unit / np.maximum(np.sqrt(a * a + (1.0 - a) ** 2), 1e-6)   # unit variance across the seam
+    grain = unit * sigma * amp
+    ycc[:, :, 0] = np.clip(y + grain, 0, 255)
+    out = cv2.cvtColor(ycc.astype(np.uint8), cv2.COLOR_YCrCb2RGB)
+    return (out, grain) if return_grain else out
+
+
 if __name__ == "__main__":
     # self-test: (1) grain visible & luma-modulated on a ramp; (2) temporally independent.
     H, W = 256, 512

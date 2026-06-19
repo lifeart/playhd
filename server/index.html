@@ -72,6 +72,12 @@
     <div class="modes" id="modes"></div>
 
     <div id="estimate" class="hint" style="margin:8px 0 2px"></div>
+    <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin:10px 0 2px">
+      <input type="checkbox" id="stream" style="width:auto" />
+      <span class="hint">▶ Play while processing (instant only — streams the upscaled clip as it is
+      produced so playback starts in ~1–2 s instead of waiting for the whole clip).
+      Experimental: needs a browser that plays fragmented MP4.</span>
+    </label>
     <button id="go">Process &amp; Play</button>
 
     <div id="progressWrap">
@@ -182,12 +188,55 @@ async function pollProgress() {
   } catch (e) { /* transient; keep polling */ }
 }
 
+// Instant mode: progressive play-while-process. Stream a fragmented MP4 from /api/stream and
+// start playing after the first fragment (~1-2 s) while the server keeps upscaling the rest.
+// (Quality / layered stay on the buffered POST /api/process path below — they are ~10x slower.)
+async function runStreaming(btn) {
+  try {
+    let srcName = $("source").value;
+    const f = $("file").files[0];
+    if (f) {                                  // upload first so GET /api/stream can resolve it
+      setStatus("Uploading…");
+      const ufd = new FormData(); ufd.append("file", f);
+      const ur = await fetch("/api/upload", { method: "POST", body: ufd });
+      if (!ur.ok) { setStatus("Upload failed: " + (await ur.text()), true); btn.disabled = false; return; }
+      srcName = (await ur.json()).name;
+    }
+    setStatus("Streaming <b>instant</b> — playing as it processes…");
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(pollProgress, 400);
+
+    $("playerPanel").style.display = "";
+    $("stats").textContent = "mode : instant (progressive fMP4 — play-while-process)\nstreaming…";
+    const v = $("player");
+    v.muted = false;                          // play WITH sound
+    const done = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } btn.disabled = false; };
+    v.onplaying = () => { $("bar").style.width = "100%";
+                          setStatus("Playing as it processes (instant — real-time 720p, with sound)."); };
+    v.onended = done;
+    v.onerror = () => { done();
+      setStatus("Stream failed — the server may be busy with another clip; try again in a moment.", true); };
+    v.src = `/api/stream?source=${encodeURIComponent(srcName)}&mode=instant`;
+    v.load();
+    v.play().catch(() => setStatus("Ready — click ▶ to play (browser blocked autoplay-with-sound)."));
+  } catch (e) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    setStatus("Stream request failed: " + e, true);
+    btn.disabled = false;
+  }
+}
+
 $("go").onclick = async () => {
   const btn = $("go");
   btn.disabled = true;
   $("progressWrap").style.display = "";
   $("bar").style.width = "0%";
   $("progressText").textContent = "starting…";
+
+  // Opt-in progressive play-while-process (instant only). Default OFF so instant keeps the proven
+  // buffered path; the streaming path is server-verified but browser fMP4 support varies.
+  if (selectedMode === "instant" && $("stream").checked) { return runStreaming(btn); }
+
   let modeNote = ".";
   if (selectedMode === "quality") modeNote = " — heavy x4plus anchor, this is the slow path.";
   else if (selectedMode === "layered")

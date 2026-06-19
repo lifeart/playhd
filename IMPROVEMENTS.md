@@ -14,11 +14,26 @@
 >   instant tier** (`INSTANT_SCALE=2`) → instant **~409 → 41 ms/frame = 10.0× = ~24 fps = real-time**.
 > - ✅ **Scene-cut detection (DONE, `397f461`, `server/scene_detect.py`):** robust cut detector
 >   (1.00/1.00 prec/recall on `sample.mp4`) forces a fresh anchor at every cut → no cross-cut smear.
-> - ◻ **Still open:** P3 (fp16 SR net), V2 (grain over static regions), V3 (graphic/text-edge shimmer),
->   V4 (layered seam/hair), progressive play-while-processing — statuses inline below.
+> - ◻ **Still open:** V4 (layered seam/hair), and the BROWSER half of progressive playback.
 >
 > Tile-SR (P1's Lever 3) was measured and **DISABLED** (`INSTANT_TILE_SR=False`): the occlusion
 > fallback is spatially scattered on real footage so a bbox covers ~97% of the frame → no win.
+>
+> **UPDATE — research round R1 (4 parallel Opus experiments; see `handoff.md` → "## Research round R1"
+> and `experiments/expN_*/REPORT.md`):**
+> - ✅ **P3 fp16 SR net — DONE (GO):** `half=` in `sr.py`/`derisk.py`, quality mode `fp16=True`. x4plus
+>   ~1.24× faster, PSNR(fp16,fp32) 71.7 dB = visually identical; instant stays fp32 (byte-identical).
+> - ✅ **V2 motion-modulated grain — DONE (GO):** `grain.apply_grain_motion`, quality mode
+>   `grain_motion=True`. Static |ΔF| 5.649→2.313 (≈ no-grain floor); moving keeps fresh grain.
+> - ◐ **Progressive play-while-process — SERVER DONE, browser PENDING:** `server/progressive.py` +
+>   `GET /api/stream` (fMP4 over chunked HTTP). HTTP/decode-verified (play-before-EOF, audio, 409,
+>   disconnect-frees-lock); browser playback unconfirmed → shipped opt-in (default OFF). See GOTCHAs #28–29.
+> - ◻ **V3 graphic-edge:** detector validated (0% face mis-fire) but **pinning NO-GO** — the title card is
+>   zero-MV skip-coded so NEMO anchor-reuse already out-stabilises per-frame SR. Detector ready as a util.
+> - **NO-GO (settled):** color-box clamp `--clamp` (structural — RD-MVs land the ghost inside the box);
+>   high-motion adaptive re-anchor / QHD-instant escalation (E2, wrong lever / breaks real-time). On high
+>   motion **tOF↔fallback% are in tension** (bicubic fallback is already tOF-optimal) — the motion-keyed
+>   threshold @0.20 is a documented default-OFF opt-in (halves window-A weak spot, zero cost on talking-head).
 
 Performance + visual-quality "poke", 2026-06-19. Read-only analysis of existing code, the
 documented Step 6/7 profiling, and the shipped `server/outputs/*.mp4`, plus light new
