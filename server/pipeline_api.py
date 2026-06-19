@@ -279,7 +279,12 @@ def get_progress():
 # Rough processing cost per mode (ms/frame, measured) -> the UI shows an estimate so the
 # user never blind-launches a 12-hour job on a 34-min source. The pipeline is ~10x slower
 # than real-time, so a long clip is a long render; this surfaces that BEFORE Process & Play.
-MODE_MS_PER_FRAME = {"instant": 130.0, "quality": 2900.0, "layered": 470.0}
+# layered is CONTENT-DEPENDENT: a static-camera scene composites cheaply (~470 ms/frame) but a
+# MOVING scene falls back to the region-aware quality path (~2900 ms/frame). R5-E1 measured ~1382
+# ms/frame on mixed content (4/7 moving scenes) -> the old 470 estimate under-promised ~3x, so the
+# UI estimate uses this conservative mixed value (an all-static clip finishes sooner; a moving clip
+# is better routed to instant/quality by the R4-E4 auto-mode).
+MODE_MS_PER_FRAME = {"instant": 130.0, "quality": 2900.0, "layered": 1400.0}
 
 
 def _source_meta(path):

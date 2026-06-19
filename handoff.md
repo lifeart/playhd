@@ -820,6 +820,44 @@ splits the chunk → instant-safe; only a *missed moving* cut escalates). The **
 structurally prevents the R4-E1 layered corruption on all non-human content. Probe is 50–150× cheaper than a
 render. Integration sketch (`recommend_mode` + an "auto" mode) in `experiments/r4_e4_automode/`.
 
+## Research round R5 — production readiness + the first perceptual quality numbers (2026-06-20)
+
+A lean 2-experiment round (the new-feature frontier had thinned). Reports in `experiments/r5_*/REPORT.md`.
+
+**R5-E1 — production stress test: ALL 3 MODES ARE PRODUCTION-READY, no blockers.** Stress-tested longer
+windows (instant to 8000 frames / 320 s) + edge cases through the shipped `process_clip`. Every run:
+valid + correctly-counted + audio-synced output, single-job lock releases cleanly, **instant is
+bit-for-bit deterministic** on the MPS fast path, multi-scene clean (the `StreamingCutDetector` caught all
+9 cuts in [0,900) exactly → no cross-cut smear), the R4-E1 layered guard classified 7 scenes correctly with
+**no false-trips across 6 normal cuts**. **Memory (the headline worry) is RESOLVED:** instant RSS rises in a
+~3000-frame **warm-up ramp then PLATEAUS** at ~1.3 GB (proven over 8000 frames; the earlier "169 KB/frame
+creep" was just the pre-plateau ramp); quality/layered show a bounded per-chunk **sawtooth** (peaks 1.64 /
+2.50 GB). So the bounded-memory claim holds for the full 50k-frame clip on a 17 GB box — more precisely it's
+"**bounded after a ~3000-frame warm-up ramp**", not literally "constant from frame 0". **One real defect
+(MEDIUM, fixed):** the layered UI time-estimate (`MODE_MS_PER_FRAME["layered"]`) was 470 ms/frame (all-static
+assumption) but a MOVING scene falls back to the ~2900 ms quality path → measured **1382 ms/frame** on mixed
+content (4/7 moving) = ~3× under-promise → **fixed: estimate bumped to 1400** (conservative mixed value;
+content-dependent — moving content is better routed by R4-E4 auto-mode). Verdicts: **instant SHIP** (37
+ms/frame, ~1.1× real-time, deterministic), **quality SHIP** (ETA honestly conservative 2517 vs 2900),
+**layered SHIP** (ETA caveat now fixed).
+
+**R5-E2 — the project's FIRST perceptual reference numbers (real measured LPIPS, not a proxy).** Degrade-
+and-restore protocol (SD = pseudo-HD GT → degrade 2× → restore → score vs GT) with a `real` codec-like
+degrade operator. Headline LPIPS (talking-head / high-motion, `real`): instant **0.108 / 0.008**, quality
+**0.108–0.123**, layered-plate **0.123 / 0.009**. **Three findings that should shape strategy:**
+1. **The heavy x4plus is NOT a quality win on this content** — the COMPACT model beats it on every
+   full-reference metric (LPIPS 0.108 vs 0.123, PSNR +1.7 dB) at **1/10 the compute**. x4plus synthesizes
+   2.7× more HF (var-Lap 256 vs 93) but it is *misaligned* with the true GT → "sharper" by var-Lap yet worse
+   by LPIPS — **a live GOTCHA #23**. Implication: lean the quality mode's region-aware blend toward compact;
+   x4plus is only clearly defensible on the **layered static plate** (cost amortized, HF doesn't flicker).
+   CAVEAT (honest): one clip + a moderate degrade operator; x4plus is built for heavier degradation and may
+   pull ahead on grittier sources — do NOT rip x4plus out, just stop assuming it's the quality ceiling.
+2. **fp16 is perceptually identical** (LPIPS(fp16,fp32) 0.00002–0.00005) for a free 1.23× — re-confirms R2-E4.
+3. **Grain HURTS every full-reference metric** (it's additive noise uncorrelated with the clean GT) — it is
+   an aesthetic/NR overlay (default-OFF is right for fidelity); `low` is the minimum dose if wanted, and a
+   touch of `low` grain *reduces* tOF on high-motion. Also: PSNR rated SR ≈ bicubic on talking-head while
+   LPIPS showed SR *halves* perceived distortion (−51%) — the perception-distortion gap the project never measured.
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a
