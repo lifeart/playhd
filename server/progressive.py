@@ -217,8 +217,13 @@ class FragmentMuxer:
         for pkt in self.vst.encode():        # flush video encoder
             pkt.stream = self.vst
             self.out.mux(pkt)
-        if self.aout is not None:            # drain remaining audio up to the real video end
-            self._feed_audio(float("inf"))
+        if self.aout is not None:            # mux audio only up to the produced video duration --
+            # NOT float("inf"): with a capped video (e.g. ?frames=N on a long source) the source
+            # audio iterator still holds the WHOLE track, and draining it all here appends minutes
+            # of audio past the video end and corrupts the file (R2-E4 BUG-1). The streaming loop
+            # already fed audio to ~video_end + AUDIO_LOOKAHEAD_S, so this adds nothing for an
+            # uncapped clip and bounds a capped one to its real length.
+            self._feed_audio(self._video_time())
         try:
             self.out.close()
         finally:

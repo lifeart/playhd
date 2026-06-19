@@ -21,8 +21,13 @@ server/outputs/
 server/uploads/
 experiments/*/artifacts/
 experiments/*/out*/
+experiments/*/cache/
+experiments/*/crops/
 experiments/*/*.json
 experiments/*/run.log
+experiments/**/*.npy
+experiments/**/*.mp4
+experiments/**/*.png
 *.log
 
 # scratch backups
