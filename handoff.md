@@ -766,6 +766,60 @@ layered missed-cut corruption is the **#1 robustness fix** — see `experiments/
 (fix: a per-frame plate-validity guard cross-checking composite-vs-LR consistency + a chroma/structural
 term in the cut detector). Other modes are unaffected by a missed cut (per-frame source is correct).
 
+## Research round R4 — 4 parallel Opus experiments (2026-06-20)
+
+Led by the #1 open bug. Reports in `experiments/r4_*/REPORT.md`.
+
+| # | experiment | verdict | status |
+|---|---|---|---|
+| **R4-E1** | Fix the layered missed-cut plate corruption (the #1 bug) | **FIXED** | **INTEGRATED + verified** |
+| **R4-E2** | Wire+verify MV interpolation ("smooth 2×") | **PASS** | validated, ready-to-land (default-OFF) |
+| **R4-E3** | Instant low-light/noise cliff | **FIXED** | **INTEGRATED** (cap, default-OFF opt-in) |
+| **R4-E4** | "Auto" mode-selection | **8/8 authored, 9/10** | validated, ready-to-land |
+
+**R4-E1 — INTEGRATED (the silent layered missed-cut corruption is fixed).** Two fixes, defense-in-depth:
+(a) a **per-frame plate-validity guard** (`layered_api.composite_frame_guarded` + `PLATE_GUARD_*`, wired
+in `pipeline_api` PASS B): per frame, downscale the HD plate to LR and PSNR it against the decoded LR over
+the **background region only** (matte α<0.5, eroded); trip on an absolute floor (24 dB) OR a relative
+cliff (>8 dB below the per-scene EMA) → fall back to the **full-frame compact SR already computed inside
+the composite** (so a tripped frame costs ZERO extra SR). Robust to ANY missed cut, detector-independent.
+(b) a **chroma-dominant cut term** in `scene_detect` (fires only when `dChroma > 1.1·dLuma` — the
+missed-cut signature; luma path byte-identical). **Lead-verified end-to-end:** on the c7 repro the post-cut
+LR-consistency is restored **14.7 → 42.5 dB**; a normal static talking-head trips the guard 0/44 frames
+(byte-identical), and `sample.mp4` cut detection stays 1.00/1.00 (zero new false positives). (a) is the
+must-have — `segment_scenes` merges a too-short trailing scene back, which can undo (b) alone.
+**Honest metric: this bug is invisible to tOF (the wrong plate is temporally stable) — only fidelity-vs-LR
+catches it.**
+
+**R4-E3 — INTEGRATED as a default-OFF opt-in (instant low-light/noise cliff).** Root cause (sharper than
+R3-E2): noise makes the encoder **intra-code ~99% of blocks** → no MVs to propagate → the safeguard wastes
+a full per-frame SR on every frame (121 ms/frame, 3.9× over budget). A **motion-gated fallback-saturation
+cap** (`INSTANT_FALLBACK_SATURATION_CAP`, via the existing `thresh_fn` hook) declines SR escalation on
+high-fallback + low-motion frames → bicubic floor → real-time (121→31 ms/frame, verified). **DEFAULT OFF
+(=1.0)** because it is byte-identical only on LOW-fallback content — it also fires on non-noise
+high-fallback + low-motion frames (a title-card reveal: short.mp4 n_sr 3→1), trading their SR fallback for
+the bicubic floor (a small but real behaviour change). The product avoids the cliff at the mode level
+instead: **R4-E4 auto-mode routes noise → quality**. Set `CAP=0.70` to enable for instant-on-noise; an
+intra-fraction>0.8 gate (the agent's hardening note) would spare title reveals. Pre-denoise CANNOT restore
+real-time (it can't create MVs — verified).
+
+**R4-E2 — GO, validated, ready to wire (not integrated).** The R3-E1 interpolation wired as an optional
+"smooth 2×" output reproduces the quality exactly through the pipeline (+3.6 to +8.9 dB PSNR over
+dup/linear-blend), both ship-blockers verified (intra-hole routing only; scene-cut guard → frame-dup on
+>0.5 intra-hole), output-only (real frames byte-identical, never enters `R[]`), OFF byte-identical (40/40),
+real in-sync 50-fps mp4, ~8–15 ms/inserted-frame at the 720p tier. Lead-landable `interp_pass.py` +
+default-OFF diff in `experiments/r4_e2_interp_wire/`.
+
+**R4-E4 — auto-mode works, validated, ready to wire (not integrated).** A ~1 s `recommend_mode(input_path)`
+probe (one decode pass: codec-MV magnitude + occlusion-fallback% + Canny edge density + scene-cut count +
+static-camera verdict + a gated human matte) picks instant/quality/layered, matching the honest-metric best
+on **8/8 authored clips, 9/10 overall** (the lone miss is a safe over-escalation — a content flash mis-read
+as a missed cut → quality, costing time not quality). Two measured design choices: **median** MV magnitude
+(a cut frame's 207-px spike fakes high motion in the mean), and **detected vs missed** cut (a detected cut
+splits the chunk → instant-safe; only a *missed moving* cut escalates). The **human-matte gate**
+structurally prevents the R4-E1 layered corruption on all non-human content. Probe is 50–150× cheaper than a
+render. Integration sketch (`recommend_mode` + an "auto" mode) in `experiments/r4_e4_automode/`.
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a

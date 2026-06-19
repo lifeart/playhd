@@ -1,0 +1,87 @@
+--- a/server/layered_api.py	2026-06-20 01:12:14.555047458 +0300
++++ b/server/layered_api.py	2026-06-20 01:43:54.999634749 +0300
+@@ -90,6 +90,27 @@
+ # frame. lp.composite stays byte-identical with its defaults, so only the layered path changes.
+ LAYERED_SEAM_FIX = True
+ 
++# R4-E1 PLATE-VALIDITY GUARD. The per-scene background plate is laid under (1-alpha) every frame. If
++# a scene cut is MISSED (similar-luma -- scene_detect's luma signal stays below threshold) the plate
++# spans two scenes and the WRONG background is painted over a whole scene: a SILENT corruption (the
++# wrong plate is temporally stable, so tOF is BLIND; only fidelity-vs-LR exposes it -- LR-consistency
++# 33.8->14.7 dB on the c7 repro). This guard cheaply checks, PER FRAME, whether the plate actually
++# matches THIS frame's background region, and FALLS BACK (to the full-frame compact SR of the real
++# frame -- already computed inside the composite, so a tripped frame costs NO extra SR) when it does
++# not. It is layered-scoped and robust to ANY missed cut, independent of the detector. R4-E1 verified:
++# on c7 the post-cut LR-consistency is restored 14.7->42.5 dB; on a normal static talking-head the
++# guard trips 0 frames and the plate path is byte-identical.
++PLATE_GUARD_ENABLE = True
++PLATE_GUARD_PSNR_DB = 24.0   # ABSOLUTE floor: a plate below this bg-PSNR is wrong -> fall back
++                             #   (corrupt c7 frames 14.7 dB; worst legit plate frame 30.3 dB)
++PLATE_GUARD_DROP_DB = 8.0    # RELATIVE cliff: also fall back on a sudden >8 dB drop below the plate's
++                             #   own established per-scene level (protects a uniformly LOWER-but-correct
++                             #   plate -- textured/low-light/grainy bg -- while catching a mid-scene
++                             #   plate that was good then went wrong)
++PLATE_GUARD_ERODE = 4        # erode the bg mask (px) to drop the soft matte-edge band
++PLATE_GUARD_MIN_BG = 0.02    # need at least this fraction of the frame as bg to judge (else trust plate)
++PLATE_GUARD_EMA = 0.30       # per-scene bg-PSNR baseline EMA weight (matches scene_detect)
++
+ # Scene-cut detection now lives in scene_detect (ONE source of truth, shared with
+ # pipeline_api.stream_gops). These constants are the layered defaults forwarded to it; the
+ # detector adds an adaptive-baseline (hysteresis) relative test on top of the same two signals
+@@ -331,3 +352,56 @@
+     # already restored ONCE per scene in PASS A, so seam_restore stays 0 here.
+     out, _c = lp.composite(fg_hd, alpha_hd, plate_hd, feather=LAYERED_SEAM_FIX)
+     return out
++
++
++# --------------------------------------------------------------------------- #
++# R4-E1 PLATE-VALIDITY GUARD (fix a) -- cheap per-frame check + auto-fallback.
++# --------------------------------------------------------------------------- #
++def plate_bg_psnr(img_lr, pha_lr, plate_hd, erode=PLATE_GUARD_ERODE, min_bg=PLATE_GUARD_MIN_BG):
++    """PSNR(plate-downscaled-to-LR, decoded-LR) over the BACKGROUND region only -- the honest
++    fidelity-vs-LR check for THIS bug (tOF is blind). img_lr: uint8 HxWx3 decoded LR. pha_lr: HxW
++    float matte in [0,1]. plate_hd: uint8 HD plate. The plate IS supposed to be this frame's
++    background, so over background pixels (alpha<0.5, eroded to drop the soft matte edge) the
++    plate downscaled by INTER_AREA (the area-average inverse of the SR upscale) should match the
++    decoded LR closely (~30-40 dB); a WRONG-scene plate craters (~12-16 dB). Returns dB, or +inf
++    when there is too little background to judge (-> never trips)."""
++    h, w = img_lr.shape[:2]
++    plate_lr = cv2.resize(plate_hd, (w, h), interpolation=cv2.INTER_AREA)
++    bg = np.asarray(pha_lr, np.float32) < 0.5
++    if erode > 0:
++        bg = cv2.erode(bg.astype(np.uint8), np.ones((erode, erode), np.uint8)) > 0
++    if int(bg.sum()) < max(64, int(min_bg * bg.size)):
++        return float("inf")
++    diff = (plate_lr.astype(np.float32) - img_lr.astype(np.float32))[bg]
++    mse = float(np.mean(diff * diff))
++    return 99.0 if mse < 1e-6 else float(10.0 * np.log10(255.0 ** 2 / mse))
++
++
++def plate_is_bad(bg_psnr, baseline, abs_db=PLATE_GUARD_PSNR_DB, drop_db=PLATE_GUARD_DROP_DB):
++    """True => the plate does NOT match this frame's background (fall back). `baseline` is the
++    per-scene EMA of bg_psnr over frames that PASSED (None until seeded). Trips on the ABSOLUTE
++    floor OR a sudden CLIFF below the plate's own established level."""
++    if not np.isfinite(bg_psnr):
++        return False                                  # too little bg to judge -> trust the plate
++    if bg_psnr < abs_db:
++        return True
++    if baseline is not None and bg_psnr < baseline - drop_db:
++        return True
++    return False
++
++
++def composite_frame_guarded(img, pha, plate_hd, w_hd, h_hd, plate_baseline=None):
++    """Guarded PASS B composite. Computes fg_hd ONCE; if the plate fails the bg-validity check it
++    returns the full-frame compact SR (faithful to the real frame -- kills the missed-cut plate
++    corruption) instead of the plate composite. Returns (out_uint8, bg_psnr, plate_bad). The caller
++    threads `plate_baseline` (per-scene EMA of bg_psnr over passing frames; reset at each scene)."""
++    fg_hd, _ms = lp.foreground_compact(img)
++    if PLATE_GUARD_ENABLE:
++        bg_psnr = plate_bg_psnr(img, pha, plate_hd)
++        if plate_is_bad(bg_psnr, plate_baseline):
++            return fg_hd, bg_psnr, True               # FALL BACK: real content, no stale plate
++    else:
++        bg_psnr = float("nan")
++    alpha_hd = lp.alpha_to_hd(pha, (h_hd, w_hd))
++    out, _c = lp.composite(fg_hd, alpha_hd, plate_hd, feather=LAYERED_SEAM_FIX)
++    return out, bg_psnr, False

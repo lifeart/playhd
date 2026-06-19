@@ -1,0 +1,129 @@
+--- a/server/scene_detect.py	2026-06-19 13:15:00.938138916 +0300
++++ b/server/scene_detect.py	2026-06-20 01:42:58.287929374 +0300
+@@ -72,6 +72,23 @@
+ MIN_SCENE_LEN = 24       # frames; cuts closer than this to the last accepted cut are dropped
+ EMA_ALPHA = 0.30         # motion-baseline EMA weight (higher = faster to follow motion changes)
+ 
++# --------------------------------------------------------------------------- #
++# CHROMA-DOMINANT cut test (R4-E1). A SIMILAR-LUMA scene cut (two shots of similar brightness,
++# e.g. a warm->cool re-grade boundary) is INVISIBLE to the luma tests above: |Δluma| stays below
++# REL_FLOOR even though the content changed (verified: c7 cut |Δluma|=26 < 40; c5 |Δluma|=47 < 8*base).
++# Such cuts are betrayed by CHROMA -- the colour changes far more than the brightness. We ADD a
++# chroma test (the luma path is byte-identical) that fires ONLY when chroma moves MORE than luma
++# (dChroma > CHROMA_DOM*dLuma) -- the missed-cut signature. That dominance gate is what separates a
++# real similar-luma cut (c7 dC 34 > dL 26; c5 dC 109 > dL 47) from sample.mp4's legitimate NON-cuts,
++# which are all LUMA-dominant brightness flashes (frame 125 dC 30 < dL 34; 303 dC 31 < dL 43;
++# 857 dC 30 < dL 39) and so never trip it. R4-E1 verified: sample.mp4 [0,5060] cut set is UNCHANGED
++# (zero new false positives, 1.00/1.00 preserved) while the previously-missed c5/c7 cuts are caught.
++CHROMA_ABS = 60.0        # |ΔU|+|ΔV| above this (and chroma-dominant) => cut (catches c5 dC~109)
++CHROMA_REL_FLOOR = 22.0  # the relative chroma test never fires below this (catches c7 dC~34)
++CHROMA_REL_MULT = 6.0    # ...and only at this many x the local CHROMA baseline (self-calibrates to a
++                         #   panning scene's high chroma baseline, e.g. c5/c5b ~29)
++CHROMA_DOM = 1.1         # gate: chroma must exceed luma by this factor (the similar-luma signature)
++
+ 
+ def luma(img: np.ndarray) -> np.ndarray:
+     """uint8 HxWx3 RGB -> float32 HxW Rec.601 luma. (Luma is enough for cut detection and is
+@@ -86,6 +103,19 @@
+     return float(np.abs(cur_luma - prev_luma).mean())
+ 
+ 
++def chroma_uv(img: np.ndarray) -> "Tuple[np.ndarray, np.ndarray]":
++    """uint8 HxWx3 RGB -> (U, V) chroma planes (float32) via BT.601 YUV. Used only by the
++    chroma-dominant cut test; cheap (one cv2 colour convert per frame, no GPU)."""
++    import cv2
++    yuv = cv2.cvtColor(img, cv2.COLOR_RGB2YUV).astype(np.float32)
++    return yuv[..., 1], yuv[..., 2]
++
++
++def chroma_diff(prev_u, prev_v, cur_u, cur_v) -> float:
++    """mean|ΔU| + mean|ΔV| between two consecutive display frames (the chroma-change signal)."""
++    return float(np.abs(cur_u - prev_u).mean() + np.abs(cur_v - prev_v).mean())
++
++
+ class StreamingCutDetector:
+     """Online scene-cut detector. Feed frames in DISPLAY order; holds one previous luma frame.
+ 
+@@ -95,17 +125,26 @@
+ 
+     def __init__(self, cut_thresh=CUT_THRESH, iframe_thresh=IFRAME_THRESH,
+                  rel_floor=REL_FLOOR, rel_mult=REL_MULT, min_scene_len=MIN_SCENE_LEN,
+-                 ema_alpha=EMA_ALPHA):
++                 ema_alpha=EMA_ALPHA, chroma_abs=CHROMA_ABS, chroma_rel_floor=CHROMA_REL_FLOOR,
++                 chroma_rel_mult=CHROMA_REL_MULT, chroma_dom=CHROMA_DOM):
+         self.cut_thresh = cut_thresh
+         self.iframe_thresh = iframe_thresh
+         self.rel_floor = rel_floor
+         self.rel_mult = rel_mult
+         self.min_scene_len = min_scene_len
+         self.ema_alpha = ema_alpha
++        self.chroma_abs = chroma_abs
++        self.chroma_rel_floor = chroma_rel_floor
++        self.chroma_rel_mult = chroma_rel_mult
++        self.chroma_dom = chroma_dom                # 0 disables the chroma test (luma-only legacy)
+         self._prev_luma: Optional[np.ndarray] = None
++        self._prev_u: Optional[np.ndarray] = None   # previous chroma planes (for the chroma test)
++        self._prev_v: Optional[np.ndarray] = None
+         self._base: Optional[float] = None     # EMA motion baseline (None until re-seeded)
++        self._base_c: Optional[float] = None   # EMA CHROMA baseline (None until re-seeded)
+         self._last_cut_idx: int = 0            # idx of the last accepted cut (or scene start)
+         self.last_diff: float = 0.0            # most recent diff (exposed for diagnostics)
++        self.last_chroma_diff: float = 0.0     # most recent chroma diff (diagnostics)
+ 
+     def _raw_cut(self, d: float, ptype: str) -> bool:
+         if d > self.cut_thresh:                                  # (A) absolute
+@@ -117,29 +156,51 @@
+             return True
+         return False
+ 
++    def _chroma_cut(self, d: float, dc: float) -> bool:
++        # (D) CHROMA-DOMINANT: a similar-luma colour cut. Only when chroma moves MORE than luma
++        # (the missed-cut signature; rejects luma-dominant brightness flashes). Mirrors the luma
++        # absolute/relative pair on the SEPARATE chroma baseline.
++        if self.chroma_dom <= 0 or dc <= self.chroma_dom * d:
++            return False
++        if dc > self.chroma_abs:                                          # (D-abs) big colour change
++            return True
++        if (self._base_c is not None and dc > self.chroma_rel_floor       # (D-rel) colour spike
++                and dc > self.chroma_rel_mult * self._base_c):
++            return True
++        return False
++
+     def update(self, idx: int, ptype: str, img: np.ndarray) -> bool:
+         cur = luma(img)
++        cu, cv = (chroma_uv(img) if self.chroma_dom > 0 else (None, None))
+         if self._prev_luma is None:                 # first frame: scene start, not a cut
+             self._prev_luma = cur
++            self._prev_u, self._prev_v = cu, cv
+             self._last_cut_idx = idx
+             return False
+         d = frame_diff(self._prev_luma, cur)
++        dc = (chroma_diff(self._prev_u, self._prev_v, cu, cv)
++              if self.chroma_dom > 0 else 0.0)
+         self.last_diff = d
++        self.last_chroma_diff = dc
+         self._prev_luma = cur
++        self._prev_u, self._prev_v = cu, cv
+ 
+-        raw = self._raw_cut(d, ptype)
++        raw = self._raw_cut(d, ptype) or self._chroma_cut(d, dc)
+         far_enough = (idx - self._last_cut_idx) >= self.min_scene_len
+         is_cut = raw and far_enough
+ 
+         if is_cut:
+             self._last_cut_idx = idx
+-            self._base = None                        # re-seed baseline from the new scene
++            self._base = None                        # re-seed baselines from the new scene
++            self._base_c = None
+         else:
+-            # update the motion baseline ONLY on non-cut frames so a cut spike never poisons it.
++            # update the motion baselines ONLY on non-cut frames so a cut spike never poisons them.
+             # Suppressed-by-min-scene-length spikes ARE folded in (they are part of the burst the
+             # baseline is meant to track).
+             self._base = d if self._base is None else (
+                 self.ema_alpha * d + (1.0 - self.ema_alpha) * self._base)
++            self._base_c = dc if self._base_c is None else (
++                self.ema_alpha * dc + (1.0 - self.ema_alpha) * self._base_c)
+         return is_cut
+ 
+ 

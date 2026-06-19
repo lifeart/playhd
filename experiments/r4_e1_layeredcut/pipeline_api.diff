@@ -1,0 +1,32 @@
+--- a/server/pipeline_api.py	2026-06-20 01:15:13.130346041 +0300
++++ b/server/pipeline_api.py	2026-06-20 01:44:29.717099041 +0300
+@@ -717,6 +717,7 @@
+         w_lr = h_lr = w_hd = h_hd = None
+         ratio = None
+         cur_plate_sid, cur_plate = None, None
++        plate_base = None                 # R4-E1: per-scene plate-validity bg-PSNR baseline (EMA)
+         rvm_sid, rec = None, [None] * 4
+         try:
+             for chunk in stream_gops(input_path, max_frames=max_frames):
+@@ -736,11 +737,20 @@
+                         cur_plate = _grain.apply_grain(np.load(info["plate_path"]),
+                                                        _PLATE_GRAIN_SEED, "med")
+                         cur_plate_sid = sid
++                        plate_base = None         # R4-E1: reset the per-scene plate-validity baseline
+                     if rvm_sid != sid:            # thread RVM recurrent state per scene
+                         rec, rvm_sid = [None] * 4, sid
+                     for (_ptype, img, _mvs) in sub:
+                         pha, rec = _layered.matte_frame_np(model, img, rec, ratio, device)
+-                        comp = _layered.composite_frame(img, pha, cur_plate, w_hd, h_hd)
++                        # R4-E1: plate-validity guard. If the plate does NOT match this frame's
++                        # background (a MISSED scene cut -> wrong fixed plate -> silent corruption),
++                        # composite_frame_guarded returns the faithful full-frame compact SR instead.
++                        comp, _bgp, _bad = _layered.composite_frame_guarded(
++                            img, pha, cur_plate, w_hd, h_hd, plate_base)
++                        if not _bad and _bgp == _bgp:   # finite bg-PSNR -> update per-scene baseline
++                            plate_base = _bgp if plate_base is None else (
++                                _layered.PLATE_GUARD_EMA * _bgp
++                                + (1.0 - _layered.PLATE_GUARD_EMA) * plate_base)
+                         # V1: per-frame grain ONLY on the moving foreground (gate by alpha). The
+                         # background keeps the plate's fixed grain (stable); the subject gets fresh
+                         # per-frame grain -> the layered mode's steady background is now visible.
