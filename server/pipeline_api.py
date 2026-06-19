@@ -76,6 +76,20 @@ def _free_gpu():
 import layered_api as _layered  # noqa: E402  (LAYERED mode: two-pass-per-scene helpers)
 import scene_detect              # noqa: E402  (robust scene-CUT detector -> forced fresh anchors)
 
+# Instant-mode speedup (Levers 1-4). These live in server/ and import the prototype READ-ONLY.
+import anchor_sr                 # noqa: E402  (Lever 1: anchor-only SR cache + adaptive safeguard)
+import fast_grain                # noqa: E402  (Lever 2: GPU/MPS film grain)
+try:
+    import gpu_ops as _gpu_ops   # noqa: E402  (Lever 4: GPU-resident recon -> single host download)
+except Exception:
+    _gpu_ops = None
+
+# Adaptive-safeguard threshold for the instant path: a non-anchor frame whose occlusion-fallback
+# fraction exceeds this gets a real SR call (bicubic only handles smaller fallback). 0.08 == the
+# high-motion regime; tuned + verified in bench_instant.py (propagated pixels stay ~identical to
+# full-SR, only sub-threshold fallback regions soften to bicubic).
+INSTANT_FALLBACK_THRESH = 0.08
+
 SAMPLE_MP4 = os.path.join(_REPO, "sample.mp4")
 OUTPUTS_DIR = os.path.join(_HERE, "outputs")
 UPLOADS_DIR = os.path.join(_HERE, "uploads")
@@ -190,7 +204,7 @@ def get_progress():
 # Rough processing cost per mode (ms/frame, measured) -> the UI shows an estimate so the
 # user never blind-launches a 12-hour job on a 34-min source. The pipeline is ~10x slower
 # than real-time, so a long clip is a long render; this surfaces that BEFORE Process & Play.
-MODE_MS_PER_FRAME = {"instant": 400.0, "quality": 2900.0, "layered": 470.0}
+MODE_MS_PER_FRAME = {"instant": 130.0, "quality": 2900.0, "layered": 470.0}
 
 
 def _source_meta(path):
@@ -453,19 +467,65 @@ def _mux_av(video_tmp, src_path, out_path, n_video_frames, fps):
 # --------------------------------------------------------------------------- #
 # Incremental HD video encoder (kept open across chunks).
 # --------------------------------------------------------------------------- #
+# HARDWARE ENCODE (Lever 3): on Apple silicon, h264_videotoolbox is a dedicated media-engine
+# H.264 encoder -- it offloads the encode off the CPU entirely (~5 ms/frame vs ~44 ms for
+# libx264 software). We prefer it and FALL BACK to libx264 if it is unavailable or fails to
+# open. VideoToolbox has no CRF; quality is set via a generous target bitrate (a function of
+# pixel count) tuned to be visually lossless vs the libx264 crf18 baseline (verified by PSNR in
+# bench_instant.py). faststart + the audio mux are unchanged (they happen later, in _mux_av).
+_HW_CODEC = "h264_videotoolbox"
+# bits-per-pixel-per-second target for the HW encoder, tuned in bench_instant.py so the decoded
+# VideoToolbox output matches libx264 crf18 (the BEFORE baseline) for this grained HD content:
+# 0.70 bpp -> ~37.7 dB decode PSNR (== x264's 37.97) at ~14 MB/48f (== x264's size), and encode
+# stays ~10 ms/frame (HW encode time is ~flat in bitrate), so quality parity costs no speed.
+_HW_BPP = 0.70
+
+
+def _hw_encode_available():
+    try:
+        av.codec.Codec(_HW_CODEC, "w")
+        return True
+    except Exception:
+        return False
+
+
 class _VideoWriter:
-    def __init__(self, path, fps):
+    """Incremental HD encoder kept open across chunks. Prefers the VideoToolbox HW encoder
+    (Lever 3) and transparently falls back to libx264 software. `codec=None` => auto (HW if
+    available); pass 'libx264' to force the software baseline (used by the BEFORE benchmark)."""
+
+    def __init__(self, path, fps, codec=None):
         self.cont = av.open(path, "w")
         self.fps = fps
         self.st = None
+        if codec is None:
+            codec = _HW_CODEC if _hw_encode_available() else "libx264"
+        self.codec = codec
+        self.encoder = None        # the codec actually used (set on first frame; may fall back)
 
     def _ensure(self, w_hd, h_hd):
-        if self.st is None:
-            st = self.cont.add_stream("libx264", rate=self.fps)
-            st.width, st.height, st.pix_fmt = w_hd, h_hd, "yuv420p"
-            st.options = {"crf": "18"}
-            self.st = st
-        return self.st
+        if self.st is not None:
+            return self.st
+        want = self.codec
+        for cand in ([want] if want == "libx264" else [want, "libx264"]):
+            try:
+                st = self.cont.add_stream(cand, rate=self.fps)
+                st.width, st.height, st.pix_fmt = w_hd, h_hd, "yuv420p"
+                if cand == _HW_CODEC:
+                    # VideoToolbox: target-bitrate quality (no CRF). realtime=1 lets the media
+                    # engine run unthrottled; allow_sw=1 keeps it working if the HW path is busy.
+                    st.bit_rate = int(w_hd * h_hd * float(self.fps) * _HW_BPP)
+                    st.options = {"realtime": "1", "allow_sw": "1"}
+                else:
+                    st.options = {"crf": "18"}
+                self.st = st
+                self.encoder = cand
+                return self.st
+            except Exception:
+                if cand == "libx264":
+                    raise
+                continue
+        raise RuntimeError("no usable H.264 encoder")
 
     def write(self, rgb_uint8):
         h_hd, w_hd = rgb_uint8.shape[:2]
@@ -584,7 +644,7 @@ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
         _set_progress(state="processing", total=total, done=0,
                       message="compositing frames (foreground per frame, plate reused)")
         t_passB = time.perf_counter()
-        writer = _VideoWriter(video_tmp, fps)
+        writer = _VideoWriter(video_tmp, fps, codec="libx264")   # layered: keep software encoder
         done = 0
         n_chunks = 0
         w_lr = h_lr = w_hd = h_hd = None
@@ -711,11 +771,29 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
         total = probe_total_frames(input_path, max_frames)
         _set_progress(state="processing", total=total, message="upscaling")
 
-        writer = _VideoWriter(video_tmp, fps)
+        # The instant mode takes the FAST path (Levers 1-4): anchor-only SR, GPU-resident
+        # reconstruct (no per-frame readback), GPU film grain, single host download, HW encode.
+        # The quality mode keeps the original full-SR + region-aware + CPU-grain + libx264 path
+        # untouched (HW encode is scoped to instant so quality/layered cannot regress).
+        fast = (mode == "instant" and cfg["backend"] == "torch" and _gpu_ops is not None)
+
+        writer = _VideoWriter(video_tmp, fps, codec=(None if fast else "libx264"))
         done = 0
         n_chunks = 0
         w_lr = h_lr = w_hd = h_hd = None
-        t_sr = t_recon = 0.0
+        t_sr = t_recon = t_grain = t_encode = 0.0
+        n_sr_calls = 0
+        n_upgrades = 0
+        ggrain = None
+
+        def _emit():
+            elapsed = time.perf_counter() - t0
+            rate = elapsed / max(1, done)
+            eta = rate * (total - done) if total and done <= total else None
+            _set_progress(done=done, elapsed_s=round(elapsed, 1),
+                          eta_s=(round(eta, 1) if eta is not None else None),
+                          ms_per_frame=round(rate * 1000.0, 1))
+
         try:
             for chunk in stream_gops(input_path, max_frames=max_frames):
                 n_chunks += 1
@@ -723,6 +801,56 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     h_lr, w_lr = chunk[0][1].shape[:2]
                     w_hd, h_hd = w_lr * SCALE, h_lr * SCALE
 
+                if fast:
+                    # 1) Lever 1: anchor-only SR cache -- SR the anchors + any high-fallback
+                    #    BACKBONE frame (so its detail propagates); cv2 bicubic everywhere else.
+                    ts = time.perf_counter()
+                    perframe_cache, _ac, sr_set = anchor_sr.build_anchor_cache(
+                        chunk, w_hd, h_hd, cfg["sr_mode"], occ_mode=cfg["occ"],
+                        fallback_thresh=INSTANT_FALLBACK_THRESH)
+                    t_sr += time.perf_counter() - ts
+
+                    # 2) Lever 4: reconstruct GPU-resident (download_output=False) -- the HD recon
+                    #    chain stays on-device; no per-frame host round-trip in reconstruct.
+                    tr = time.perf_counter()
+                    _, R = derisk.reconstruct(
+                        chunk, None, SCALE, True, cfg["occ"], perframe_cache, set(),
+                        backend=cfg["backend"], collect_metrics=False, download_output=False)
+                    t_recon += time.perf_counter() - tr
+
+                    # 3) adaptive safeguard for the B LEAVES (post-reconstruct, correct since a
+                    #    leaf is never a reference): SR-patch any B frame's fallback pixels above
+                    #    threshold. hole_frac is exact + anchor-invariant -> no extra mask scan.
+                    ts = time.perf_counter()
+                    p_info = anchor_sr.patch_high_fallback(
+                        chunk, R, w_hd, h_hd, cfg["sr_mode"],
+                        fallback_thresh=INSTANT_FALLBACK_THRESH, skip=sr_set)
+                    t_sr += time.perf_counter() - ts
+                    n_sr_calls += p_info["n_sr_calls"]
+                    n_upgrades += p_info["n_adaptive_upgrades"]
+
+                    if ggrain is None and cfg["grain"] != "off":
+                        ggrain = fast_grain.GpuGrain(h_hd, w_hd, _gpu_ops.device())
+
+                    # 4) Lever 2 grain on-device + the single GPU->host download (HW encode needs
+                    #    a CPU frame) + Lever 3 HW encode, then free the chunk.
+                    for i in range(len(chunk)):
+                        recon_t = R[i]["recon"]                  # [1,3,H,W] float, GPU-resident
+                        tg = time.perf_counter()
+                        if cfg["grain"] != "off":
+                            recon_t = ggrain.apply(recon_t, done, cfg["grain"])
+                        recon = fast_grain.download_rgb(recon_t)  # contiguous-HWC GPU->host (~5x)
+                        t_grain += time.perf_counter() - tg
+                        te = time.perf_counter()
+                        writer.write(recon)
+                        t_encode += time.perf_counter() - te
+                        done += 1
+                        _emit()
+                    del perframe_cache, R, chunk
+                    _free_gpu()
+                    continue
+
+                # ---- QUALITY (region-aware) path -- original full-SR pipeline, untouched ----
                 # 1) per-frame SR cache for this chunk (anchor / fallback / baseline source)
                 ts = time.perf_counter()
                 perframe_cache = derisk.build_perframe_cache(chunk, w_hd, h_hd, cfg["sr_mode"])
@@ -751,12 +879,7 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                         recon = _grain.apply_grain(recon, done, cfg["grain"])
                     writer.write(recon)
                     done += 1
-                    elapsed = time.perf_counter() - t0
-                    rate = elapsed / done
-                    eta = rate * (total - done) if total and done <= total else None
-                    _set_progress(done=done, elapsed_s=round(elapsed, 1),
-                                  eta_s=(round(eta, 1) if eta is not None else None),
-                                  ms_per_frame=round(rate * 1000.0, 1))
+                    _emit()
 
                 del perframe_cache, region_gate, R, chunk
                 _free_gpu()                         # release MPS cache between chunks (see _free_gpu)
@@ -782,6 +905,15 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
             "t_total_s": round(total_s, 2),
             "ms_per_frame": round(total_s * 1000.0 / max(1, done), 1),
         })
+        if fast:                                   # instant fast-path extras (Levers 1-4)
+            LAST_STATS.update({
+                "t_grain_io_s": round(t_grain, 2),     # GPU grain + the single host download
+                "t_encode_s": round(t_encode, 2),      # HW (VideoToolbox) encode
+                "video_encoder": getattr(writer, "encoder", None),
+                "n_sr_calls": n_sr_calls,              # anchors + adaptive upgrades
+                "sr_calls_per_frame": round(n_sr_calls / max(1, done), 3),
+                "n_adaptive_upgrades": n_upgrades,
+            })
         _set_progress(state="done", done=done, elapsed_s=round(total_s, 1),
                       eta_s=0.0, ms_per_frame=round(total_s * 1000.0 / max(1, done), 1),
                       message="done")
