@@ -1,15 +1,16 @@
 """playhd Stage-1 local server.
 
-A minimal FastAPI app that wraps the validated upscaling pipeline so a user can, in a
-browser: pick a source mp4, choose a quality mode, click "Process & Play", and watch the
-upscaled result.
+A minimal FastAPI app that wraps the validated streaming upscaling pipeline so a user
+can, in a browser: pick a source mp4 (or upload one), choose Instant / Quality, click
+"Process & Play", watch a live progress bar, then watch the upscaled result -- WITH SOUND.
 
 Endpoints:
   GET  /                -> server/index.html (the demo console)
-  GET  /api/sources     -> available source mp4s (repo sample + server/uploads/*.mp4)
-  POST /api/process     -> run the pipeline (source|upload + mode + start/n) -> output mp4 URL
-  GET  /outputs/<f>.mp4 -> the produced mp4, served with Content-Type video/mp4 + Range
-                           support (StaticFiles) so <video> can play/seek.
+  GET  /api/sources     -> available source mp4s + the two modes
+  POST /api/process     -> run the whole-clip streaming pipeline (source|upload + mode)
+                           -> {url, source, stats}.  One job at a time (409 if busy).
+  GET  /api/progress     -> live {state, done, total, elapsed_s, eta_s, ms_per_frame}
+  GET  /outputs/<f>.mp4 -> the produced mp4 (StaticFiles: video/mp4 + HTTP Range -> seek)
 
 Run:
   cd /Users/lifeart/Repos/playhd
@@ -50,23 +51,33 @@ def index():
 @app.get("/api/sources")
 def api_sources():
     return {"sources": pipe.list_sources(), "modes": [
-        {"id": "instant", "label": "Instant (lower quality)",
-         "desc": "Compact x4 anchor on the GPU, motion-propagated. Fast, real-time-style path."},
-        {"id": "quality", "label": "Quality (buffered, slower)",
-         "desc": "Heavy x4plus anchor + region-aware detail blend. Sharper, much slower (~2 s/frame)."},
+        {"id": "instant", "label": "Instant",
+         "desc": "Compact x4 anchor on the GPU, motion-propagated. Fast (~0.4 s/frame)."},
+        {"id": "quality", "label": "Quality",
+         "desc": "Heavy x4plus anchor + region-aware detail. Sharper, slower (~2.8 s/frame)."},
+        {"id": "layered", "label": "Quality — Layered (talking-head, static camera)",
+         "desc": "Stable, shimmer-free background: heavy-SR the static background plate ONCE "
+                 "per scene, composite only the moving subject per frame. Needs a roughly "
+                 "static camera + a human subject; non-commercial matte (RVM, CC BY-NC-SA). "
+                 "Slowest path — buffered, two decode passes."},
     ]}
+
+
+@app.get("/api/progress")
+def api_progress():
+    return pipe.get_progress()
 
 
 @app.post("/api/process")
 async def api_process(
     mode: str = Form("instant"),
     source: str = Form("sample.mp4"),
-    start: int = Form(5000),
-    n: int = Form(48),
     file: UploadFile | None = File(None),
 ):
-    if mode not in pipe.MODE_CONFIG:
+    if not pipe.is_valid_mode(mode):
         raise HTTPException(400, f"unknown mode {mode!r}")
+    if pipe.is_busy():
+        raise HTTPException(409, "a clip is already being processed; please wait")
 
     # An uploaded file takes precedence over the dropdown selection.
     if file is not None and file.filename:
@@ -87,10 +98,11 @@ async def api_process(
         src_name = os.path.basename(input_path)
 
     try:
-        # Run the (blocking, GPU-bound) pipeline off the event loop.
-        out_path = await run_in_threadpool(
-            pipe.process_clip, input_path, mode, int(start), int(n)
-        )
+        # Run the (blocking, GPU-bound) WHOLE-CLIP streaming pipeline off the event loop.
+        # /api/progress is served concurrently while this runs.
+        out_path = await run_in_threadpool(pipe.process_clip, input_path, mode)
+    except pipe.BusyError:
+        raise HTTPException(409, "a clip is already being processed; please wait")
     except Exception as e:                      # surface real failures to the UI, never swallow
         raise HTTPException(500, f"pipeline failed: {type(e).__name__}: {e}")
 

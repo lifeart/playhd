@@ -23,3 +23,4 @@ server/uploads/
 
 # scratch backups
 *.step3bak
+server/testdata/

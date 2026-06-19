@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>playhd — upscaler console</title>
+<title>playhd — upscaler</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -15,10 +15,11 @@
   .sub { color: #8b949e; margin: 0 0 22px; font-size: 13px; }
   .panel {
     background: #161b22; border: 1px solid #30363d; border-radius: 10px;
-    padding: 18px 20px; max-width: 880px; margin: 0 auto 18px;
+    padding: 18px 20px; max-width: 900px; margin: 0 auto 18px;
   }
   label { display: block; font-weight: 600; margin: 14px 0 6px; font-size: 13px; }
-  select, input[type=number], input[type=file] {
+  label:first-child { margin-top: 0; }
+  select, input[type=file] {
     width: 100%; padding: 8px 10px; background: #0d1117; color: #e6edf3;
     border: 1px solid #30363d; border-radius: 6px; font-size: 14px;
   }
@@ -32,26 +33,28 @@
   .mode.sel { border-color: #2f81f7; background: #11203a; }
   .mode .t { font-weight: 700; }
   .mode .d { color: #8b949e; font-size: 12px; margin-top: 4px; }
-  button {
-    margin-top: 20px; width: 100%; padding: 12px; font-size: 15px; font-weight: 700;
+  button#go {
+    margin-top: 20px; width: 100%; padding: 13px; font-size: 16px; font-weight: 700;
     background: #238636; color: #fff; border: 0; border-radius: 8px; cursor: pointer;
   }
-  button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
-  #status { margin-top: 14px; font-size: 13px; color: #8b949e; min-height: 18px; }
+  button#go:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+  #progressWrap { margin-top: 16px; display: none; }
+  .bar { height: 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 7px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0%; background: #2f81f7;
+             transition: width .25s ease; }
+  #progressText { margin-top: 8px; font-size: 13px; color: #8b949e;
+                  font-family: ui-monospace, SFMono-Regular, monospace; }
+  #status { margin-top: 12px; font-size: 13px; color: #8b949e; min-height: 18px; }
   #status.err { color: #f85149; }
-  video { width: 100%; border-radius: 8px; margin-top: 10px; background: #000; }
+  video { width: 100%; border-radius: 8px; margin-top: 4px; background: #000; }
   .stats { font-size: 12px; color: #8b949e; margin-top: 10px; white-space: pre-wrap;
            font-family: ui-monospace, SFMono-Regular, monospace; }
-  .spin { display: inline-block; width: 13px; height: 13px; border: 2px solid #30363d;
-          border-top-color: #2f81f7; border-radius: 50%; animation: s .8s linear infinite;
-          vertical-align: -2px; margin-right: 6px; }
-  @keyframes s { to { transform: rotate(360deg); } }
   small.hint { color: #6e7681; font-weight: 400; }
 </style>
 </head>
 <body>
-  <h1>playhd — server-side video upscaler</h1>
-  <p class="sub">Pick a source, choose a mode, then Process &amp; Play. SD → HD (x4) via motion-propagated SR.</p>
+  <h1>playhd — video upscaler</h1>
+  <p class="sub">Select a clip and click Process &amp; Play. SD → HD (x4), with sound. Whole clip, any length.</p>
 
   <div class="panel">
     <div class="row">
@@ -65,21 +68,16 @@
       </div>
     </div>
 
-    <label>Quality mode</label>
+    <label>Mode</label>
     <div class="modes" id="modes"></div>
 
-    <div class="row">
-      <div>
-        <label>Start frame</label>
-        <input type="number" id="start" value="5000" min="0" step="1" />
-      </div>
-      <div>
-        <label>Frames <small class="hint">(window length)</small></label>
-        <input type="number" id="n" value="48" min="2" max="240" step="1" />
-      </div>
-    </div>
-
+    <div id="estimate" class="hint" style="margin:8px 0 2px"></div>
     <button id="go">Process &amp; Play</button>
+
+    <div id="progressWrap">
+      <div class="bar"><i id="bar"></i></div>
+      <div id="progressText"></div>
+    </div>
     <div id="status"></div>
   </div>
 
@@ -91,20 +89,54 @@
 <script>
 const $ = (id) => document.getElementById(id);
 let selectedMode = "instant";
+let pollTimer = null;
+let sourcesData = [];
+
+function humanT(s) {
+  s = Math.round(s);
+  if (s < 90) return s + "s";
+  if (s < 3600) return Math.round(s / 60) + "m";
+  return (s / 3600).toFixed(1) + "h";
+}
+
+// Show the selected source's duration + an estimated processing time for the chosen mode,
+// and warn before a long render (the pipeline is ~10x slower than real-time).
+function updateEstimate() {
+  const el = $("estimate");
+  if ($("file").files.length) {            // uploaded file: estimate only known after upload
+    el.textContent = "Uploaded clip — processing time shown once it starts. Short clips recommended.";
+    el.style.color = "";
+    return;
+  }
+  const src = sourcesData.find((x) => x.name === $("source").value);
+  if (!src || !src.est_s || src.est_s[selectedMode] == null) { el.textContent = ""; return; }
+  const est = src.est_s[selectedMode];
+  const dur = src.duration_s != null ? humanT(src.duration_s) : "?";
+  let msg = `Source ${dur} · est. ~${humanT(est)} to process (${selectedMode})`;
+  if (est > 180) {
+    msg += " ⚠ long render — try a short clip / few-second upload first";
+    el.style.color = "#d9772b";
+  } else { el.style.color = ""; }
+  el.textContent = msg;
+}
 
 async function loadSources() {
   const r = await fetch("/api/sources");
   if (!r.ok) { setStatus("failed to load sources", true); return; }
   const data = await r.json();
+  sourcesData = data.sources;
 
   const sel = $("source");
   sel.innerHTML = "";
   for (const s of data.sources) {
     const o = document.createElement("option");
     o.value = s.name;
-    o.textContent = `${s.name} (${s.size_mb} MB)`;
+    const dur = s.duration_s != null ? `, ${humanT(s.duration_s)}` : "";
+    o.textContent = `${s.name} (${s.size_mb} MB${dur})`;
     sel.appendChild(o);
   }
+  sel.onchange = updateEstimate;
+  $("file").onchange = updateEstimate;
 
   const modes = $("modes");
   modes.innerHTML = "";
@@ -116,9 +148,11 @@ async function loadSources() {
     div.onclick = () => {
       selectedMode = m.id;
       [...modes.children].forEach((c) => c.classList.toggle("sel", c.dataset.id === m.id));
+      updateEstimate();
     };
     modes.appendChild(div);
   }
+  updateEstimate();
 }
 
 function setStatus(html, isErr) {
@@ -127,23 +161,55 @@ function setStatus(html, isErr) {
   s.innerHTML = html;
 }
 
+function fmt(t) { return (t == null) ? "—" : `${t}s`; }
+
+function renderProgress(p) {
+  const total = p.total || 0;
+  const done = p.done || 0;
+  const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  $("bar").style.width = pct + "%";
+  let line = `${p.state} · ${done}/${total || "?"} frames`;
+  if (p.elapsed_s != null) line += ` · elapsed ${fmt(p.elapsed_s)}`;
+  if (p.eta_s != null && p.state === "processing") line += ` · ETA ${fmt(p.eta_s)}`;
+  if (p.ms_per_frame != null) line += ` · ${p.ms_per_frame} ms/frame`;
+  $("progressText").textContent = line;
+}
+
+async function pollProgress() {
+  try {
+    const r = await fetch("/api/progress", { cache: "no-store" });
+    if (r.ok) renderProgress(await r.json());
+  } catch (e) { /* transient; keep polling */ }
+}
+
 $("go").onclick = async () => {
   const btn = $("go");
   btn.disabled = true;
-  const t0 = performance.now();
-  setStatus(`<span class="spin"></span>Processing in <b>${selectedMode}</b> mode… `
-    + (selectedMode === "quality" ? "(heavy x4plus anchor — this can take a while)" : "(fast path)"));
+  $("progressWrap").style.display = "";
+  $("bar").style.width = "0%";
+  $("progressText").textContent = "starting…";
+  let modeNote = ".";
+  if (selectedMode === "quality") modeNote = " — heavy x4plus anchor, this is the slow path.";
+  else if (selectedMode === "layered")
+    modeNote = " — SR the static background once per scene, composite the moving subject per "
+      + "frame. Slowest (buffered) path; needs a roughly static camera + a human subject. "
+      + "Matte: RVM, CC BY-NC-SA (non-commercial).";
+  setStatus(`Processing in <b>${selectedMode}</b> mode` + modeNote);
+
+  // Live progress: poll while the (blocking) POST runs.
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(pollProgress, 400);
 
   const fd = new FormData();
   fd.append("mode", selectedMode);
   fd.append("source", $("source").value);
-  fd.append("start", $("start").value);
-  fd.append("n", $("n").value);
   const f = $("file").files[0];
   if (f) fd.append("file", f);
 
   try {
     const r = await fetch("/api/process", { method: "POST", body: fd });
+    clearInterval(pollTimer); pollTimer = null;
+    await pollProgress();
     if (!r.ok) {
       const txt = await r.text();
       setStatus("Error: " + txt, true);
@@ -151,25 +217,35 @@ $("go").onclick = async () => {
       return;
     }
     const data = await r.json();
-    const wall = ((performance.now() - t0) / 1000).toFixed(1);
-    setStatus(`Done in ${wall}s wall. Loading player…`);
+    $("bar").style.width = "100%";
+    const s = data.stats || {};
 
     $("playerPanel").style.display = "";
     const v = $("player");
+    v.muted = false;                 // play WITH sound
     v.src = data.url;
     v.load();
-    v.play().catch(() => {});
+    v.play().catch(() => setStatus("Done — click ▶ to play (browser blocked autoplay-with-sound)."));
 
-    const s = data.stats || {};
-    $("stats").textContent =
+    let statsText =
       `source       : ${data.source}\n` +
       `mode         : ${s.label || s.mode}\n` +
-      `window       : start ${s.start_frame}, ${s.n_frames} frames @ ${s.fps} fps\n` +
+      `frames       : ${s.n_frames} @ ${Number(s.fps).toFixed(2)} fps (${s.n_chunks} chunks, cap ${s.soft_cap})\n` +
       `resolution   : ${s.src_resolution} -> ${s.out_resolution} (x${s.scale})\n` +
-      `server time  : ${s.t_total_s}s total  (sr ${s.t_sr_s}s, recon ${s.t_recon_s}s, ` +
-      `encode ${s.t_encode_s}s)  = ${s.ms_per_frame} ms/frame`;
+      `audio        : ${s.audio}\n`;
+    if (s.mode === "layered") {
+      statsText +=
+        `scenes       : ${s.n_scenes} (${s.n_fallback} moving -> region-aware fallback), plate sample cap ${s.plate_sample_cap}\n` +
+        `server time  : ${s.t_total_s}s total (plate SR ${s.t_sr_s}s, build ${s.t_passA_plate_s}s, composite ${s.t_passB_composite_s}s) = ${s.ms_per_frame} ms/frame\n` +
+        `layered      : ${s.layered_note}`;
+    } else {
+      statsText +=
+        `server time  : ${s.t_total_s}s total (sr ${s.t_sr_s}s, recon ${s.t_recon_s}s) = ${s.ms_per_frame} ms/frame`;
+    }
+    $("stats").textContent = statsText;
     setStatus(`Done — ${s.out_resolution}, ${s.n_frames} frames in ${s.t_total_s}s server-side.`);
   } catch (e) {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     setStatus("Request failed: " + e, true);
   } finally {
     btn.disabled = false;
