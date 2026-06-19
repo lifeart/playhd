@@ -74,6 +74,7 @@ def _free_gpu():
         except Exception:
             pass
 import layered_api as _layered  # noqa: E402  (LAYERED mode: two-pass-per-scene helpers)
+import scene_detect              # noqa: E402  (robust scene-CUT detector -> forced fresh anchors)
 
 SAMPLE_MP4 = os.path.join(_REPO, "sample.mp4")
 OUTPUTS_DIR = os.path.join(_HERE, "outputs")
@@ -280,28 +281,45 @@ def probe_total_frames(path, max_frames=None):
 # display order. Mirrors derisk.decode_lr_and_mvs (export_mvs, int pict_type map)
 # but never re-decodes from 0 per chunk.
 # --------------------------------------------------------------------------- #
-def stream_gops(path, max_frames=None, soft_cap=SOFT_CAP_FRAMES):
-    """Yield lists of (ptype, lr_rgb, mvs) in display order. A new chunk starts at
-    every I-frame; a GOP longer than `soft_cap` is additionally cut at the next
-    backbone (I/P) frame so each chunk -- and peak HD memory -- stays bounded. Each
-    chunk is a self-contained backbone for derisk.reconstruct (its first backbone
-    frame is force-anchored because it has no in-chunk predecessor)."""
+def stream_gops(path, max_frames=None, soft_cap=SOFT_CAP_FRAMES, detect_cuts=True):
+    """Yield lists of (ptype, lr_rgb, mvs) in display order. A new chunk starts at:
+      * every codec I-frame (a self-contained backbone), AND
+      * every DETECTED SCENE CUT (scene_detect: luma-diff + I-frame flag + hysteresis) --
+        so a cut that is NOT a clean I-frame ALSO forces a fresh anchor; without this a
+        mid-GOP cut would leave the chunk spanning it and derisk.reconstruct would warp the
+        pre-cut anchor across the cut = a cross-cut smear, AND
+      * the next backbone (I/P) frame once a GOP exceeds `soft_cap` (bounds peak HD memory).
+
+    Each chunk therefore lies within ONE scene and is a self-contained backbone for
+    derisk.reconstruct: its first frame is force-anchored (no in-chunk predecessor -> fresh
+    per-frame SR, drift/smear reset). A scene cut that lands on a B-frame is handled cleanly --
+    the new chunk's leading B-leaves have no in-chunk past anchor so they warp ONLY from the
+    FUTURE (post-cut) anchor, and the previous chunk's trailing B-leaves lose their future
+    (post-cut) reference so they warp past-only (old scene); neither bridges the cut.
+
+    `detect_cuts=False` restores the OLD I-frame-only chunking (used by the BEFORE/AFTER
+    verification to reproduce the cross-cut smear)."""
     cont = av.open(path)
     try:
         vs = cont.streams.video[0]
         vs.codec_context.options = {"flags2": "+export_mvs"}
+        det = scene_detect.StreamingCutDetector() if detect_cuts else None
         chunk = []
         produced = 0
         for frame in cont.decode(vs):
             if max_frames is not None and produced >= max_frames:
                 break
             ptype = {1: "I", 2: "P", 3: "B"}.get(int(frame.pict_type), "?")
-            # Decide a boundary BEFORE adding this frame so the new chunk STARTS on a
-            # backbone frame (I always; P only when the current chunk hit the soft cap).
-            if chunk and (ptype == "I" or (len(chunk) >= soft_cap and ptype == "P")):
+            img = frame.to_ndarray(format="rgb24")
+            # Scene-cut signal for THIS frame (cut between produced-1 and produced). Computed
+            # BEFORE the boundary decision so the new chunk STARTS at the cut frame.
+            is_cut = det.update(produced, ptype, img) if det is not None else False
+            # Boundary BEFORE adding this frame so the new chunk STARTS at the boundary frame
+            # (I-frame, scene cut, or -- at the soft cap -- the next backbone P).
+            if chunk and (ptype == "I" or is_cut
+                          or (len(chunk) >= soft_cap and ptype == "P")):
                 yield chunk
                 chunk = []
-            img = frame.to_ndarray(format="rgb24")
             try:
                 sd = frame.side_data.get(derisk.SDType.MOTION_VECTORS)
             except Exception:
@@ -644,12 +662,16 @@ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
 # --------------------------------------------------------------------------- #
 # Main entry point
 # --------------------------------------------------------------------------- #
-def process_clip(input_path, mode, max_frames=None, out_path=None):
+def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=True):
     """STREAMING upscale of the WHOLE clip (or the first `max_frames` for testing).
 
     Processes the input in GOP-sized chunks (bounded memory), encoding each chunk's
     HD frames into the output video stream incrementally, then muxes the source audio
     in (copy if AAC, else transcode). Returns out_path. Timing/metadata -> LAST_STATS.
+
+    `detect_cuts` (default True): also cut a chunk at every detected SCENE CUT so no chunk
+    warps across a cut (see stream_gops). Set False ONLY to reproduce the legacy I-frame-only
+    chunking (the BEFORE case in the cross-cut-smear verification).
 
     Holds the single-job lock for its duration (raises BusyError if one is running)."""
     if not is_valid_mode(mode):

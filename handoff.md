@@ -4,15 +4,28 @@ Real-time SD→FullHD video upscaling "on the fly". Status as of 2026-06-19.
 
 ## TL;DR
 
-Goal: upscale low-res video to HD in real time by running an **expensive neural SR network
-only on sparse anchor/keyframes**, then reconstructing every other frame cheaply by **warping
-the super-resolved anchor with codec motion vectors + residuals**. This is the **NEMO**
-(MobiCom 2020) architecture; we are porting its idea from VP9 to **H.264/H.265**.
+**PRODUCT TARGET (clarified 2026-06-19): a web app.** Upload / pick an mp4 → **"Process & Play"** →
+a **QUALITY toggle**, and watch the upscaled result *with sound*. Underneath: upscale low-res video
+to HD by running an **expensive neural SR network only on sparse anchor/keyframes**, then
+reconstructing every other frame cheaply by **warping the super-resolved anchor with codec motion
+vectors + residuals** (the **NEMO**, MobiCom 2020, architecture, ported from VP9 to **H.264/H.265**).
+**Three product modes:** **instant** (compact anchor + adaptive mask + grain, ~0.4 s/frame),
+**quality** (x4plus + region-aware + grain, ~2.9 s/frame), **layered** (two-pass-per-scene static-bg
+plate, ~0.47 s/frame, ~167× steadier background). **Staging: server-side NOW** (wrap the validated
+Python/MPS prototype), **browser-only (WebGPU) LATER.**
+
+**HARD CONSTRAINT (honest):** the pipeline is **~10× slower than real-time** → a full long video is a
+long render. Great for short clips (process → play); long videos need **progressive
+play-while-processing** (HLS/fMP4) + a background-render mode — the next UX stage.
 
 **Current state:** the architecture is validated end-to-end on real H.264 and **GPU-accelerated to
-real-time on Apple Silicon**. **5 deep-research passes** done; **Steps 1–9 complete** + a **layered-
-architecture track (L1–L4) in progress** (see below). Under **git** (init 2026-06-19; commits
-`7520d7e` Steps 1–8, `ee53c13` Step 9; `.gitignore` excludes `sample.mp4`/`models/`/`out*/`).
+real-time on Apple Silicon**; the **layered track is done**; and a **Stage-1 product server** (FastAPI
++ a knob-free browser console, 3 quality modes, streaming whole-clip processing + in-sync audio) is
+built on top. **5 deep-research passes** done; **Steps 1–10 complete** (layered L1–L4); **server built
+(`5dcf75f` + `c45e4c8`).** Under **git** (init 2026-06-19; commits `7520d7e` Steps 1–8, `ee53c13`
+Step 9, `9ee519e` Step 10/layered, `5dcf75f` Stage-1 server, `c45e4c8` server streaming rebuild +
+layered mode + crash fixes + long-video guard; `.gitignore` excludes `sample.mp4`/`models/`/`out*/`/
+`server/{outputs,uploads,testdata}/`).
 
 Headline results:
 - **Economic thesis validated:** on a talking-head clip, propagated-SR ≈ per-frame-SR (45–46 dB) at
@@ -32,6 +45,12 @@ Headline results:
   propagated so it needs fresh per-frame SR), and the earlier "layered may be cheaper" hypothesis was
   WRONG. Verdict: a quality/stability OPTION to kill background shimmer, not the default path. Real-time
   path stays `--region-aware` propagation.
+- **Product layer — Stage-1 server (web app), commits `5dcf75f` / `c45e4c8`:** a FastAPI app
+  (`server/`) wraps the prototype so you upload/pick an mp4, click **Process & Play**, and get the
+  upscaled clip **with in-sync source audio**, knob-free, in **3 modes** (instant / quality / layered).
+  Processes the **WHOLE clip** in **constant memory** by streaming GOP-sized chunks + encoding
+  incrementally, then muxes audio with **`+faststart`** (browser plays progressively). See
+  **"## Product layer — Stage-1 server"** below.
 
 ## Repo layout
 
@@ -50,17 +69,25 @@ prototype/before_fallback.py # Step 1 "before" recon (clean BEFORE for fallback%
 prototype/probe_gop.py      # GOP/MV-source-sign/duplicate-frame probe for a real clip
 prototype/matting.py        # LAYERED L1: RVM foreground matting on MPS (load_rvm/matte_sequence/fg_mask_lr)
 prototype/background_plate.py # LAYERED L2: static-camera background plate (scene_segments/build_plate/sr_plate/sample_plate)
-prototype/layered_pipeline.py # LAYERED L3: composite plate + per-frame FG + grain (in progress)
+prototype/layered_pipeline.py # LAYERED L3: composite plate + per-frame FG + grain
 prototype/demo_matting.py / demo_background_plate.py  # layered demos
 prototype/README.md    # how the prototype works + result tables + ARTIFACTS index
 prototype/models/      # auto-downloaded SR weights (realesr-general-x4v3.pth, RealESRGAN_x4plus.pth) + RVM via torch.hub cache
 prototype/out_quality/ # Step 8 artifacts: detail_drift.png/.csv, ab_anchor_*, grain_{ab,consec,field}.png
 prototype/out_matting/ out_plate/ out_layered/  # LAYERED L1/L2/L3 artifacts
 prototype/out*/        # generated artifacts (see prototype/README.md ## Artifacts) — all gitignored
+server/                # PRODUCT LAYER — Stage-1 web app (FastAPI + browser console)
+server/app.py          #   FastAPI: GET / (console) + /api/sources, /api/process, /api/progress, /outputs/*.mp4
+server/pipeline_api.py #   STREAMING constant-memory GOP-chunk processing of the WHOLE clip + source-audio mux + faststart (instant/quality)
+server/layered_api.py  #   the LAYERED mode (two-pass-per-scene: build+heavy-SR one bg plate/scene, composite the moving FG per frame)
+server/index.html      #   knob-free UI: pick/upload mp4 → mode → Process & Play → progress + duration/ETA guard → player (with sound)
+server/{uploads,testdata,outputs}/  # uploaded sources / test clips / produced mp4s (all gitignored)
 handoff.md             # this file
 ```
-**Under git** since 2026-06-19 (`master`): `7520d7e` Steps 1–8, `ee53c13` Step 9. `.gitignore`
-excludes `sample.mp4` (78 MB), `prototype/models/` (weights), `out*/` (~340 MB), `__pycache__`, logs.
+**Under git** since 2026-06-19 (`master`): `7520d7e` Steps 1–8, `ee53c13` Step 9, `9ee519e`
+Step 10 (layered), `5dcf75f` Stage-1 server, `c45e4c8` server streaming rebuild + layered mode +
+crash fixes + long-video guard. `.gitignore` excludes `sample.mp4` (78 MB), `prototype/models/`
+(weights), `out*/` (~340 MB), `server/{outputs,uploads,testdata}/`, `__pycache__`, logs.
 Layered-track modules (matting/background_plate/layered_pipeline + the analysis modules
 anchor_pipeline/sr_diffusion) are committed after the layered track's seam-verification pass.
 Persistent project memory (loaded each Claude session) lives outside the repo at
@@ -309,7 +336,7 @@ silently no-ops). No real diffusion SR is wired on this box (basicsr + multi-GB 
 so `--sr diffusion` is NO-GO; the probe is retained for the record. Standalone. Artifacts:
 `sr_diffusion.py`.
 
-## Step 10 — LAYERED architecture ("video as a composition of layers") — IN PROGRESS
+## Step 10 — LAYERED architecture ("video as a composition of layers") — DONE (commit `9ee519e`)
 
 Motivated by the recurring finding that **everything splits by motion** (static = heavy detail
 persists + propagation near-free; dynamic = detail erodes + needs fresh SR). Idea: decompose the
@@ -360,6 +387,101 @@ motion plate registration + scene-cut detection.
   denoised, x4plus-sharp background)**, NOT a speed win and NOT the default real-time path. **Keep
   `--region-aware` propagation as the real-time path; reach for layered only when background shimmer is the
   specific defect to kill** and the ~4× cost + non-commercial matte + static-camera limits are acceptable.
+
+## Product layer — Stage-1 server (web app) — DONE (commits `5dcf75f`, `c45e4c8`)
+
+The product target is a **web app**: upload or pick an mp4 → **Process & Play** → a QUALITY toggle,
+and watch the upscaled clip **with its original sound**, knob-free, any length. **Stage 1 (now) is
+server-side** — a FastAPI app wraps the validated Python/MPS prototype unchanged and streams the
+result to a minimal browser player. **Stage 2 (later, once tuned) is a browser-only WebGPU/ORT-Web
+port** — deferred because the make-or-break unknown there is codec MVs in the browser (WebCodecs
+doesn't expose them); server-side extracts MVs via PyAV exactly as the prototype does, so there is no
+port and no browser-MV problem yet.
+
+**Run:**
+```bash
+cd /Users/lifeart/Repos/playhd
+python3 -m uvicorn server.app:app --host 127.0.0.1 --port 8000
+# open http://127.0.0.1:8000/
+```
+
+**Files (`server/`):**
+- **`app.py`** — FastAPI. `GET /` serves the console; `GET /api/sources` returns sources + the 3 modes
+  + each source's duration & per-mode processing-time estimate; `POST /api/process` (`mode` + `source`
+  or an uploaded `file`) runs the whole-clip pipeline OFF the event loop (`run_in_threadpool`) and
+  returns `{url, source, stats}`; `GET /api/progress` (live `{state, done, total, elapsed_s, eta_s,
+  ms_per_frame}`) is served concurrently while a job runs; `/outputs/*.mp4` via StaticFiles (HTTP Range
+  → `<video>` can seek). **One job at a time** → 409 if busy. Failures are surfaced to the UI (500 with
+  the real error), never swallowed.
+- **`pipeline_api.py`** — the **STREAMING, constant-memory** core for instant/quality. Opens the input
+  container ONCE, yields **self-contained GOP chunks** (new chunk at every I-frame; a GOP longer than
+  `SOFT_CAP_FRAMES=48` is also cut at the next P → a forced fresh anchor, NEMO-style), runs the
+  prototype's `build_perframe_cache` + `reconstruct` (+ `_build_region_gate` for quality) per chunk,
+  applies grain (global frame-index seed → temporally independent across chunks), and **encodes each
+  chunk into the output H.264 stream incrementally** (libx264 crf 18, yuv420p). Never more than one
+  chunk of HD frames is alive → peak memory is bounded regardless of clip length. Then **muxes the
+  SOURCE AUDIO** in, in sync (copy if AAC, else transcode to AAC; a video-only source doesn't crash),
+  and writes the final mp4 with **`+faststart`** (moov atom at the front → the browser starts
+  progressive playback instead of stalling until the whole file is fetched).
+- **`layered_api.py`** — the **LAYERED** mode (two pass per scene, bounded memory). PASS 0 segments the
+  clip into scenes (one lightweight decode; a real cut = big RGB jump OR an I-frame + smaller jump, with
+  a `MIN_SCENE_LEN` filter so periodic keyframes / short GOPs don't spawn false scenes). PASS A per
+  scene: matte a capped, evenly-sampled subset (RVM, `PLATE_SAMPLE_CAP=64`), run the static-camera
+  check, build the temporal-median background plate, **heavy-SR it ONCE (x4plus)**, and **spill the HD
+  plate to disk**; a MOVING-camera scene is flagged → it falls back to the quality (region-aware) path
+  (a fixed plate would be wrong). PASS B (driven by the streaming GOP loop): per frame composite
+  `alpha*compact_fg_hd + (1-alpha)*plate_hd` + grain (RVM recurrent state threaded per scene; one HD
+  plate held at a time). Reuses `matting.py`/`background_plate.py`/`layered_pipeline.py` READ-ONLY.
+- **`index.html`** — knob-free console: source dropdown (+ size/duration) or upload, the 3 mode cards,
+  a **duration/estimate guard** (shows source length + estimated processing time for the chosen mode and
+  warns ⚠ before a >3-min render, since the pipeline is ~10× slower than real-time), Process & Play, a
+  live progress bar (polls `/api/progress` every 400 ms), then the `<video>` player (autoplay **with
+  sound**) + a server-timing stats readout.
+
+**The 3 modes** (mode → the exact prototype flag combo the handoff recommends for that regime):
+
+| mode | config | ~speed (server, ms/frame) |
+|---|---|---|
+| **instant** | compact `realesr-general-x4v3` anchor, `--backend torch`, `--occ adaptive`, grain | ~0.4 s/frame (400) |
+| **quality** | heavy `RealESRGAN_x4plus` anchor, `--region-aware` blend, `--occ adaptive`, grain | ~2.9 s/frame (2900) |
+| **layered** | static-bg plate heavy-SR'd ONCE/scene + per-frame composited moving FG + grain | ~0.47 s/frame (470) |
+
+All modes output **x4** (SCALE=4; e.g. 640×320 → 2560×1280). Layered uniquely delivers a
+**rock-stable, denoised, x4plus-sharp background** (direct frame-to-frame flicker |ΔF| ≈ 0.001 vs
+per-frame x4plus 0.167, **~167× steadier** — see Step 10); it needs a roughly static camera + a human
+subject and uses the **non-commercial** RVM matte (CC BY-NC-SA).
+
+**Two crash fixes baked into the streaming rebuild (`c45e4c8`):**
+1. **Windowed-in-memory OOM / `avcodec_open2` EAGAIN.** The first server (`5dcf75f`) held a whole
+   window at HD and opened the codec on a window so large it OOM'd (failed around n=5000). FIXED by the
+   GOP-chunk streaming above (open the container once; one bounded chunk alive at a time; encode
+   incrementally).
+2. **MPS-allocator creep / frame-630 `BlockingIOError`/EAGAIN.** The MPS caching allocator's
+   freed-but-cached memory crept up over a long clip (NOT bounded by per-chunk `del`s) and eventually
+   failed an allocation under memory pressure. FIXED by `_free_gpu()` (`gc.collect()` +
+   `torch.mps.empty_cache()`) once per processed chunk — returns cached memory to the OS, leaves active
+   tensors untouched, ~ms cost.
+
+**Long-video guard:** `/api/sources` returns each source's duration + a per-mode processing-time
+estimate (`MODE_MS_PER_FRAME` instant 400 / quality 2900 / layered 470 ms·frame⁻¹); the UI shows it and
+warns before a multi-hour render. This is the honest surfacing of the ~10× hard constraint BEFORE the
+user blind-launches a multi-hour job on a 34-min source.
+
+## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
+
+Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a
+**NO-GO on this content**:
+- **MPS feasibility** (Step 9 Stream-3): diffusion DOES run on MPS, but VAE *decode* dominates and the
+  per-anchor latency is ~7–14× x4plus → too slow without a tiny VAE (TAESD).
+- **The Q1 real-weights A/B** (`stabilityai/stable-diffusion-x4-upscaler`, the diffusers-native, ungated
+  model — I ran the A/B myself): on a REAL H.264-compressed SD anchor crop it **HALLUCINATES** — var-of-
+  Laplacian face 216 vs x4plus 16 (13×) but the "win" is **FAKE**: it paints smooth skin (a hand) in
+  grainy/scaly texture and rewrites the plaid weave. SD-x4-upscaler was trained on CLEAN bicubic LR, so
+  it reads H.264 compression noise as signal — the exact NR-metric trap research pass 4 warned about.
+**Verdict:** **x4plus stays the max-quality anchor.** Revisiting needs a **degradation-aware** model
+(OSEDiff/StableSR — trained/finetuned on real codec degradation) **+ TAESD** (kill the VAE-decode cost)
++ CoreML/ANE. Even then, the Step-8 detail-drift finding caps the benefit to static content/regions.
+Visuals: `prototype/out_diffusion_real/`.
 
 ## GOTCHAS (read before touching anything)
 
@@ -484,6 +606,31 @@ motion plate registration + scene-cut detection.
     (~25%) is INPAINTED (a guess) — safe only because the subject always covers it; if the matte ever
     under-covers, the guessed pixels show.
 
+20. **Whole-clip processing MUST stream GOP chunks — never window-in-memory** (server). The first
+    server build held an entire window at HD and opened `avcodec` on it → OOM / `avcodec_open2` EAGAIN
+    past ~n=5000. The rebuild opens the container ONCE and processes self-contained GOP chunks (cut at
+    every I-frame; a long GOP also cut at the next P = a forced fresh anchor, `SOFT_CAP_FRAMES=48`),
+    encoding incrementally so only one chunk of HD frames is ever alive. Peak memory is bounded
+    regardless of clip length.
+
+21. **Free the MPS caching allocator BETWEEN chunks** (server). Over a long clip the MPS allocator's
+    freed-but-cached memory creeps up (NOT bounded by per-chunk `del`s) and eventually fails an
+    allocation with `BlockingIOError`/EAGAIN under memory pressure (the "frame-630" crash). Call
+    `gc.collect()` + `torch.mps.empty_cache()` once per processed chunk (`_free_gpu()`): it returns
+    cached memory to the OS, leaves active tensors untouched, costs ~ms.
+
+22. **Write the output mp4 with `+faststart`** (server). Without the moov atom moved to the front, a
+    `<video>` element stalls at readyState 0 until the whole file is fetched (no progressive play).
+    `av.open(out, "w", options={"movflags": "+faststart"})` is what makes the result reliably
+    web-playable. (Audio: copy if the source is AAC, else transcode to AAC; muxed in sync up to the
+    video duration; a video-only source does NOT crash.)
+
+23. **Diffusion SR hallucinates on real compressed SD** (Q1). SD-x4-upscaler was trained on clean
+    bicubic LR; on real H.264 it reads compression noise as signal and invents grainy/scaly texture and
+    false weave. Its var-Lap "win" over x4plus is FAKE detail, not fidelity — never trust an
+    NR-sharpness metric to pick the anchor. x4plus stays the anchor; a diffusion anchor needs a
+    degradation-aware model + TAESD (see "## Diffusion anchor — NO-GO").
+
 ## Known limitations / done since (Steps 1–4) and still NOT done
 
 - ✅ **DONE — real SR network** (Step 3): `prototype/sr.py` SRVGGNetCompact /
@@ -510,7 +657,12 @@ motion plate registration + scene-cut detection.
   distorted upscaled to ref res via bicubic first. Note VMAF is compression-trained, not SR —
   report tOF/tLP alongside.
 
-## Key research findings (3 passes, all adversarially verified)
+## Key research findings (5 passes, all adversarially verified)
+
+(Passes 1–3 detailed below; **pass 4** `wau8fdg60` — better upscaling: heavy/diffusion anchors, film
+grain, propagation-stabilizes-detail — and **pass 5** `wce7evoli` — layered/compositional video SR:
+Wang&Adelson, RVM, MV-free segmentation/plate — are summarized in Steps 8–10, the layered section, and
+"## Diffusion anchor — NO-GO" above.)
 
 - **NEMO** (https://chaos5958.github.io/assets/pdf/3372224.3419185.pdf, code
   https://github.com/kaist-ina/nemo): SR on 1.79–9.74% of frames, 45–120 fps 240p→1080p on a
@@ -549,19 +701,26 @@ motion plate registration + scene-cut detection.
 
 ## Recommended next step
 
-Steps 1–9 confirmed the architecture on real H.264 AND reached real-time on Apple Silicon. The
-active frontier is the **layered architecture** (Step 10) — the most promising direction because it
-could deliver quality AND speed at once:
+Steps 1–10 validated the architecture on real H.264, reached real-time on Apple Silicon, and finished
+the layered track. The PRODUCT now exists as a **Stage-1 server** (web app, 3 modes). The frontier is
+making that product good:
 
-1. **Finish the layered track (L3 → L4).** L3 measures the composite (does the fixed plate give
-   x4plus background sharpness at ~zero flicker, and is it cheaper than full-frame propagation?);
-   L4 characterizes failure modes (hair/seams, camera motion, the hole, multi-object). If it holds,
-   build the streaming layered pipeline (matte at a slow refresh + MV-propagated gate; plate per
-   scene; foreground per-anchor) and add the `global_motion` homography path for non-static cameras.
-2. **Improve the high-motion regime** (the standing weak spot). Window A pays ~24% honest P-frame
-   occlusion fallback, needs ~12.5% anchors at budget 1.0. Levers: better masks, shorter P→anchor
-   hops, adaptive triggering keyed on tOF + fallback% (the honest metrics — NOT LR-consistency).
-3. **Productionization gaps:** a commercially-licensed matte (RVM is non-commercial); the TAESD
-   path to make a diffusion anchor affordable (VAE decode is the bottleneck, not MPS); color-box
-   clamping (`--clamp`, untested); a WebGPU / lighter-SR (ABPN) path if the target is the browser
-   (web-realesrgan / Anime4K-WebGPU / websr — links in "Still open").
+1. **Scene-cut detection (in progress).** The layered mode's per-scene plate depends on robust scene
+   segmentation (`layered_api.segment_scenes`: I-frame + RGB-jump + `MIN_SCENE_LEN`). Harden it across
+   encodes (short GOPs, fades, motion bursts) — a bad cut corrupts a plate.
+2. **Make "instant" actually instant.** The server's instant mode is ~0.4 s/frame (~10× real-time) — it
+   still builds a full per-frame compact-SR cache + reconstructs + re-encodes per chunk. The prototype
+   reached ~38–40 ms/frame GPU-resident (Step 7); close that gap (anchor-only SR + keep the recon on the
+   GPU + drop the redundant per-frame cache) so instant is genuinely fast / anchor-only.
+3. **Progressive play-while-processing.** The ~10× hard constraint means a long video is a long render.
+   Stream output as it is produced (HLS / fMP4 segments) + a background-render mode so the user can
+   start watching before the whole clip is done — the biggest UX lever for long clips.
+4. **Improve the high-motion regime** (standing weak spot): ~24% honest P-frame occlusion fallback,
+   needs ~12.5% anchors at budget 1.0. Levers: better masks, shorter P→anchor hops, tOF+fallback%-keyed
+   triggering (the honest metrics — NOT LR-consistency).
+5. **Productionization / later:** a commercially-licensed matte (RVM is non-commercial); a
+   degradation-aware diffusion anchor + TAESD (see "## Diffusion anchor — NO-GO"); color-box clamping
+   (`--clamp`, untested); and the **Stage-2 browser-only WebGPU/ORT-Web port** — where
+   codec-MVs-in-the-browser becomes the make-or-break unknown (ffmpeg.wasm export_mvs / JS H.264 parser /
+   WebGPU optical-flow substitute / keep MV extraction server-side). Benchmark web-realesrgan /
+   Anime4K-WebGPU / websr.

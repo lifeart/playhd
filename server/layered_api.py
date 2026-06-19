@@ -49,7 +49,10 @@ _REPO = os.path.dirname(_HERE)
 _PROTO = os.path.join(_REPO, "prototype")
 if _PROTO not in sys.path:
     sys.path.insert(0, _PROTO)
+if _HERE not in sys.path:          # server/ on the path -> `import scene_detect` (sibling) resolves
+    sys.path.insert(0, _HERE)
 
+import scene_detect                  # noqa: E402  (shared scene-CUT detector -- one source of truth)
 import derisk                        # noqa: E402  (decode/MVs, SDType, reconstruct)
 import matting                       # noqa: E402  (L1: RVM matte)
 import background_plate as bp        # noqa: E402  (L2: plate build + heavy SR + motion check)
@@ -67,14 +70,14 @@ PLATE_SAMPLE_CAP = 64
 FG_DILATE = 3                        # grow the FG gate so the matte-edge band stays foreground
 STATIC_THRESH_PX = 0.6               # |median MV| above this (px) => camera moves => fallback
 
-# Scene-cut detection (see segment_scenes). A scene must span MANY GOPs, so a periodic
-# keyframe is NOT a cut -- a real cut is a near-total content change. We combine the two
-# signals the prototype uses: a very large frame-to-frame RGB jump, OR a smaller jump that
-# the encoder corroborated by re-anchoring with an I-frame. A minimum scene length then
-# absorbs bursts of fast motion so they never spawn tiny false scenes.
-CUT_THRESH = 60.0                    # mean |dF| above this (any frame) => scene cut
-IFRAME_CUT_THRESH = 45.0             # at an I-frame, a smaller jump still counts as a cut
-MIN_SCENE_LEN = 24                   # frames; cuts closer than this are merged (~1 s @ 24fps)
+# Scene-cut detection now lives in scene_detect (ONE source of truth, shared with
+# pipeline_api.stream_gops). These constants are the layered defaults forwarded to it; the
+# detector adds an adaptive-baseline (hysteresis) relative test on top of the same two signals
+# (a near-total frame-to-frame jump, OR a smaller jump corroborated by a codec I-frame) and the
+# same minimum-scene-length merge. Kept here so segment_scenes' public signature is unchanged.
+CUT_THRESH = scene_detect.CUT_THRESH          # 60.0  mean |dluma| above this (any frame) => cut
+IFRAME_CUT_THRESH = scene_detect.IFRAME_THRESH  # 45.0  at an I-frame, a smaller jump counts too
+MIN_SCENE_LEN = scene_detect.MIN_SCENE_LEN    # 24  frames; cuts closer than this are merged
 
 
 def _device():
@@ -115,36 +118,20 @@ def stream_frames(path, max_frames=None):
 
 
 # --------------------------------------------------------------------------- #
-# PASS 0: scene segmentation (bounded -- holds ONE previous frame).
-# This refines background_plate.find_scene_cuts so it is robust to SHORT-GOP encodes (where
-# a bare mid-stream I-frame is just a periodic keyframe, not a cut -- the spec requires "a
-# scene spans multiple GOPs"). A cut is declared when:
-#   * the mean frame-to-frame RGB jump exceeds CUT_THRESH (a near-total content change), OR
-#   * an I-frame coincides with a smaller jump (> IFRAME_CUT_THRESH) -- the encoder re-anchored
-#     AND the content changed, the prototype's two-signal cut.
-# A greedy MIN_SCENE_LEN filter then merges cuts that are too close (bursts of fast motion),
-# so a busy run of frames never spawns one-frame scenes. Returns (segments, total_frames).
+# PASS 0: scene segmentation (bounded -- scene_detect holds ONE previous luma frame).
+# The cut DETECTION is delegated to scene_detect.find_cuts (the SAME StreamingCutDetector that
+# pipeline_api.stream_gops uses to force fresh anchors -> one source of truth). This function
+# only assembles the per-scene [a,b) segments and merges a too-short TRAILING scene (the greedy
+# minimum-scene-length between cuts is already applied inside the detector). Returns
+# (segments, total_frames). A periodic keyframe (small diff) is NOT a cut; a real cut is a
+# near-total content change OR an I-frame-corroborated jump OR a strong relative spike.
 # --------------------------------------------------------------------------- #
 def segment_scenes(path, max_frames=None, cut_thresh=CUT_THRESH,
                    iframe_thresh=IFRAME_CUT_THRESH, min_scene_len=MIN_SCENE_LEN):
-    candidates = []
-    prev = None
-    total = 0
-    for idx, ptype, img, _mvs in stream_frames(path, max_frames=max_frames):
-        cur = img.astype(np.int16)
-        if prev is not None:
-            d = float(np.abs(cur - prev).mean())
-            if d > cut_thresh or (ptype == "I" and d > iframe_thresh):
-                candidates.append(idx)
-        prev = cur                            # hold exactly one previous frame
-        total = idx + 1
-    # greedy: accept a cut only if it is >= min_scene_len from the previous accepted boundary
-    accepted, last = [], 0
-    for c in sorted(set(candidates)):
-        if 0 < c < total and (c - last) >= min_scene_len:
-            accepted.append(c)
-            last = c
-    bounds = [0] + accepted + [total]
+    cuts, total = scene_detect.find_cuts(
+        path, max_frames=max_frames,
+        cut_thresh=cut_thresh, iframe_thresh=iframe_thresh, min_scene_len=min_scene_len)
+    bounds = [0] + [c for c in cuts if 0 < c < total] + [total]
     segs = []
     for a, b in zip(bounds[:-1], bounds[1:]):
         if segs and (b - a) < min_scene_len:  # merge a too-short trailing scene into prev
