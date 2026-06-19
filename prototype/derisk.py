@@ -738,7 +738,7 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
             recon = torch.where(occ3, pf, recon)
             if has_true:
                 oracle = torch.where(occ3, G.img_to_dev(hd_frames[i]), oracle)
-            hf = G.frac_true(occ)
+            hf = occ.float().mean()          # GPU scalar -- NOT .item()'d here (see note below)
         R[i] = dict(recon=recon, oracle=oracle, perframe=pf, mask=occ,
                     hole_frac=hf, dist=R[p]["dist"] + 1, type=pt, is_anchor=False)
 
@@ -783,7 +783,7 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
             if wp is not None and wf is not None:
                 recon = torch.where(both[None, None], a_p * wp + a_f * wf, recon)
             recon = recon.clamp(0, 255)
-            hf = G.frac_true(none)
+            hf = none.float().mean()         # GPU scalar -- batched .item() after both passes
         if has_true:
             if owp is not None:
                 oracle = torch.where(only_p[None, None], owp, oracle)
@@ -794,6 +794,19 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
             oracle = oracle.clamp(0, 255)
         R[i] = dict(recon=recon, oracle=oracle, perframe=pf, mask=none,
                     hole_frac=hf, dist=i, type=pt, is_anchor=False)
+
+    # ----------------- batched hole_frac materialization (ONE device->host sync) -----------------
+    # Each non-anchor frame's hole_frac was kept as a GPU SCALAR (occ.float().mean()) instead of
+    # being .item()'d in its blend step: a per-frame .item() drains the MPS queue, serializing
+    # consecutive frames' kernels (~12 ms/frame measured). The value is identical -- same op, same
+    # order -- so this is a pure latency fix (recon stays numerically unchanged for ALL backends/
+    # modes; the numpy regression path is untouched). One stacked .item() materializes them all.
+    _ht = {i: R[i]["hole_frac"] for i in R if torch.is_tensor(R[i]["hole_frac"])}
+    if _ht:
+        _keys = list(_ht)
+        _vals = torch.stack([_ht[i] for i in _keys]).tolist()    # single sync for every frame
+        for i, v in zip(_keys, _vals):
+            R[i]["hole_frac"] = float(v)
 
     # ----------------- Stream-1 region-aware gate (HD weight, built ONCE: temporally stable) ---
     # The gate a_lr is the SAME map for every frame (window_static_weight), so upsample it to HD

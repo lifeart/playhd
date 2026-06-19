@@ -78,7 +78,8 @@ import scene_detect              # noqa: E402  (robust scene-CUT detector -> for
 
 # Instant-mode speedup (Levers 1-4). These live in server/ and import the prototype READ-ONLY.
 import anchor_sr                 # noqa: E402  (Lever 1: anchor-only SR cache + adaptive safeguard)
-import fast_grain                # noqa: E402  (Lever 2: GPU/MPS film grain)
+import fast_grain                # noqa: E402  (GPU/MPS film grain)
+import pipe_encode               # noqa: E402  (Lever 2: threaded encode + chunk prefetch overlap)
 try:
     import gpu_ops as _gpu_ops   # noqa: E402  (Lever 4: GPU-resident recon -> single host download)
 except Exception:
@@ -89,6 +90,19 @@ except Exception:
 # high-motion regime; tuned + verified in bench_instant.py (propagated pixels stay ~identical to
 # full-SR, only sub-threshold fallback regions soften to bicubic).
 INSTANT_FALLBACK_THRESH = 0.08
+
+# Lever 3 (tile-SR safeguard): SR only the bounding box of a high-fallback frame's occlusion
+# region instead of the full 2560x1280. DISABLED by default after measurement: on this real
+# footage the occlusion fallback is spatially SCATTERED (camera + complex motion), so a single
+# bounding box covers ~97% of the frame and even a 32x16 grid only reaches ~46% coverage -- which
+# would need hundreds of tiny SR forward passes whose launch overhead erases the area saving.
+# The premise (a compact moving-edge occlusion) doesn't match; kept available for content where
+# it does (set True). See _quality_instant.py / the grid-coverage probe.
+INSTANT_TILE_SR = False
+# Lever 4a: keep the per-frame SR/bicubic fallback cache GPU-RESIDENT. Non-anchor frames are
+# bicubic-upscaled on-device (F.interpolate) straight from the small LR upload instead of a CPU
+# cv2.resize + a full 9.8 MB HD host->device upload per frame -> kills reconstruct's upload_perframe.
+INSTANT_GPU_CACHE = True
 
 SAMPLE_MP4 = os.path.join(_REPO, "sample.mp4")
 OUTPUTS_DIR = os.path.join(_HERE, "outputs")
@@ -116,7 +130,13 @@ _PLATE_GRAIN_SEED = 12345
 MODE_CONFIG = {
     "instant": dict(sr_mode="realesrgan",          # compact realesr-general-x4v3 (~0.13 s/frame SR)
                     backend="torch",               # MPS fast path (recon stays GPU-resident)
-                    occ="adaptive",                # full quality both regimes, cheaper than full
+                    occ="reactive",                # Lever 1: drop the fwd-bwd softmax splat. Instant
+                                                   # is the FAST tier; Step-7 established reactive ==
+                                                   # full-mask quality on low-motion talking-head and
+                                                   # loses only slightly on high-motion. The splat was
+                                                   # 12 ms of recon (fired 63/82 mask calls on real
+                                                   # footage); reactive cuts recon ~58->47 ms AND
+                                                   # shrinks hole_frac so fewer safeguard SR upgrades.
                     region_aware=False,
                     grain="med",
                     label="Instant (compact anchor, torch/MPS, adaptive occ, grain)"),
@@ -778,6 +798,10 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
         fast = (mode == "instant" and cfg["backend"] == "torch" and _gpu_ops is not None)
 
         writer = _VideoWriter(video_tmp, fps, codec=(None if fast else "libx264"))
+        if fast:
+            # Lever 2: encode on a worker thread so the VideoToolbox media engine runs frame i
+            # while the GPU produces frame i+1 (the encode no longer sits on the critical path).
+            writer = pipe_encode.ThreadedEncoder(writer, maxsize=8)
         done = 0
         n_chunks = 0
         w_lr = h_lr = w_hd = h_hd = None
@@ -794,8 +818,12 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                           eta_s=(round(eta, 1) if eta is not None else None),
                           ms_per_frame=round(rate * 1000.0, 1))
 
+        chunk_iter = stream_gops(input_path, max_frames=max_frames)
+        if fast:
+            # Lever 2: decode the next GOP chunk on a worker thread while the GPU works the current.
+            chunk_iter = pipe_encode.prefetch_chunks(chunk_iter, maxsize=2)
         try:
-            for chunk in stream_gops(input_path, max_frames=max_frames):
+            for chunk in chunk_iter:
                 n_chunks += 1
                 if w_lr is None:
                     h_lr, w_lr = chunk[0][1].shape[:2]
@@ -807,7 +835,8 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     ts = time.perf_counter()
                     perframe_cache, _ac, sr_set = anchor_sr.build_anchor_cache(
                         chunk, w_hd, h_hd, cfg["sr_mode"], occ_mode=cfg["occ"],
-                        fallback_thresh=INSTANT_FALLBACK_THRESH)
+                        fallback_thresh=INSTANT_FALLBACK_THRESH,
+                        tile=INSTANT_TILE_SR, gpu_cache=INSTANT_GPU_CACHE)
                     t_sr += time.perf_counter() - ts
 
                     # 2) Lever 4: reconstruct GPU-resident (download_output=False) -- the HD recon
@@ -824,7 +853,7 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     ts = time.perf_counter()
                     p_info = anchor_sr.patch_high_fallback(
                         chunk, R, w_hd, h_hd, cfg["sr_mode"],
-                        fallback_thresh=INSTANT_FALLBACK_THRESH, skip=sr_set)
+                        fallback_thresh=INSTANT_FALLBACK_THRESH, skip=sr_set, tile=INSTANT_TILE_SR)
                     t_sr += time.perf_counter() - ts
                     n_sr_calls += p_info["n_sr_calls"]
                     n_upgrades += p_info["n_adaptive_upgrades"]

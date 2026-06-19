@@ -43,6 +43,9 @@ import fast_grain
 
 SCALE = P.SCALE
 STRENGTH = "med"
+# Occlusion mode the AFTER (instant) path actually ships with -- read from the live instant config
+# so the bench tracks what production runs (Lever 1 flipped this to 'reactive').
+OCC_AFTER = P.MODE_CONFIG["instant"]["occ"]
 
 
 def _psnr(a, b):
@@ -123,23 +126,25 @@ def run_after(chunks, w_hd, h_hd, out_path, thresh, approach="patch"):
         sr_set = None
         if approach == "prescan":
             cache, info = anchor_sr.build_anchor_cache_prescan(
-                chunk, w_hd, h_hd, "realesrgan", occ_mode="adaptive", fallback_thresh=thresh)
+                chunk, w_hd, h_hd, "realesrgan", occ_mode=OCC_AFTER, fallback_thresh=thresh)
             t["sr"] += info["t_scan_s"] + info["t_build_s"]   # full scan + (SR forwards + bicubic)
         else:                                                 # 'hybrid' (default)
             cache, info, sr_set = anchor_sr.build_anchor_cache(
-                chunk, w_hd, h_hd, "realesrgan", occ_mode="adaptive", fallback_thresh=thresh)
+                chunk, w_hd, h_hd, "realesrgan", occ_mode=OCC_AFTER, fallback_thresh=thresh,
+                tile=P.INSTANT_TILE_SR, gpu_cache=P.INSTANT_GPU_CACHE)
             t["sr"] += info["t_scan_s"] + info["t_cache_s"]   # backbone scan + (SR + bicubic)
         _srmod.reset_latency("realesrgan")
 
         _sync(); tr = time.perf_counter()
-        _, R = derisk.reconstruct(chunk, None, SCALE, True, "adaptive", cache, set(),
+        _, R = derisk.reconstruct(chunk, None, SCALE, True, OCC_AFTER, cache, set(),
                                   backend="torch", collect_metrics=False, download_output=False)
         _sync(); t["recon"] += time.perf_counter() - tr
 
         if approach == "hybrid":
             _sync(); tp = time.perf_counter()
             pinfo = anchor_sr.patch_high_fallback(chunk, R, w_hd, h_hd, "realesrgan",
-                                                  fallback_thresh=thresh, skip=sr_set)
+                                                  fallback_thresh=thresh, skip=sr_set,
+                                                  tile=P.INSTANT_TILE_SR)
             _sync(); t["sr"] += time.perf_counter() - tp      # B-leaf adaptive-upgrade SR forwards
             info = {**info, **pinfo}
         info_all.append(info)

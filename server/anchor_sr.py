@@ -47,7 +47,65 @@ def anchor_indices(frames):
     return {i for i in backbone if frames[i][0] == "I" or i == first}, backbone
 
 
-def build_anchor_cache(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive", fallback_thresh=0.08):
+# --------------------------------------------------------------------------- #
+# Lever 4a: GPU-resident bicubic upscale (avoids the CPU cv2.resize + the 9.8 MB HD upload).
+# --------------------------------------------------------------------------- #
+def _gpu_bicubic(lr_u8, w_hd, h_hd):
+    """LR uint8 HxWx3 -> [1,3,h_hd,w_hd] float32 (0..255) on device, bicubic. Resident; consumed
+    directly by reconstruct_torch (gpu_ops.img_to_dev passes a tensor through untouched)."""
+    import torch
+    import torch.nn.functional as F
+    import gpu_ops as G
+    t = G.img_to_dev(lr_u8)                                   # [1,3,h,w] float, single small upload
+    up = F.interpolate(t, size=(h_hd, w_hd), mode="bicubic", align_corners=False)
+    return up.clamp_(0.0, 255.0)
+
+
+# --------------------------------------------------------------------------- #
+# Lever 3: tile super-resolution -- SR only the bounding box of a frame's occlusion-fallback
+# region. The SR there is consumed ONLY at fallback pixels (a backbone P reads pf at occ pixels;
+# a B leaf overwrites all but the both-occluded pixels), so the rest of the frame never reads it.
+# --------------------------------------------------------------------------- #
+_TILE_PAD_LR = 12   # LR-pixel halo SR'd around the bbox then discarded, so the kept interior is
+# free of the compact net's conv-border effect (verified PSNR-vs-full-SR in _quality_instant.py).
+
+
+def _bbox_of(mask_lr, pad, w_lr, h_lr):
+    """Padded bounding box (x0,y0,x1,y1) of a True LR mask, or None if empty."""
+    ys, xs = np.where(mask_lr)
+    if ys.size == 0:
+        return None
+    x0 = max(int(xs.min()) - pad, 0); x1 = min(int(xs.max()) + 1 + pad, w_lr)
+    y0 = max(int(ys.min()) - pad, 0); y1 = min(int(ys.max()) + 1 + pad, h_lr)
+    return x0, y0, x1, y1
+
+
+def _sr_tile(lr_u8, bbox_lr, scale, sr_mode):
+    """SR the LR bbox tile (x4) -> (tile_hd_u8, hd_bbox). The halo is SR'd for border accuracy
+    then cropped away to the exact bbox so only well-conditioned interior pixels are kept."""
+    import sr as _srmod
+    x0, y0, x1, y1 = bbox_lr
+    tile = lr_u8[y0:y1, x0:x1]
+    sr = _srmod.upscale(tile, model=sr_mode)                 # ((y1-y0)*scale)x((x1-x0)*scale)x3
+    hx0, hy0, hx1, hy1 = x0 * scale, y0 * scale, x1 * scale, y1 * scale
+    return sr[:hy1 - hy0, :hx1 - hx0], (hx0, hy0, hx1, hy1)
+
+
+def _place_tile(hd_base, sr_tile, hd_bbox):
+    """Write an SR tile into an HD frame at hd_bbox. hd_base may be numpy (CPU cache) or a
+    [1,3,H,W] device tensor (gpu_cache); the SR tile is uint8 HxWx3."""
+    hx0, hy0, hx1, hy1 = hd_bbox
+    if isinstance(hd_base, np.ndarray):
+        hd_base[hy0:hy1, hx0:hx1] = sr_tile
+        return hd_base
+    import torch
+    t = torch.from_numpy(np.ascontiguousarray(sr_tile)).to(hd_base.device)
+    hd_base[0, :, hy0:hy1, hx0:hx1] = t.permute(2, 0, 1).float()
+    return hd_base
+
+
+def build_anchor_cache(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive", fallback_thresh=0.08,
+                       tile=False, gpu_cache=False):
     """HYBRID anchor cache (the instant-mode default). Runs the SR net on:
       * the ANCHORS (I + first backbone), AND
       * any non-anchor BACKBONE (I/P) frame whose LR occlusion-fallback fraction exceeds
@@ -57,47 +115,87 @@ def build_anchor_cache(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive", fallbac
     high-fallback backbone frame's compact-SR INTO the cache (before reconstruct) makes its
     detail propagate correctly down the chain (no bicubic contamination of later frames) --
     this is what the cheap post-reconstruct patch could not do. B-frame fallback (leaves) is
-    handled afterwards by patch_high_fallback. Returns (cache, info, sr_set)."""
+    handled afterwards by patch_high_fallback.
+
+    `tile` (Lever 3): an UPGRADED backbone frame is SR'd only over the bounding box of its
+    occlusion-fallback region (the only place its cache is read -- the rest is overwritten by
+    the warp) and bicubic elsewhere, not full-frame. `gpu_cache` (Lever 4a): the cache holds
+    GPU-resident [1,3,H,W] tensors (bicubic done on-device from the small LR upload), so
+    reconstruct_torch never does the per-frame HD host->device upload. Anchors are ALWAYS full
+    SR (read everywhere, drift 0). Returns (cache, info, sr_set)."""
     import sr as _srmod
     N = len(frames)
+    h_lr, w_lr = frames[0][1].shape[:2]
+    scale = w_hd // w_lr
     anchors, backbone = anchor_indices(frames)
 
     # ---- cheap scan of the BACKBONE chain only -> which P frames to SR in the cache ----
     t_scan0 = time.perf_counter()
-    bb_fracs, sr_set = {}, set(anchors)
+    bb_fracs, sr_set, bb_masks = {}, set(anchors), {}
     for i in backbone:
         if i in anchors:
             continue
-        bb_fracs[i] = _lr_fallback_fraction(frames, i, backbone, occ_mode)
+        m = _lr_fallback_mask(frames, i, backbone, occ_mode)
+        bb_fracs[i] = float(m.mean())
         if bb_fracs[i] > fallback_thresh:
             sr_set.add(i)
+            bb_masks[i] = m
     t_scan = time.perf_counter() - t_scan0
 
     _srmod.load_model(sr_mode)
     _warm_sr(_srmod, sr_mode, frames[0][1])            # one-off MPS graph compile (per process)
     t0 = time.perf_counter()
-    cache = {}
+    cache, tile_area = {}, []
+
+    def base_hd(i):
+        return _gpu_bicubic(frames[i][1], w_hd, h_hd) if gpu_cache else \
+            cv2.resize(frames[i][1], (w_hd, h_hd), interpolation=cv2.INTER_CUBIC)
+
+    def full_sr(i):
+        sr = _srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode)
+        import gpu_ops as G
+        return G.img_to_dev(sr) if gpu_cache else sr
+
     for i in range(N):
-        cache[i] = (_srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode) if i in sr_set
-                    else cv2.resize(frames[i][1], (w_hd, h_hd), interpolation=cv2.INTER_CUBIC))
+        if i in anchors:
+            cache[i] = full_sr(i)                       # anchors: always full SR
+        elif i in sr_set:
+            if tile:                                    # Lever 3: SR only the fallback bbox
+                bbox = _bbox_of(bb_masks[i], _TILE_PAD_LR, w_lr, h_lr)
+                if bbox is None:
+                    cache[i] = base_hd(i)
+                else:
+                    sr_tile, hd_bbox = _sr_tile(frames[i][1], bbox, scale, sr_mode)
+                    cache[i] = _place_tile(base_hd(i), sr_tile, hd_bbox)
+                    tile_area.append((bbox[2] - bbox[0]) * (bbox[3] - bbox[1]) / (w_lr * h_lr))
+            else:
+                cache[i] = full_sr(i)
+        else:
+            cache[i] = base_hd(i)                       # bicubic fallback source
     info = {"n_frames": N, "n_anchors": len(anchors), "anchors": sorted(anchors),
             "backbone_upgrades": sorted(sr_set - anchors), "bb_fallback_fracs": bb_fracs,
+            "tile": tile, "gpu_cache": gpu_cache,
+            "mean_tile_area_frac": round(float(np.mean(tile_area)), 4) if tile_area else 0.0,
             "t_scan_s": round(t_scan, 4), "t_cache_s": round(time.perf_counter() - t0, 4)}
     return cache, info, sr_set
 
 
 def patch_high_fallback(frames, R, w_hd, h_hd, sr_mode, fallback_thresh=0.08, skip=None,
-                        collect_info=True):
+                        collect_info=True, tile=False):
     """Adaptive safeguard for the LEAF frames (post-reconstruct). For each frame whose exact,
     anchor-invariant occlusion-fallback fraction (R[i]['hole_frac']) exceeds `fallback_thresh`
     and is NOT already SR'd in the cache (`skip` = the cache's sr_set), run the real SR net and
     patch its detail into EXACTLY that frame's fallback pixels (R[i]['mask']). For a B leaf this
     is fully correct (it is never a reference, so nothing propagates from it); the warped pixels
     came from the already-correct backbone. Operates in place on the GPU-resident recon tensor.
+    `tile` (Lever 3): SR only the bounding box of the frame's fallback mask (the patch only
+    writes inside the mask anyway) instead of the full 2560x1280.
     Returns the upgrade accounting + per-frame fallback fractions for the quality report."""
     import torch
     import gpu_ops as G
     import sr as _srmod
+    h_lr, w_lr = frames[0][1].shape[:2]
+    scale = w_hd // w_lr
     anchors, _ = anchor_indices(frames)
     skip = set(skip or ()) | set(anchors)
     N = len(frames)
@@ -108,10 +206,24 @@ def patch_high_fallback(frames, R, w_hd, h_hd, sr_mode, fallback_thresh=0.08, sk
         if i in skip or R[i].get("mask") is None:
             continue
         if hf > fallback_thresh:
-            sr_hd = G.img_to_dev(_srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode))
             mask = R[i]["mask"]
             if not torch.is_tensor(mask):
-                mask = torch.from_numpy(np.ascontiguousarray(mask)).to(sr_hd.device)
+                mask = torch.from_numpy(np.ascontiguousarray(mask)).to(R[i]["recon"].device)
+            if tile:
+                # SR only the fallback bbox; place it into a copy of the recon, then masked-select.
+                ys, xs = torch.where(mask)
+                if ys.numel() == 0:
+                    continue
+                hx0 = int(xs.min()); hx1 = int(xs.max()) + 1
+                hy0 = int(ys.min()); hy1 = int(ys.max()) + 1
+                # map HD bbox back to LR (+halo), SR the LR tile, place into a full HD canvas.
+                lx0 = max(hx0 // scale - _TILE_PAD_LR, 0); lx1 = min(-(-hx1 // scale) + _TILE_PAD_LR, w_lr)
+                ly0 = max(hy0 // scale - _TILE_PAD_LR, 0); ly1 = min(-(-hy1 // scale) + _TILE_PAD_LR, h_lr)
+                sr_tile, hd_bbox = _sr_tile(frames[i][1], (lx0, ly0, lx1, ly1), scale, sr_mode)
+                sr_hd = R[i]["recon"].clone()
+                _place_tile(sr_hd, sr_tile, hd_bbox)
+            else:
+                sr_hd = G.img_to_dev(_srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode))
             R[i]["recon"] = torch.where(mask[None, None], sr_hd, R[i]["recon"])
             upgraded.append(i)
     info = {}
@@ -133,10 +245,10 @@ def patch_high_fallback(frames, R, w_hd, h_hd, sr_mode, fallback_thresh=0.08, sk
 # Optional PRE-SCAN path (correct propagation for upgraded backbone frames, at the cost of a
 # cheap LR occlusion scan). Kept for the A/B comparison in bench_instant.py.
 # --------------------------------------------------------------------------- #
-def _lr_fallback_fraction(frames, i, backbone_idx, occ_mode):
-    """Estimate frame i's occlusion-fallback fraction at LR (no HD warp). Mirrors the mask
-    reconstruct() builds: non-anchor backbone P -> past occlusion fraction; B leaf -> the
-    `none` (past AND future occluded) fraction. Used only by the pre-scan path / diagnostics."""
+def _lr_fallback_mask(frames, i, backbone_idx, occ_mode):
+    """Frame i's occlusion-fallback mask at LR (no HD warp). Mirrors the mask reconstruct()
+    builds: non-anchor backbone P -> past occlusion; B leaf -> the `none` (past AND future
+    occluded). Used for the backbone scan (fraction + tile bbox) and diagnostics."""
     pt, lr, mvs = frames[i]
     h_lr, w_lr = lr.shape[:2]
 
@@ -148,10 +260,16 @@ def _lr_fallback_fraction(frames, i, backbone_idx, occ_mode):
     prev_ip = max([b for b in backbone_idx if b < i], default=None)
     next_ip = min([b for b in backbone_idx if b > i], default=None)
     if pt in ("I", "P"):
-        return 0.0 if prev_ip is None else float(occ_dir(prev_ip, "past").mean())
+        return (occ_dir(prev_ip, "past") if prev_ip is not None
+                else np.zeros((h_lr, w_lr), bool))
     occ_p = occ_dir(prev_ip, "past") if prev_ip is not None else np.ones((h_lr, w_lr), bool)
     occ_f = occ_dir(next_ip, "future") if next_ip is not None else np.ones((h_lr, w_lr), bool)
-    return float((occ_p & occ_f).mean())
+    return occ_p & occ_f
+
+
+def _lr_fallback_fraction(frames, i, backbone_idx, occ_mode):
+    """Frame i's LR occlusion-fallback fraction (mask mean). Used by the pre-scan path."""
+    return float(_lr_fallback_mask(frames, i, backbone_idx, occ_mode).mean())
 
 
 def build_anchor_cache_prescan(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive",
