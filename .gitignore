@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS
+.DS_Store
+
+# Large assets & model weights — keep out of git (use external storage / download script)
+sample.mp4
+prototype/models/
+*.pth
+*.onnx
+*.safetensors
+*.ckpt
+
+# Generated experiment artifacts (regenerable via the scripts)
+out*/
+prototype/out*/
+*.log
+
+# scratch backups
+*.step3bak
