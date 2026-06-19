@@ -86,10 +86,12 @@ except Exception:
     _gpu_ops = None
 
 # Adaptive-safeguard threshold for the instant path: a non-anchor frame whose occlusion-fallback
-# fraction exceeds this gets a real SR call (bicubic only handles smaller fallback). 0.08 == the
-# high-motion regime; tuned + verified in bench_instant.py (propagated pixels stay ~identical to
-# full-SR, only sub-threshold fallback regions soften to bicubic).
-INSTANT_FALLBACK_THRESH = 0.08
+# fraction exceeds this gets a real SR call (bicubic upscale handles the rest). At the 720p instant
+# tier bicubic fallback is visually fine (it's the fast/lower-quality tier), so this is set HIGH
+# (0.50) -> the safeguard fires only on catastrophic >50%-fallback frames (rare), keeping SR pure
+# anchor-only (~8 ms/frame) for ~10x / 24 fps. Lower it (e.g. 0.08) to trade speed for crisper
+# occlusion regions on high-motion content; verified clean on talking-head at 0.50.
+INSTANT_FALLBACK_THRESH = 0.50
 
 # Lever 3 (tile-SR safeguard): SR only the bounding box of a high-fallback frame's occlusion
 # region instead of the full 2560x1280. DISABLED by default after measurement: on this real
@@ -147,7 +149,7 @@ MODE_CONFIG = {
                                                    # shrinks hole_frac so fewer safeguard SR upgrades.
                     region_aware=False,
                     grain="med",
-                    label="Instant (compact anchor, torch/MPS, adaptive occ, grain)"),
+                    label="Instant (720p, compact anchor-only SR, ~real-time ~24 fps)"),
     "quality": dict(sr_mode="realesrgan-x4plus",   # heavy RRDBNet x4plus (~2.2 s/frame, +61% sharper)
                     backend="torch",               # region-aware integration is tested on torch
                     occ="adaptive",
