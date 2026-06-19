@@ -1,6 +1,6 @@
 # playhd — handoff
 
-Real-time SD→FullHD video upscaling "on the fly". Status as of 2026-06-18.
+Real-time SD→FullHD video upscaling "on the fly". Status as of 2026-06-19.
 
 ## TL;DR
 
@@ -9,14 +9,29 @@ only on sparse anchor/keyframes**, then reconstructing every other frame cheaply
 the super-resolved anchor with codec motion vectors + residuals**. This is the **NEMO**
 (MobiCom 2020) architecture; we are porting its idea from VP9 to **H.264/H.265**.
 
-**Current state:** the riskiest seam is de-risked and the architecture is validated end-to-end
-on a real H.264 bitstream (see `prototype/`). 3 deep-research passes done. **Steps 1–4 complete
-on real footage** (`sample.mp4`, 640×320 H.264 with real B-frames): B-frame backbone+leaf
-reconstruction, a real SR network on the anchor (`realesr-general-x4v3`), and an adaptive
-re-anchoring quality-vs-anchor-fraction curve are all done (see "Program progress" below). The
-economic thesis is validated: on a talking-head clip, propagated-SR ≈ per-frame-SR (45–46 dB)
-at ~7% of the SR compute (~14–24× fewer SR calls). Next step is profiling the new bottleneck:
-warp+mask+decode (SR is no longer the bottleneck).
+**Current state:** the architecture is validated end-to-end on real H.264 and **GPU-accelerated to
+real-time on Apple Silicon**. **5 deep-research passes** done; **Steps 1–9 complete** + a **layered-
+architecture track (L1–L4) in progress** (see below). Under **git** (init 2026-06-19; commits
+`7520d7e` Steps 1–8, `ee53c13` Step 9; `.gitignore` excludes `sample.mp4`/`models/`/`out*/`).
+
+Headline results:
+- **Economic thesis validated:** on a talking-head clip, propagated-SR ≈ per-frame-SR (45–46 dB) at
+  ~7% of the SR compute (~14–24× fewer SR calls). No production upscaler (RTX VSR, Anime4K, animejanai)
+  exploits codec MVs for temporal propagation → this is the novelty.
+- **Real-time reached** (Steps 6–7): numpy 252 ms/frame → torch/MPS **38–40 ms (25 fps)** via GPU warp+
+  mask+blend, transfer removal, and `--occ adaptive` (full quality both regimes) or `--occ reactive`
+  (faster, full quality on low-motion). RECOMMENDED LIVE CONFIG: `--backend torch --occ adaptive --grain`.
+- **Quality axis** (Steps 8–9): heavy x4plus anchor (+61% sharper, 2.2 s/frame so buffered/quality-mode
+  only — live anchor stays compact); per-frame film grain; `--region-aware` motion-gated detail (recovers
+  95% of heavy static detail at compact flicker). Diffusion anchor = NO-GO on this box (7–14× too slow,
+  VAE-decode bound — needs TAESD); live heavy anchor = throughput-bound on one GPU.
+- **Layered track ("video as layers" idea) — DONE (L1–L4):** decompose into a static background plate
+  (RVM matte L1 + temporal-median plate L2, SR'd ONCE/scene) + per-frame foreground, composite + grain (L3).
+  RESULT: uniquely delivers a **rock-stable, denoised, x4plus-sharp background (~167× less flicker than
+  per-frame x4plus)** — but it is **NOT a speed win** (~4–5× slower; the moving foreground can't be
+  propagated so it needs fresh per-frame SR), and the earlier "layered may be cheaper" hypothesis was
+  WRONG. Verdict: a quality/stability OPTION to kill background shimmer, not the default path. Real-time
+  path stays `--region-aware` propagation.
 
 ## Repo layout
 
@@ -33,19 +48,30 @@ prototype/ab_anchor.py # Step 8 compact-vs-x4plus A/B visual; grain_demo.py = gr
 prototype/anchor_sweep.py   # Step 4 quality-vs-anchor-fraction sweep driver
 prototype/before_fallback.py # Step 1 "before" recon (clean BEFORE for fallback%/LR-consistency)
 prototype/probe_gop.py      # GOP/MV-source-sign/duplicate-frame probe for a real clip
+prototype/matting.py        # LAYERED L1: RVM foreground matting on MPS (load_rvm/matte_sequence/fg_mask_lr)
+prototype/background_plate.py # LAYERED L2: static-camera background plate (scene_segments/build_plate/sr_plate/sample_plate)
+prototype/layered_pipeline.py # LAYERED L3: composite plate + per-frame FG + grain (in progress)
+prototype/demo_matting.py / demo_background_plate.py  # layered demos
 prototype/README.md    # how the prototype works + result tables + ARTIFACTS index
-prototype/models/      # auto-downloaded SR weights (realesr-general-x4v3.pth, RealESRGAN_x4plus.pth)
+prototype/models/      # auto-downloaded SR weights (realesr-general-x4v3.pth, RealESRGAN_x4plus.pth) + RVM via torch.hub cache
 prototype/out_quality/ # Step 8 artifacts: detail_drift.png/.csv, ab_anchor_*, grain_{ab,consec,field}.png
-prototype/out*/        # generated artifacts (see prototype/README.md ## Artifacts)
+prototype/out_matting/ out_plate/ out_layered/  # LAYERED L1/L2/L3 artifacts
+prototype/out*/        # generated artifacts (see prototype/README.md ## Artifacts) — all gitignored
 handoff.md             # this file
 ```
+**Under git** since 2026-06-19 (`master`): `7520d7e` Steps 1–8, `ee53c13` Step 9. `.gitignore`
+excludes `sample.mp4` (78 MB), `prototype/models/` (weights), `out*/` (~340 MB), `__pycache__`, logs.
+Layered-track modules (matting/background_plate/layered_pipeline + the analysis modules
+anchor_pipeline/sr_diffusion) are committed after the layered track's seam-verification pass.
 Persistent project memory (loaded each Claude session) lives outside the repo at
 `~/.claude/projects/-Users-lifeart-Repos-playhd/memory/` → `playhd-project.md`,
 `playhd-research-state.md`.
 
-Raw research reports (full JSON, more detail than summarized here) are in the task outputs:
-`wo4me2syo` (pass 1), `wgdeoh3u5` (pass 2), `wy0mun7qt` (pass 3) under
-`/private/tmp/claude-501/.../tasks/`.
+Raw research reports (full JSON, more detail than summarized here) are in the task outputs under
+`/private/tmp/claude-501/.../tasks/`: `wo4me2syo` (pass 1: NEMO/architecture), `wgdeoh3u5`
+(pass 2: H.264 MV extraction), `wy0mun7qt` (pass 3: occlusion/FSR2/metrics/baselines), `wau8fdg60`
+(pass 4: better-upscaling — heavy/diffusion anchors, grain, propagation-stabilizes-detail),
+`wce7evoli` (pass 5: layered/compositional video SR — Wang&Adelson, RVM, MV-free segmentation/plate).
 
 ## How to run
 
@@ -283,6 +309,58 @@ silently no-ops). No real diffusion SR is wired on this box (basicsr + multi-GB 
 so `--sr diffusion` is NO-GO; the probe is retained for the record. Standalone. Artifacts:
 `sr_diffusion.py`.
 
+## Step 10 — LAYERED architecture ("video as a composition of layers") — IN PROGRESS
+
+Motivated by the recurring finding that **everything splits by motion** (static = heavy detail
+persists + propagation near-free; dynamic = detail erodes + needs fresh SR). Idea: decompose the
+frame into a **static background layer** (SR'd ONCE per scene with a heavy model → amortized over
+hundreds of frames, dissolving the live-heavy-anchor throughput ceiling) + a **dynamic foreground
+layer** (~18% of frame, SR'd per-frame/anchor), then composite + grain. Research pass 5 (`wce7evoli`)
+validated it for **static-camera talking-head** content; Wang&Adelson 1994 is the blueprint (background
+= one extended plate the camera window slides over, built by temporal-median of motion-compensated
+frames). Key correction: **codec-MV segmentation FAILS for near-still talking heads** (lip-only motion →
+~zero MVs → misclassified as background) — so use a real matte (RVM); MVs are still free for global-
+motion plate registration + scene-cut detection.
+
+- **L1 (DONE) — `matting.py`:** Robust Video Matting on MPS via `torch.hub.load("PeterL1n/RobustVideoMatting","mobilenetv3")`.
+  Fully native (zero CPU fallback), **~19–22 ms/frame** (LR→720p), clean & temporally stable matte
+  (alpha MAD 0.0105), FG **~18% of frame**. API: `load_rvm`, `matte_sequence` (threads the recurrent
+  state — feed frames IN ORDER), `fg_mask_lr(pha,lr_hw,soft,thresh,dilate)` → gate (1=FG, 0=BG). The
+  KEY economic insight: in the layered render you DON'T run warp+mask propagation on the background, so
+  recon shrinks to the ~18% FG → layered may be CHEAPER than full-frame propagation AND higher quality.
+- **L2 (DONE) — `background_plate.py`:** static-camera verified (global MV = 0.000 px). Plate = per-pixel
+  temporal-median of background-only pixels (FG masked, dilate 3 px). **Plates are PER-SCENE** — segment
+  on codec I-frames (`scene_segments`); the canonical `start 5000` window has a hard cut at frame 32, so
+  build on `[0,32)`. Coverage 75.2%, always-occluded hole 24.78% (behind subject, inpainted, never
+  visible). Subject cleanly removed. Heavy-SR the plate ONCE (x4plus) = **86 ms/frame over 32 frames →
+  ~9 ms/frame for a 300-frame shot** (amortization scales with scene length), bg sharpness 8.86× bicubic.
+  API: `estimate_global_motion`, `scene_segments`, `build_plate(hole_fill="inpaint")`, `sr_plate`,
+  `sample_plate(static=identity; global_motion hook for camera motion)`.
+- **L3 (DONE) — `layered_pipeline.py`:** composite `out = alpha*fg_hd + (1-alpha)*plate_hd` + grain.
+  **The background win is REAL & unique:** BG sharpness 15.3 vs x4plus ceiling 13.6 (**112%** — the
+  temporal-median plate DENOISES before the single heavy SR, so it beats SR-ing one noisy frame) at
+  **direct frame-to-frame flicker |ΔF| = 0.001 vs x4plus 0.167 (~167× steadier)** — neither uniform-x4plus
+  nor region-aware achieves this. x4plus-bbox FG gets full subject detail (55.7 ≈ x4plus 57.1), so both
+  layers are x4plus-sharp at once. **BUT IT IS NOT A SPEED WIN** (corrects the earlier "layered may be
+  cheaper" hypothesis): the foreground is the MOVING subject → can't be propagated (Step-8 detail erodes
+  in ~1 frame on motion) → must be SR'd FRESH every frame, which is the cost floor (~130 ms compact full-
+  frame). The plate amortizes only the background (which was already cheap via warp). GPU-realistic layered
+  compact-FG ≈ **~148 ms (6.8 fps), ~4–5× SLOWER than the 33 ms propagation pipeline.** The bbox trick
+  barely helps a centered head (bbox = 50.6% of frame, not 18%; alpha-mass 27% but bounding box huge).
+  Metric note: literal "tOF≈0" was REFUTED (tOF measures deviation from decoded-LR jitter; the fixed plate
+  deviates from that real jitter, so tOF BG = 0.023 ≈ x4plus 0.025) — the spirit (zero flicker) is true via
+  the direct |ΔF| metric, not tOF. FG tOF is WORSE (0.218 vs 0.074) — the moving alpha edge over a static
+  plate + disocclusion ring is temporally noisier. Artifacts: `out_layered/`.
+- **L4 (folded into L3's honesty section) — failure modes:** lighting/color across the seam is GOOD (plate
+  = temporal median of the SAME footage). Halo REAL but subtle (faint hairline/jaw rim; FG/BG sharpness
+  discontinuity 5.1–5.8× vs uniform-x4plus 3.4×). Hair bulk fine, fine wisps lose. WORST exactly at the
+  disocclusion ring (low-coverage inpainted plate, sharpness 8.7 vs 15.3). Bounded to static-camera +
+  human foreground + non-commercial matte.
+- **VERDICT:** layered is a **quality/stability OPTION (kills background shimmer with a rock-stable,
+  denoised, x4plus-sharp background)**, NOT a speed win and NOT the default real-time path. **Keep
+  `--region-aware` propagation as the real-time path; reach for layered only when background shimmer is the
+  specific defect to kill** and the ~4× cost + non-commercial matte + static-camera limits are acceptable.
+
 ## GOTCHAS (read before touching anything)
 
 1. **System `ffmpeg` is BROKEN** on this machine: `dyld: Library not loaded:
@@ -384,6 +462,28 @@ so `--sr diffusion` is NO-GO; the probe is retained for the record. Standalone. 
     Also: `--region-aware` REQUIRES `--sr realesrgan-x4plus` (the propagation chain is the single
     heavy model; the compact source is a separate per-frame compact SR). Default OFF = byte-identical.
 
+17. **RVM matte: non-commercial license + recurrent state** (L1). RVM is **CC BY-NC-SA 4.0** —
+    fine for this prototype/research, but a COMMERCIAL product cannot ship it; swap for a
+    differently-licensed matte (re-trained RVM, MediaPipe Selfie Segmentation, etc.). Also RVM is
+    RECURRENT (ConvGRU) — you MUST thread its state (`rec=[None]*4`) across frames in display order
+    (`matte_sequence` does this); calling it per-frame statelessly loses the temporal coherence that
+    keeps the matte edge from crawling. Human-only; it can drop a non-human/empty frame (e.g. a title
+    card), which the plate's temporal median tolerates as a minority but a mostly-mis-matted scene
+    would corrupt the plate.
+
+18. **Background plates are PER-SCENE — segment on codec I-frames** (L2). A plate accumulates one
+    static shot; never let frames from across a cut into the same median (the canonical `start 5000`
+    window spans a hard cut at frame 32 → a mid-stream I-frame; the naive full-48 plate reports a
+    bogus 0% hole because the title-card frames fill the occluded region). Use `scene_segments` /
+    `find_scene_cuts` (codec I-frames + an RGB-diff spike) and build per segment.
+
+19. **The plate assumes a STATIC camera** (L2). Verified here (global MV = 0.000 px → `sample_plate`
+    is identity). Any pan/zoom breaks the identity plate: the `global_motion` hook handles translation,
+    but real camera motion (parallax/zoom) needs per-frame homography warping of the plate (cheap from
+    block MVs, ~6–18 ms/field per the research) — NOT implemented in v1. The always-occluded hole
+    (~25%) is INPAINTED (a guess) — safe only because the subject always covers it; if the matte ever
+    under-covers, the guessed pixels show.
+
 ## Known limitations / done since (Steps 1–4) and still NOT done
 
 - ✅ **DONE — real SR network** (Step 3): `prototype/sr.py` SRVGGNetCompact /
@@ -449,19 +549,19 @@ so `--sr diffusion` is NO-GO; the probe is retained for the record. Standalone. 
 
 ## Recommended next step
 
-Steps 1–4 confirmed the architecture on real H.264 (B-frames, real SR net, adaptive anchors).
-Propagation has **removed SR as the real-time bottleneck**, so the priorities now are:
+Steps 1–9 confirmed the architecture on real H.264 AND reached real-time on Apple Silicon. The
+active frontier is the **layered architecture** (Step 10) — the most promising direction because it
+could deliver quality AND speed at once:
 
-1. ✅ **DONE (Step 6) — profiled + GPU-accelerated.** Real end-to-end fps measured and the hot
-   path (warp+mask+**blend**) moved to MPS. To CROSS the 40 ms line robustly (not just at the
-   margin): (a) keep the displayed frame on the GPU (skip the ~10 ms output download — render
-   from the Metal texture); (b) deploy on-GPU SR so the fallback source is already resident (no
-   ~9 ms perframe upload); (c) a cheaper occlusion mask than even reactive, since the mask is now
-   the dominant recon op. Window A (high-motion) was profiled only for speed (content-independent
-   ratio holds); its higher fallback% makes the B-frame blend do more work — re-profile if needed.
-2. **Improve the high-motion regime.** Window A still pays ~24% honest P-frame occlusion fallback
-   and needs ~12.5% anchors at budget 1.0. Better masks / shorter P→anchor hops / smarter adaptive
-   triggering (keyed on tOF + fallback%, the honest metrics — NOT LR-consistency) are the levers.
-3. **Consider a WebGPU / lighter-SR path.** If the target is the browser, benchmark
-   web-realesrgan / Anime4K-WebGPU / websr (links in "Still open") and/or a lighter anchor net
-   (ABPN) to push the anchor SR cost down further.
+1. **Finish the layered track (L3 → L4).** L3 measures the composite (does the fixed plate give
+   x4plus background sharpness at ~zero flicker, and is it cheaper than full-frame propagation?);
+   L4 characterizes failure modes (hair/seams, camera motion, the hole, multi-object). If it holds,
+   build the streaming layered pipeline (matte at a slow refresh + MV-propagated gate; plate per
+   scene; foreground per-anchor) and add the `global_motion` homography path for non-static cameras.
+2. **Improve the high-motion regime** (the standing weak spot). Window A pays ~24% honest P-frame
+   occlusion fallback, needs ~12.5% anchors at budget 1.0. Levers: better masks, shorter P→anchor
+   hops, adaptive triggering keyed on tOF + fallback% (the honest metrics — NOT LR-consistency).
+3. **Productionization gaps:** a commercially-licensed matte (RVM is non-commercial); the TAESD
+   path to make a diffusion anchor affordable (VAE decode is the bottleneck, not MPS); color-box
+   clamping (`--clamp`, untested); a WebGPU / lighter-SR (ABPN) path if the target is the browser
+   (web-realesrgan / Anime4K-WebGPU / websr — links in "Still open").
