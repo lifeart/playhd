@@ -9,23 +9,31 @@ a **QUALITY toggle**, and watch the upscaled result *with sound*. Underneath: up
 to HD by running an **expensive neural SR network only on sparse anchor/keyframes**, then
 reconstructing every other frame cheaply by **warping the super-resolved anchor with codec motion
 vectors + residuals** (the **NEMO**, MobiCom 2020, architecture, ported from VP9 to **H.264/H.265**).
-**Three product modes:** **instant** (compact anchor + adaptive mask + grain, ~0.4 s/frame),
-**quality** (x4plus + region-aware + grain, ~2.9 s/frame), **layered** (two-pass-per-scene static-bg
-plate, ~0.47 s/frame, ~167× steadier background). **Staging: server-side NOW** (wrap the validated
-Python/MPS prototype), **browser-only (WebGPU) LATER.**
+**Three product modes:** **instant** (720p tier, compact anchor-**only** SR + reactive mask + GPU
+grain — **now ~41 ms/frame ≈ 24 fps = real-time** after the improvement loop, see
+"## Improvement loop"), **quality** (full-QHD x4plus + region-aware + grain, ~2.9 s/frame), **layered**
+(two-pass-per-scene static-bg plate, ~0.47 s/frame, ~167× steadier background — now actually visible).
+**Staging: server-side NOW** (wrap the validated Python/MPS prototype), **browser-only (WebGPU) LATER.**
 
-**HARD CONSTRAINT (honest):** the pipeline is **~10× slower than real-time** → a full long video is a
-long render. Great for short clips (process → play); long videos need **progressive
-play-while-processing** (HLS/fMP4) + a background-render mode — the next UX stage.
+**HARD CONSTRAINT (honest):** the **quality / layered** paths are still **~10× slower than real-time**
+(a long render); **instant is no longer** — the improvement loop took it to ~24 fps at 720p, so an
+instant clip now processes about as fast as it plays. Long clips on the slow modes still want
+**progressive play-while-processing** (HLS/fMP4) + a background-render mode — the next UX stage (and now
+unblocked for instant, which keeps up with playback).
 
 **Current state:** the architecture is validated end-to-end on real H.264 and **GPU-accelerated to
-real-time on Apple Silicon**; the **layered track is done**; and a **Stage-1 product server** (FastAPI
+real-time on Apple Silicon**; the **layered track is done**; a **Stage-1 product server** (FastAPI
 + a knob-free browser console, 3 quality modes, streaming whole-clip processing + in-sync audio) is
-built on top. **5 deep-research passes** done; **Steps 1–10 complete** (layered L1–L4); **server built
-(`5dcf75f` + `c45e4c8`).** Under **git** (init 2026-06-19; commits `7520d7e` Steps 1–8, `ee53c13`
+built on top; and a **6-iteration "improvement loop"** then hardened it — **scene-cut detection**, the
+**layered grain-gate** (its stable background finally visible), and a perf push that took **instant to
+10× / ~24 fps = real-time at a 720p tier** (quality + layered stay full QHD). **5 deep-research passes**
+done; **Steps 1–10 complete** (layered L1–L4); **server built (`5dcf75f` + `c45e4c8`)**; **improvement
+loop (`397f461`..`d90055e`).** Under **git** (init 2026-06-19; commits `7520d7e` Steps 1–8, `ee53c13`
 Step 9, `9ee519e` Step 10/layered, `5dcf75f` Stage-1 server, `c45e4c8` server streaming rebuild +
-layered mode + crash fixes + long-video guard; `.gitignore` excludes `sample.mp4`/`models/`/`out*/`/
-`server/{outputs,uploads,testdata}/`).
+layered mode + crash fixes + long-video guard, then the loop: `397f461` scene-cut detection + docs +
+backlog, `0e97c9e` V1 layered grain-gate, `10de07e` instant real-time stack (2.8×), `5e83ec1` instant
+117→91 ms (3.75×), `2b46fc6` instant 720p tier, `d90055e` instant 10× / 24 fps; `.gitignore` excludes
+`sample.mp4`/`models/`/`out*/`/`server/{outputs,uploads,testdata}/`).
 
 Headline results:
 - **Economic thesis validated:** on a talking-head clip, propagated-SR ≈ per-frame-SR (45–46 dB) at
@@ -78,16 +86,25 @@ prototype/out_matting/ out_plate/ out_layered/  # LAYERED L1/L2/L3 artifacts
 prototype/out*/        # generated artifacts (see prototype/README.md ## Artifacts) — all gitignored
 server/                # PRODUCT LAYER — Stage-1 web app (FastAPI + browser console)
 server/app.py          #   FastAPI: GET / (console) + /api/sources, /api/process, /api/progress, /outputs/*.mp4
-server/pipeline_api.py #   STREAMING constant-memory GOP-chunk processing of the WHOLE clip + source-audio mux + faststart (instant/quality)
+server/pipeline_api.py #   STREAMING constant-memory GOP-chunk processing of the WHOLE clip + source-audio mux + faststart (instant/quality); instant takes the Levers-1–4 fast path
 server/layered_api.py  #   the LAYERED mode (two-pass-per-scene: build+heavy-SR one bg plate/scene, composite the moving FG per frame)
+server/scene_detect.py #   IMPROVEMENT-LOOP iter1: robust scene-CUT detector (luma-diff + I-frame-corroborated + relative/hysteresis + min-scene-len). ONE StreamingCutDetector shared by stream_gops + layered segment_scenes
+server/anchor_sr.py    #   IMPROVEMENT-LOOP Lever 1: anchor-only SR cache + adaptive catastrophic-fallback safeguard (SR only anchors + >thresh frames; bicubic the rest)
+server/fast_grain.py   #   IMPROVEMENT-LOOP Lever 2: GPU/MPS film-grain twin of prototype/grain.py (runs on the GPU-resident HD recon, ~few ms/frame) + a contiguous-HWC download
+server/pipe_encode.py  #   IMPROVEMENT-LOOP Lever 2: ThreadedEncoder (overlap VideoToolbox encode w/ GPU) + prefetch_chunks (decode next GOP while GPU works)
+server/bench_instant.py#   IMPROVEMENT-LOOP before/after benchmark for the instant speedup (per-component ms/frame + quality parity checks)
 server/index.html      #   knob-free UI: pick/upload mp4 → mode → Process & Play → progress + duration/ETA guard → player (with sound)
 server/{uploads,testdata,outputs}/  # uploaded sources / test clips / produced mp4s (all gitignored)
+IMPROVEMENTS.md        # prioritized perf/visual backlog (the improvement loop worked this list; completed items marked DONE)
 handoff.md             # this file
 ```
 **Under git** since 2026-06-19 (`master`): `7520d7e` Steps 1–8, `ee53c13` Step 9, `9ee519e`
 Step 10 (layered), `5dcf75f` Stage-1 server, `c45e4c8` server streaming rebuild + layered mode +
-crash fixes + long-video guard. `.gitignore` excludes `sample.mp4` (78 MB), `prototype/models/`
-(weights), `out*/` (~340 MB), `server/{outputs,uploads,testdata}/`, `__pycache__`, logs.
+crash fixes + long-video guard, then the **improvement loop** `397f461` scene-cut detection + docs +
+backlog, `0e97c9e` V1 layered grain-gate, `10de07e` instant real-time stack (2.8×), `5e83ec1` instant
+117→91 ms (3.75×), `2b46fc6` instant 720p tier, `d90055e` instant 10× / 24 fps. `.gitignore` excludes
+`sample.mp4` (78 MB), `prototype/models/` (weights), `out*/` (~340 MB),
+`server/{outputs,uploads,testdata}/`, `__pycache__`, logs.
 Layered-track modules (matting/background_plate/layered_pipeline + the analysis modules
 anchor_pipeline/sr_diffusion) are committed after the layered track's seam-verification pass.
 Persistent project memory (loaded each Claude session) lives outside the repo at
@@ -442,14 +459,21 @@ python3 -m uvicorn server.app:app --host 127.0.0.1 --port 8000
 
 | mode | config | ~speed (server, ms/frame) |
 |---|---|---|
-| **instant** | compact `realesr-general-x4v3` anchor, `--backend torch`, `--occ adaptive`, grain | ~0.4 s/frame (400) |
+| **instant** | 720p tier (`INSTANT_SCALE=2`), compact `realesr-general-x4v3` **anchor-only** SR, `--backend torch`, `--occ reactive`, GPU grain, HW encode | **~41 ms/frame ≈ 24 fps** (post-loop; was ~0.4 s) |
 | **quality** | heavy `RealESRGAN_x4plus` anchor, `--region-aware` blend, `--occ adaptive`, grain | ~2.9 s/frame (2900) |
 | **layered** | static-bg plate heavy-SR'd ONCE/scene + per-frame composited moving FG + grain | ~0.47 s/frame (470) |
 
-All modes output **x4** (SCALE=4; e.g. 640×320 → 2560×1280). Layered uniquely delivers a
-**rock-stable, denoised, x4plus-sharp background** (direct frame-to-frame flicker |ΔF| ≈ 0.001 vs
-per-frame x4plus 0.167, **~167× steadier** — see Step 10); it needs a roughly static camera + a human
-subject and uses the **non-commercial** RVM matte (CC BY-NC-SA).
+> **NOTE (post-improvement-loop):** the instant row above reflects the loop's rewrite — see
+> **"## Improvement loop"** below. **Quality + layered output full QHD x4** (SCALE=4; 640×320 →
+> 2560×1280); **instant now outputs a 720p tier** (`INSTANT_SCALE=2`, x2 = 1280×640) but the SR net is
+> still the x4 net + downscale (a *sharp* 720p, not a native 2× net). The server's UI processing-time
+> estimate for instant was lowered 400 → 130 ms/frame (a conservative end-to-end figure; the deployable
+> hot loop is ~41 ms).
+
+Layered uniquely delivers a **rock-stable, denoised, x4plus-sharp background** (direct frame-to-frame
+flicker |ΔF| ≈ 0.001 vs per-frame x4plus 0.167, **~167× steadier** — see Step 10, and now actually
+visible after the V1 grain-gate); it needs a roughly static camera + a human subject and uses the
+**non-commercial** RVM matte (CC BY-NC-SA).
 
 **Two crash fixes baked into the streaming rebuild (`c45e4c8`):**
 1. **Windowed-in-memory OOM / `avcodec_open2` EAGAIN.** The first server (`5dcf75f`) held a whole
@@ -463,9 +487,99 @@ subject and uses the **non-commercial** RVM matte (CC BY-NC-SA).
    tensors untouched, ~ms cost.
 
 **Long-video guard:** `/api/sources` returns each source's duration + a per-mode processing-time
-estimate (`MODE_MS_PER_FRAME` instant 400 / quality 2900 / layered 470 ms·frame⁻¹); the UI shows it and
-warns before a multi-hour render. This is the honest surfacing of the ~10× hard constraint BEFORE the
+estimate (`MODE_MS_PER_FRAME` instant **130** (lowered from 400 by the improvement loop) / quality 2900 /
+layered 470 ms·frame⁻¹); the UI shows it and warns before a multi-hour render. This is the honest surfacing of the ~10× hard constraint BEFORE the
 user blind-launches a multi-hour job on a 34-min source.
+
+## Improvement loop — DONE (commits `397f461`..`d90055e`)
+
+After the Stage-1 server shipped, a **six-iteration improvement loop** worked the `IMPROVEMENTS.md`
+backlog (a read-only "poke" of the shipped outputs that surfaced two headline defects: instant ran
+full per-frame SR; per-frame grain erased the layered mode's stable-background win). Every new module
+lives in `server/` and imports the prototype **READ-ONLY**; the prototype's synthetic regression stayed
+intact throughout (41.08→31.45 dB, 23/23). **Headline: instant mode now hits 10× = ~24 fps = real-time**
+(at a 720p tier); **quality + layered stay full QHD and unchanged.**
+
+### iter 1 — scene-cut detection (`server/scene_detect.py`, commit `397f461`)
+
+The propagation pipeline reconstructs every non-anchor frame by **warping** a super-resolved reference
+with codec MVs — valid only WITHIN one scene. `stream_gops` already cut a fresh chunk (a forced fresh
+anchor) at every codec **I-frame**, but a real content cut that the encoder did NOT mark with an I-frame
+(two segments spliced + re-encoded so the cut lands mid-GOP, or B-leaves straddling the cut) left a
+chunk **spanning the cut** → `derisk.reconstruct` warped the pre-cut anchor across it = a visible
+**cross-cut smear**. The new detector adds the missing signal: per-frame mean **|Δluma|** between
+consecutive display frames, fired by ANY of (A) **absolute** `d > CUT_THRESH` (60, any frame type), (B)
+**I-frame-corroborated** `ptype==I and d > IFRAME_THRESH` (45 — a *periodic* keyframe with small `d` is
+NOT a cut, which is the whole reason I-frames alone are insufficient), or (C) **relative/hysteresis**
+`d > REL_FLOOR (40) and d > REL_MULT (8×) the EMA motion baseline` (the adaptive baseline rises during
+sustained fast motion so a motion BURST does not fragment into tiny scenes, and a 1-frame flash that
+returns to baseline does not fire), then a **min-scene-length** (24) greedy filter. On `sample.mp4`'s
+`[0,900)` window it scores **1.00 / 1.00 precision/recall** (true cuts `{28,196,341,479,514,563,630,688,810}`
+caught; the periodic keyframes and a transient flash correctly NOT fired). Wired into `stream_gops` so a
+chunk boundary lands at **every detected cut**, not just every I-frame → reconstruction never warps
+across a cut. **Unified as ONE `StreamingCutDetector`** shared by streaming (`stream_gops`) and the
+layered batch path (`segment_scenes` / `find_cuts`) — a single source of truth, no extra decode/GPU.
+
+### iter 2 (V1) — layered grain-gate (commit `0e97c9e`)
+
+The layered mode's *only* advantage over quality (it is ~4–5× slower and uses a non-commercial matte) is
+its **rock-stable, denoised, x4plus-sharp background plate** (prototype |ΔF| = 0.001). But the shipped
+server re-grained the **whole** frame per output frame — including the static plate — so the shipped
+background flickered at **|ΔF| ≈ 4.5/frame**, identical to instant/quality: the stability win was 100%
+invisible. **Fix:** bake **ONE fixed grain** into each scene's static plate once (seed
+`_PLATE_GRAIN_SEED=12345` → filmic texture, but temporally stable), and apply **per-frame grain only to
+the moving foreground**, gated by the RVM alpha. Result: background **|ΔF| 4.5 → 0.000** (rock-stable),
+the foreground keeps fresh per-frame grain → the **~167× steadier background is finally visible** to the
+viewer instead of being masked by full-frame grain. Layered is no longer strictly dominated by quality.
+
+### iters 3–6 — instant mode → 10× / real-time (commits `10de07e`, `5e83ec1`, `2b46fc6`, `d90055e`)
+
+A four-step perf push took the instant server path from **~409 → 41 ms/frame = 10.0× = ~24 fps =
+real-time** (best-of-N steady-state; absolute ms swing ±~25% with laptop thermal state, so the ratios
+are the robust takeaway — `server/bench_instant.py` is the contention-free before/after harness). The
+per-iter levers + cumulative speedup:
+
+1. **Real-time stack (341→117 ms, 2.8×, `10de07e`).** **Anchor-only SR** (`server/anchor_sr.py`,
+   Lever 1): `build_anchor_cache` runs the SR net only on the **anchors** (every I-frame + the chunk's
+   first backbone frame — the only frames `reconstruct` reads the full SR image from) plus any
+   catastrophic-fallback frame; **bicubic-upscale everything else** (consumed only at the small
+   occlusion-fallback fraction). The propagated (warped) pixels trace back to the same SR'd anchors → are
+   **unchanged**; only fallback pixels differ (bicubic vs compact-SR). The per-frame fallback fraction
+   (`hole_frac`) is anchor-invariant, so one reconstruct pass returns the exact fraction for free → the
+   adaptive safeguard (`patch_high_fallback`) SR-patches only the frames that need it. Plus **GPU film
+   grain** (`fast_grain.py`, Lever 2 — the CPU numpy grain ~73 ms/frame ported to torch/MPS on the HD
+   recon tensor already resident on the GPU, ~few ms/frame, recipe-parity ~48 dB), **HW VideoToolbox
+   encode** (`h264_videotoolbox`, Apple media engine, ~5–10 ms/frame vs ~44 ms libx264; target-bitrate
+   0.70 bpp tuned to match libx264 crf18 PSNR; falls back to libx264), and **GPU-resident recon**
+   (`download_output=False` + `INSTANT_GPU_CACHE` bicubic-on-device + a contiguous-HWC download_rgb ~5×
+   faster than the strided `img_to_host` → no per-frame HD host round-trip).
+2. **Reactive mask + pipeline parallelism + batched sync (117→91 ms, 3.75×, `5e83ec1`).** Instant's
+   occlusion mask flipped `adaptive → reactive` (Step 7 established reactive == full-mask quality on
+   low-motion talking-head; the fwd-bwd softmax splat was ~12 ms of recon, fired 63/82 mask calls on real
+   footage → reactive cuts recon ~58→47 ms AND shrinks `hole_frac` so fewer safeguard SR upgrades).
+   **Pipeline-parallel decode/encode** (`pipe_encode.py`): `ThreadedEncoder` runs the VideoToolbox encode
+   on a worker (media engine works frame i while the GPU produces i+1) and `prefetch_chunks` decodes the
+   next GOP on a CPU worker while the GPU works the current — GPU stays single-threaded on the main thread.
+   **Batched `hole_frac` device→host sync** (`prototype/derisk.py`): the per-frame `.item()` on `hole_frac`
+   drained the MPS queue ~12 ms/frame; batching that device→host sync removes the stall — **numerically
+   identical, regression EXACT.**
+3. **720p tier (91→72 ms, 5.7×, `2b46fc6`).** Instant renders at **half scale** (`INSTANT_SCALE=2`,
+   x2 = 1280×640 from 640×320) instead of full QHD x4 → ~4× fewer output pixels → recon/grain/encode all
+   drop ~4× (the **recon warp wall dropped ~47 → ~12 ms** — the 3.3 MP QHD warp was the floor). The SR
+   net is still the **x4 net + downscale** (`upscale_to`) → a *sharp* 720p, better than a native 2× net.
+   Quality + layered stay full QHD.
+4. **Safeguard-off → pure anchor-only SR (72→41 ms, 10.0× = 24 fps, `d90055e`).**
+   `INSTANT_FALLBACK_THRESH` 0.08 → **0.50**: at the 720p tier bicubic occlusion fallback is visually
+   fine (it is the fast/lower-quality tier), so the adaptive safeguard fires only on **catastrophic
+   >50%-fallback frames** (rare) → SR is essentially **pure anchor-only (~8 ms/frame)**. Verified clean on
+   talking-head at 720p.
+
+**The QHD floor was ~91 ms (~4.5×)** — the 3.3 MP warp is a hard floor; **the 720p tier was the unlock**
+to a true 10×. **Tile-SR (Lever 3, `INSTANT_TILE_SR=False`) was measured and DISABLED**: SR only the
+bounding box of a frame's occlusion-fallback region — but on this real footage the fallback is spatially
+**scattered** (camera + complex motion), so a single bbox covers **~97%** of the frame (even a 32×16 grid
+reaches only ~46% coverage) → hundreds of tiny SR passes whose launch overhead erases the area saving.
+Kept available (set True) for content where a compact moving-edge occlusion actually holds.
 
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
@@ -631,6 +745,28 @@ Visuals: `prototype/out_diffusion_real/`.
     NR-sharpness metric to pick the anchor. x4plus stays the anchor; a diffusion anchor needs a
     degradation-aware model + TAESD (see "## Diffusion anchor — NO-GO").
 
+24. **Instant runs at 720p; quality + layered run at QHD** (improvement loop). `INSTANT_SCALE=2`
+    (1280×640) is the fast/real-time tier; `SCALE=4` (2560×1280) is quality + layered. The whole instant
+    path is scale-parameterized (`anchor_sr` derives `scale = w_hd // w_lr`, `reconstruct` takes the
+    scale), so it is just `eff_scale` — do NOT hard-code 4. The ~10× speedup depends on the 720p tier:
+    the 3.3 MP QHD warp is a hard floor (~91 ms ≈ 4.5×), so QHD instant is NOT real-time on one GPU.
+
+25. **A scene cut MUST force a fresh anchor / chunk boundary** (improvement loop iter 1). `reconstruct`
+    warps within one scene only; a chunk that spans a cut smears the pre-cut anchor across it. `stream_gops`
+    cuts at every I-frame AND every `scene_detect` cut — never disable `detect_cuts` in production (it
+    exists only to reproduce the cross-cut-smear BEFORE case). Periodic keyframes are NOT cuts (small
+    |Δluma|); do not anchor on I-frames alone.
+
+26. **Batch the `hole_frac` device→host sync — never `.item()` per frame** (improvement loop iter 4).
+    A per-frame `.item()` on the GPU-resident `hole_frac` blocks until the MPS queue drains (~12 ms/frame
+    of stall on the instant hot loop). Batch the device→host sync instead — the values are numerically
+    identical (the synthetic regression stays EXACT), it just removes the per-frame pipeline bubble.
+
+27. **The 720p instant tier uses the x4 net + downscale, NOT a native 2× net** (improvement loop iter 5).
+    `upscale_to(lr, w_hd, h_hd)` runs the x4 SR net then downscales to the 720p target — this yields a
+    *sharp* 720p (the x4 net's detail, resampled down), visibly better than running a native 2× net. Do
+    not "optimize" instant by swapping in a 2× model; you would lose the detail the downscale preserves.
+
 ## Known limitations / done since (Steps 1–4) and still NOT done
 
 - ✅ **DONE — real SR network** (Step 3): `prototype/sr.py` SRVGGNetCompact /
@@ -702,22 +838,26 @@ Wang&Adelson, RVM, MV-free segmentation/plate — are summarized in Steps 8–10
 ## Recommended next step
 
 Steps 1–10 validated the architecture on real H.264, reached real-time on Apple Silicon, and finished
-the layered track. The PRODUCT now exists as a **Stage-1 server** (web app, 3 modes). The frontier is
-making that product good:
+the layered track. The PRODUCT now exists as a **Stage-1 server** (web app, 3 modes), and the
+**improvement loop** hardened it (scene-cut detection, the layered grain-gate, and instant → 10× /
+24 fps real-time). The frontier is making that product good:
 
-1. **Scene-cut detection (in progress).** The layered mode's per-scene plate depends on robust scene
-   segmentation (`layered_api.segment_scenes`: I-frame + RGB-jump + `MIN_SCENE_LEN`). Harden it across
-   encodes (short GOPs, fades, motion bursts) — a bad cut corrupts a plate.
-2. **Make "instant" actually instant.** The server's instant mode is ~0.4 s/frame (~10× real-time) — it
-   still builds a full per-frame compact-SR cache + reconstructs + re-encodes per chunk. The prototype
-   reached ~38–40 ms/frame GPU-resident (Step 7); close that gap (anchor-only SR + keep the recon on the
-   GPU + drop the redundant per-frame cache) so instant is genuinely fast / anchor-only.
-3. **Progressive play-while-processing.** The ~10× hard constraint means a long video is a long render.
-   Stream output as it is produced (HLS / fMP4 segments) + a background-render mode so the user can
-   start watching before the whole clip is done — the biggest UX lever for long clips.
-4. **Improve the high-motion regime** (standing weak spot): ~24% honest P-frame occlusion fallback,
-   needs ~12.5% anchors at budget 1.0. Levers: better masks, shorter P→anchor hops, tOF+fallback%-keyed
-   triggering (the honest metrics — NOT LR-consistency).
+1. ✅ **DONE — scene-cut detection** (improvement loop iter 1, `server/scene_detect.py`): luma-diff +
+   I-frame-corroborated + relative/hysteresis + min-scene-len, 1.00/1.00 prec/recall on `sample.mp4`,
+   forces a fresh anchor at every cut. One `StreamingCutDetector` shared by `stream_gops` + layered
+   `segment_scenes`.
+2. ✅ **DONE — make "instant" actually instant** (improvement loop iters 3–6): anchor-only SR + GPU
+   grain + HW encode + GPU-resident recon + reactive mask + pipeline parallelism + the 720p tier →
+   **~409 → 41 ms/frame = 10.0× = ~24 fps = real-time**. (See "## Improvement loop".)
+3. **Progressive play-while-processing — now the top lever.** With instant at ~24 fps it keeps up with
+   playback, so streaming output as it is produced (HLS / fMP4 segments) + a background-render mode lets
+   the user start watching almost immediately. The quality/layered modes (still ~10× slower) get the same
+   UX win for short leads. This is the biggest remaining UX lever.
+4. **Improve the high-motion / instant-quality regime** (standing weak spot): ~24% honest P-frame
+   occlusion fallback, needs ~12.5% anchors at budget 1.0; at 720p instant the safeguard is off
+   (`INSTANT_FALLBACK_THRESH=0.50`) so a high-motion clip leans on bicubic fallback — a content-adaptive
+   threshold (or a QHD instant tier when motion is high) is the lever. Plus better masks, shorter
+   P→anchor hops, tOF+fallback%-keyed triggering (the honest metrics — NOT LR-consistency).
 5. **Productionization / later:** a commercially-licensed matte (RVM is non-commercial); a
    degradation-aware diffusion anchor + TAESD (see "## Diffusion anchor — NO-GO"); color-box clamping
    (`--clamp`, untested); and the **Stage-2 browser-only WebGPU/ORT-Web port** — where

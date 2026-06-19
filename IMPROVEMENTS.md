@@ -1,5 +1,25 @@
 # playhd — prioritized improvement backlog
 
+> **STATUS — improvement loop DONE (commits `397f461`..`d90055e`).** The top items below were
+> implemented; see `handoff.md` → "## Improvement loop" for the full write-up.
+> - ✅ **V1 — layered grain-gate (DONE, `0e97c9e`):** bake one fixed grain into the static plate +
+>   per-frame grain only on the alpha-gated foreground → background **|ΔF| 4.5 → 0.000**; the ~167×
+>   steadier background is finally visible.
+> - ✅ **P1 — anchor-only SR (DONE, `10de07e`, `server/anchor_sr.py`):** SR only the anchors (+ a
+>   catastrophic-fallback safeguard), bicubic the rest; propagated pixels are identical, only fallback
+>   pixels differ.
+> - ✅ **P2 + the real-time stack / 720p (DONE → 10×, `10de07e`/`5e83ec1`/`2b46fc6`/`d90055e`):** HW
+>   VideoToolbox encode + reactive mask + GPU grain (`server/fast_grain.py`) + GPU-resident recon +
+>   pipeline-parallel decode/encode (`server/pipe_encode.py`) + batched `hole_frac` sync + a **720p
+>   instant tier** (`INSTANT_SCALE=2`) → instant **~409 → 41 ms/frame = 10.0× = ~24 fps = real-time**.
+> - ✅ **Scene-cut detection (DONE, `397f461`, `server/scene_detect.py`):** robust cut detector
+>   (1.00/1.00 prec/recall on `sample.mp4`) forces a fresh anchor at every cut → no cross-cut smear.
+> - ◻ **Still open:** P3 (fp16 SR net), V2 (grain over static regions), V3 (graphic/text-edge shimmer),
+>   V4 (layered seam/hair), progressive play-while-processing — statuses inline below.
+>
+> Tile-SR (P1's Lever 3) was measured and **DISABLED** (`INSTANT_TILE_SR=False`): the occlusion
+> fallback is spatially scattered on real footage so a bbox covers ~97% of the frame → no win.
+
 Performance + visual-quality "poke", 2026-06-19. Read-only analysis of existing code, the
 documented Step 6/7 profiling, and the shipped `server/outputs/*.mp4`, plus light new
 measurement (one 24-frame instant run; a few-frame visual diff on real outputs). No
@@ -33,7 +53,11 @@ Honesty note up front — what is **measured** vs **inferred**:
 
 ## PERFORMANCE
 
-### P1 — [CRITICAL · impact HIGH · effort MEDIUM] Instant runs full per-frame SR; the architecture needs anchor-only SR
+### P1 — ✅ DONE (`10de07e`, `server/anchor_sr.py`) — [CRITICAL · impact HIGH · effort MEDIUM] Instant runs full per-frame SR; the architecture needs anchor-only SR
+> **Done:** `anchor_sr.build_anchor_cache` SRs only the anchors (+ a catastrophic-fallback safeguard
+> above `INSTANT_FALLBACK_THRESH`), bicubic everywhere else; the propagated pixels are byte-identical,
+> only the small fallback fraction differs. This was the gateway to the instant 10× / real-time push.
+
 **Issue.** `server/pipeline_api.py:process_clip` → `derisk.build_perframe_cache(chunk, …)`
 (`prototype/derisk.py:466-477`) runs the SR network on **every frame of the chunk**
 (`for i in range(N): cache[i] = upscale_to(...)`). `derisk.reconstruct`
@@ -76,7 +100,13 @@ escalation change, plus a regression check that numpy default stays byte-identic
 
 ---
 
-### P2 — [impact HIGH · effort MEDIUM-LOW] Server pays CPU encode + per-frame transfers + CPU grain on top of recon
+### P2 — ✅ DONE (`10de07e`/`5e83ec1`/`2b46fc6`/`d90055e`) — [impact HIGH · effort MEDIUM-LOW] Server pays CPU encode + per-frame transfers + CPU grain on top of recon
+> **Done (this is the real-time stack):** HW `h264_videotoolbox` encode + reactive mask for instant +
+> GPU grain (`server/fast_grain.py`) + GPU-resident recon (`download_output=False`, contiguous-HWC
+> download) + pipeline-parallel decode/encode (`server/pipe_encode.py`) + batched `hole_frac` sync, then
+> a **720p instant tier** (`INSTANT_SCALE=2`). Together with P1: instant **~409 → 41 ms/frame = 10.0× =
+> ~24 fps = real-time**. The QHD warp floor (~91 ms ≈ 4.5×) is why the 720p tier was the unlock.
+
 **Issue.** Even with P1, "other" is ~119 ms/frame. The server runs `reconstruct(..., download_output=True)`
 (full HD readback every frame ~11 ms), uploads `perframe_cache[i]` every frame (~9 ms),
 applies grain on CPU at 3.3 MP, and encodes with **libx264 crf 18** at 2560×1280 (CPU, default
@@ -104,7 +134,10 @@ GPU grain is a port of `grain.py`.
 
 ---
 
-### P3 — [impact MEDIUM · effort LOW] fp16 for the SR net itself (not the mask) is untested
+### P3 — ◻ OPEN — [impact MEDIUM · effort LOW] fp16 for the SR net itself (not the mask) is untested
+> **Status:** still open. Lower priority now that instant SR is anchor-only/amortized; most relevant to
+> the quality-mode x4plus anchor (~2.2 s). Cast the SR net + input to fp16 on MPS and A/B sharpness/PSNR.
+
 **Issue.** Step 7 measured fp16 on the **mask** ops and rejected it (kernel-launch-bound,
 `scatter_add` slower in fp16). The **SR network** (compute-bound conv net) was not tested in fp16
 and would likely gain ~1.5-2×. Matters for the quality-mode x4plus anchor (~2.2 s) and for any
@@ -126,12 +159,21 @@ fallback SR pass; less so once instant SR is anchor-only (P1) and already amorti
   even if a literal 25 fps end-to-end with simultaneous encode is tight on one GPU.
 - Verdict: P1 is the gateway; P2 is what actually crosses into "play while processing"; neither
   requires new algorithms — both are wiring the server onto paths the prototype already validated.
+- ✅ **OUTCOME (improvement loop):** P1 + P2 shipped, plus a **720p instant tier** that the original
+  poke did not anticipate, taking instant **all the way to ~41 ms/frame = 10.0× = ~24 fps = real-time**
+  (better than the ~60–90 ms estimated here). Progressive play-while-processing is now the open lever
+  (instant keeps up with playback at 24 fps).
 
 ---
 
 ## VISUAL QUALITY
 
-### V1 — [impact HIGH · effort LOW] Per-frame grain destroys the layered mode's stable-background win
+### V1 — ✅ DONE (`0e97c9e`) — [impact HIGH · effort LOW] Per-frame grain destroys the layered mode's stable-background win
+> **Done:** `pipeline_api._run_layered` bakes ONE fixed grain into each scene's static plate
+> (`_PLATE_GRAIN_SEED=12345`) and applies per-frame grain only to the alpha-gated foreground →
+> background **|ΔF| 4.5 → 0.000**; the ~167× steadier background is finally visible. Layered is no
+> longer strictly dominated by quality mode.
+
 **Issue.** Layered mode's *only* advantage over quality mode (it is 4-5× slower and uses a
 non-commercial matte) is a rock-stable, denoised background plate. The plate is sampled
 identically every frame (static camera) → bare composite |ΔF| = 0.001. But grain is added as a
@@ -164,7 +206,10 @@ non-commercial matte, no visible benefit). This is the single highest-value chea
 
 ---
 
-### V2 — [impact MEDIUM · effort LOW] Grain re-adds flicker over otherwise-stable propagated regions (all modes)
+### V2 — ◻ OPEN — [impact MEDIUM · effort LOW] Grain re-adds flicker over otherwise-stable propagated regions (all modes)
+> **Status:** still open for instant/quality (V1 fixed only layered's plate). The motion-gated /
+> frozen-on-static grain idea below is unchanged; reuses the region-aware motion gate already in quality.
+
 **Issue.** The same mechanism as V1 in the non-layered modes: on low-motion content the
 propagated background is near-static, and per-frame grain re-injects ~4.5/frame of flicker (raises
 tOF). Grain is filmic and desirable on detail/motion, but uniform full-strength grain over static
@@ -176,7 +221,10 @@ static) — reuses existing machinery. Frozen-grain-on-static (as in V1) also ap
 
 ---
 
-### V3 — [impact MEDIUM · effort MEDIUM] High-contrast graphics/text edges shimmer under propagation
+### V3 — ◻ OPEN — [impact MEDIUM · effort MEDIUM] High-contrast graphics/text edges shimmer under propagation
+> **Status:** still open. (Scene-cut detection, iter 1, helps the *cut* into a title card but not the
+> per-frame edge shimmer *within* a held graphic — that still needs per-graphic pinning/freezing.)
+
 **Issue.** Title cards, lower-thirds and captions (sharp high-contrast edges on flat fields) shimmer
 frame-to-frame under MV warp. Observed on `short_*` frames 20-24 (the "USACHEV TODAY" title card):
 the amplified diff (`/tmp/playhd_frames/lay_TLbg_diff8x.png`) shows the letter edges flickering
@@ -189,7 +237,10 @@ detected.
 
 ---
 
-### V4 — [impact LOW-MEDIUM · effort MEDIUM] Layered matte-edge halo / hair, worst at the disocclusion ring
+### V4 — ◻ OPEN — [impact LOW-MEDIUM · effort MEDIUM] Layered matte-edge halo / hair, worst at the disocclusion ring
+> **Status:** still open (and now worth more attention, since V1 made layered a shippable mode rather
+> than a strictly-dominated one).
+
 **Issue.** Already characterized (handoff L4, `out_layered/seam_*`): faint hairline/jaw rim halo
 from the FG/BG sharpness discontinuity (5.1-5.8× vs uniform-x4plus 3.4×); fine hair wisps lost;
 worst exactly at the inpainted always-occluded ring (plate sharpness 8.7 vs 15.3 there).
@@ -215,9 +266,11 @@ region-aware on for quality mode (it is). Monitor; no new work.
 ---
 
 ## Suggested order of attack (impact × effort)
-1. **V1** — grain gating in layered (LOW effort, HIGH visual impact; makes the mode worth its cost).
-2. **P1** — anchor-only SR in instant (MEDIUM effort, HIGHEST perf impact; ~1.8× and the gateway to progressive playback).
-3. **P2** — HW encode + reactive mask + GPU grain + drop transfers (MEDIUM-LOW; crosses into play-while-processing).
-4. **V2** — motion-modulated / lower grain on static regions (LOW; reuses the region gate).
-5. **V3** — pin high-contrast graphic overlays (MEDIUM; common content).
-6. **P3 / V4 / V6** — fp16 SR; layered seam/hair; monitor x4plus stability (lower priority).
+1. ✅ **V1** — grain gating in layered — **DONE** (`0e97c9e`).
+2. ✅ **P1** — anchor-only SR in instant — **DONE** (`10de07e`); ended up the gateway to the full 10×.
+3. ✅ **P2** — HW encode + reactive mask + GPU grain + drop transfers (+ pipeline parallelism + the
+   720p tier) — **DONE** (`10de07e`/`5e83ec1`/`2b46fc6`/`d90055e`); instant is now real-time (24 fps).
+4. **Progressive play-while-processing** — now the top open lever (instant keeps up with playback).
+5. **V2** — motion-modulated / lower grain on static regions (LOW; reuses the region gate).
+6. **V3** — pin high-contrast graphic overlays (MEDIUM; common content).
+7. **P3 / V4 / V6** — fp16 SR net; layered seam/hair; monitor x4plus stability (lower priority).

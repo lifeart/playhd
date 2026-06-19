@@ -10,19 +10,29 @@ and sweeps an **adaptive re-anchoring quality-vs-anchor-fraction curve**. Defaul
 the original synthetic experiment byte-identical.
 
 > **This prototype is the reference / validation layer.** The shipping product is a **web app**
-> (`../server/`, see `../handoff.md` → "## Product layer — Stage-1 server"): upload or pick an mp4 →
-> **Process & Play** → a quality toggle, and watch the upscaled clip **with sound**. The server reuses
-> these prototype modules unchanged (no new warp/mask/SR math) and streams the WHOLE clip in GOP-sized
-> chunks (bounded memory) + muxes the source audio back in. **Three modes**, each a flag combo defined
-> below: **instant** (compact anchor + `--occ adaptive` + grain, ~0.4 s/frame), **quality**
+> (`../server/`, see `../handoff.md` → "## Product layer — Stage-1 server" + "## Improvement loop"):
+> upload or pick an mp4 → **Process & Play** → a quality toggle, and watch the upscaled clip **with
+> sound**. The server reuses these prototype modules unchanged (no new warp/mask/SR math) and streams the
+> WHOLE clip in GOP-sized chunks (bounded memory) + muxes the source audio back in. **Three modes**, each
+> a flag combo defined below: **instant** (compact anchor + reactive mask + grain), **quality**
 > (`--sr realesrgan-x4plus` + `--region-aware` + grain, ~2.9 s/frame), and **layered** (Step 10's
 > per-scene static-background plate, heavy-SR'd ONCE/scene, + per-frame composited moving foreground +
 > grain, ~0.47 s/frame). Layered uniquely gives a rock-stable, denoised, x4plus-sharp **background**
 > (~167× steadier frame-to-frame than per-frame x4plus); it needs a roughly static camera + a human
-> subject and a non-commercial matte (RVM, CC BY-NC-SA). Run it: `cd .. && python3 -m uvicorn
-> server.app:app --port 8000` → http://127.0.0.1:8000/. The full product/server detail (streaming,
-> audio, the two crash fixes, the long-video guard, the staging toward a browser-only WebGPU port)
-> lives in `../handoff.md`; the rest of this README is the prototype.
+> subject and a non-commercial matte (RVM, CC BY-NC-SA).
+>
+> **A six-iteration "improvement loop" (commits `397f461`..`d90055e`) then hardened the server (DOCS in
+> `../handoff.md` → "## Improvement loop"; `../IMPROVEMENTS.md` is the backlog it worked):** robust
+> **scene-cut detection** (forces a fresh anchor at every cut), the **layered grain-gate** (its ~167×
+> steadier background is finally *visible*), and a perf push that took **instant mode to a 720p tier at
+> ~41 ms/frame = 10× = ~24 fps = real-time** (anchor-only SR + GPU grain + HW VideoToolbox encode +
+> GPU-resident recon + reactive mask + pipeline-parallel decode/encode; quality + layered stay full QHD).
+> All of that is *server-side* and reuses these prototype modules read-only.
+>
+> Run it: `cd .. && python3 -m uvicorn server.app:app --port 8000` → http://127.0.0.1:8000/. The full
+> product/server detail (streaming, audio, the two crash fixes, the long-video guard, the improvement
+> loop, the staging toward a browser-only WebGPU port) lives in `../handoff.md`; the rest of this README
+> is the prototype.
 
 ## Run
 
