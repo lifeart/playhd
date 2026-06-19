@@ -1,0 +1,52 @@
+R2-E3: reduce the LAYERED-mode matte-edge HALO + recover hair (OUTPUT-only)
+sample.mp4 start 5000, scene[0]=[0,32), LR 640x320 -> HD 2560x1280 (x4). GPU-free analysis
+(RVM matte cached once in bootstrap.py; SR reuses prototype out_layered cache).
+
+METRICS
+  ratio   = seam discontinuity = FGring/BGring var-Laplacian (RELATIVE seam-continuity, NOT
+            an SR-quality claim). Target = uniform-x4plus ceiling 3.45.
+  FG/BGring = the two ring var-Laplacians. deep-BG plate var-Lap ~15.4 = the match target for BGring.
+  halo    = px (HD) the layered composite stays SOFTER than the uniform-x4plus ceiling near the
+            edge (the soft 'moat'); 0 = ceiling-matched. mean over frames 8/16/24.
+  fg_bias = (|out-plate|-|out-fg|) hair band; UP (toward 0) = hair looks more like the SUBJECT (wisps kept).
+  hairS/coreS = hair-band / subject-core (a>0.95) |Laplacian|. coreS MUST hold (drop=face smear).
+
+x4plus-bbox budget (WORST seam):
+  config                 | ratio | FGring | BGring | halo | fg_bias | hairS | coreS
+  baseline               |  5.02 |   50.8 |   10.8 | 11.7 |  -3.20  |  2.84 |  4.08
+  (a) feather            |  4.72 |   46.1 |   10.3 | 12.0 |  -2.68  |  2.81 |  4.08
+  (b) ringRestore s=0.5  |  3.38 |   50.8 |   15.9 |  8.0 |  -3.23  |  3.19 |  4.08
+  (b-alt) softenFG [REJ] |  1.39 |   14.0 |   10.8 | 11.7 |  -3.36  |  2.53 |  4.04  <- only by smearing FG
+  (a)+(b) RECOMMENDED    |  3.22 |   46.1 |   14.9 |  7.7 |  -2.72  |  3.17 |  4.08
+  uniform-x4plus (REF)   |  3.45 |   57.9 |   16.9 |  0.0 |   nan   |  3.96 |  4.08
+
+compact-FG budget:
+  baseline               |  3.45 |   33.8 |   10.6 | 12.3 |  -3.14  |  2.74 |  2.75
+  (a)+(b) RECOMMENDED    |  2.16 |   29.9 |   14.7 |  8.0 |  -2.67  |  3.09 |  2.75
+  (ratio<ceiling here only because the compact subject is inherently soft; the BACKGROUND ring
+   is correctly restored to its own deep-BG level -> no soft moat, which is the seam goal.)
+
+VERDICT
+  (a) feather       HELPS (mild): hair fg_bias -3.20->-2.72 (+15% toward subject = wisps kept),
+                    coreS UNCHANGED (no face smear). Cheap at LR (+4 ms/frame).
+  (b) ringRestore   THE FIX: restores the soft near-subject plate ring (real BG softened by low
+                    temporal coverage + matte-edge contamination, var-Lap 10.8) to the deep-BG
+                    level (~15) -> x4plus seam ratio 5.02->3.22 (== ceiling 3.45), halo 11.7->7.7,
+                    coreS UNCHANGED. Re-contrasts EXISTING softened texture, fabricates nothing
+                    (the ~8% pure-inpaint holes have ~0 HF -> stay soft, not invented).
+  (b-alt) softenFG  REJECTED: lowers the ratio only by destroying the subject edge (FGring
+                    50.8->14.0, coreS 4.08->4.04, heatmap shows FG detail loss).
+  (c) better inpaint NO-GO: always-occluded holes = only 7.5% of the visible BG-ring and ALWAYS
+                    behind the subject (gotcha #19); NS / wider-Telea / diffuse fills are SOFTER
+                    not sharper, allmedian leaves a subject-ghost. The 92% recovered-median moat
+                    dominates and is fixed by (b) at composite time -- (b) IS the better ring treatment.
+
+COST (composite @2560x1280)
+  naive per-frame seam pass:  +158 ms/frame (too dear).
+  COST-OPT: restore the plate ring ONCE/scene (prepare_scene_plate, union band, strength~0.8 to
+  offset union dilution -> x4plus ratio 3.47, halo 8.0) = 135 ms once (~0.45 ms/frame @300f) +
+  feather the LR alpha (+~4 ms/frame)  ==>  ~+5 ms/frame total (negligible vs ~209 ms/frame layered).
+
+DELIVERABLE: seam_composite.py -- default-preserving composite() (seam_restore=0.0, feather=False
+  -> BYTE-IDENTICAL, verified) + prepare_scene_plate() for the amortized integration.
+ARTIFACTS: crops/{hairline,leftface}_{montage,before_after}.png (RGB + |Laplacian| heatmap rows).

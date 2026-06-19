@@ -252,9 +252,14 @@ detected.
 
 ---
 
-### V4 — ◻ OPEN — [impact LOW-MEDIUM · effort MEDIUM] Layered matte-edge halo / hair, worst at the disocclusion ring
-> **Status:** still open (and now worth more attention, since V1 made layered a shippable mode rather
-> than a strictly-dominated one).
+### V4 — ✅ DONE (R2-E3, `LAYERED_SEAM_FIX`) — Layered matte-edge halo / hair
+> **Done (research round R2):** diagnosed as a SOFT-BACKGROUND problem (the near-subject plate ring is
+> real background softened by low coverage + matte-edge contamination, only ~8% inpaint — so "better
+> inpaint" was a NO-GO). Fix = a band-localized plate-ring sharpness RESTORE baked once per scene
+> (`layered_pipeline.restore_plate_ring`, `layered_api` PASS A) + an alpha-aware FEATHER per frame
+> (`feather_alpha`, PASS B): x4plus seam ratio 5.02→3.22 (= uniform-x4plus ceiling), halo 11.7→7.7px,
+> subject core EXACTLY unchanged, ~+5 ms/frame. Softening the FG edge was REJECTED (smears the subject).
+> `lp.composite` defaults stay byte-identical. See `experiments/r2_e3_seam/REPORT.md`.
 
 **Issue.** Already characterized (handoff L4, `out_layered/seam_*`): faint hairline/jaw rim halo
 from the FG/BG sharpness discontinuity (5.1-5.8× vs uniform-x4plus 3.4×); fine hair wisps lost;

@@ -169,9 +169,82 @@ def foreground_x4plus_bbox(
 # --------------------------------------------------------------------------- #
 # The composite + the grain final pass
 # --------------------------------------------------------------------------- #
-def composite(fg_hd: np.ndarray, alpha_hd: np.ndarray, plate_hd: np.ndarray) -> Tuple[np.ndarray, float]:
-    """out = alpha*fg + (1-alpha)*plate  (HD). alpha_hd is HxWx1 float in [0,1]."""
+# --- R2-E3 seam-halo reduction helpers (OUTPUT-ONLY, default-preserving) --------------- #
+# The matte seam halo is a SOFT-BACKGROUND problem: the near-subject plate ring is real
+# background softened by low temporal coverage + matte-edge contamination (var-Lap ~10.8 vs
+# ~15.4 deep BG). restore_plate_ring re-contrasts that existing texture (fabricates nothing);
+# feather_alpha recovers hair wisps with the subject core untouched. See
+# experiments/r2_e3_seam/REPORT.md.
+def _alpha_grad_softness(a):
+    gx = cv2.Sobel(a, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(a, cv2.CV_32F, 0, 1, ksize=3)
+    g = np.hypot(gx, gy)
+    band = (a > 0.02) & (a < 0.98)
+    p90 = max(np.percentile(g[band], 90), 1e-3) if band.any() else 1e-3
+    soft = np.clip(1.0 - np.clip(g / p90, 0, 1), 0, 1) * band
+    return cv2.GaussianBlur(soft, (0, 0), 2.0)
+
+
+def feather_alpha(a_hd, soft_sigma=4.0, lift=0.35):
+    """Alpha-aware feather: wider feather + faint-wisp lift where the alpha ramp is gentle (soft
+    hair), tight at hard jaw/shoulder edges. Recovers wisps; subject core untouched."""
+    a = a_hd[..., 0].astype(np.float32)
+    soft = _alpha_grad_softness(a)
+    a_wide = cv2.GaussianBlur(a, (0, 0), soft_sigma)
+    a_f = soft * a_wide + (1.0 - soft) * a
+    if lift > 0:
+        lifted = np.power(np.clip(a_f, 0, 1), 1.0 / (1.0 + lift))
+        a_f = soft * lifted + (1.0 - soft) * a_f
+    return np.clip(a_f, 0, 1)[..., None]
+
+
+def _bgside_band_weight(a, center=0.22, width=0.18):
+    w = np.exp(-((a - center) / width) ** 2).astype(np.float32)
+    w[a < 0.015] = 0.0
+    w[a > 0.55] = 0.0
+    return cv2.GaussianBlur(w, (0, 0), 2.0)
+
+
+def restore_plate_ring(plate_hd, a_hd, strength=0.5, amount=0.6, sigma=2.0):
+    """Blend a band-localized plate unsharp (BG side of the matte) toward the plate at `strength`.
+    strength~0.5 lands the near-subject ring at the deep-BG level; strength=0 -> identity. Targets
+    the background, not the subject (budget-independent). Cheapest run ONCE per scene on the static
+    plate (see prepare_scene_plate)."""
+    if strength <= 0:
+        return plate_hd
+    a = a_hd[..., 0].astype(np.float32)
+    w = _bgside_band_weight(a)[..., None]
+    p = plate_hd.astype(np.float32)
+    hf = p - cv2.GaussianBlur(p, (0, 0), sigma)
+    sh = np.clip(p + amount * w * hf, 0, 255).astype(np.uint8)
+    return cv2.addWeighted(plate_hd, 1.0 - strength, sh, strength, 0.0)
+
+
+def prepare_scene_plate(plate_hd, alphas_hd, strength=0.8):
+    """Restore the soft near-subject plate ring ONCE per scene (the plate is static -> amortized to
+    ~0/frame like the plate SR). `alphas_hd` = a list of per-frame HxWx1 HD alphas OR a single
+    union alpha; the union footprint covers every frame's ring. Call after build_plate/sr_plate and
+    pass the result as plate_hd to composite() with seam_restore=0."""
+    union = None
+    for a in (alphas_hd if isinstance(alphas_hd, (list, tuple)) else [alphas_hd]):
+        union = a.astype(np.float32) if union is None else np.maximum(union, a)
+    return restore_plate_ring(plate_hd, union, strength=strength)
+
+
+def composite(fg_hd: np.ndarray, alpha_hd: np.ndarray, plate_hd: np.ndarray,
+              seam_restore: float = 0.0, feather: bool = False) -> Tuple[np.ndarray, float]:
+    """out = alpha*fg + (1-alpha)*plate  (HD). alpha_hd is HxWx1 float in [0,1].
+
+    OUTPUT-ONLY seam-halo reduction (R2-E3), DEFAULT-PRESERVING:
+      seam_restore=0.0, feather=False -> byte-identical to the original composite.
+      feather=True   -> alpha-aware feather (recover hair wisps, core untouched).
+      seam_restore>0 -> restore the soft near-subject plate ring (kill the halo moat); 0.5 =
+                        deep-BG-matched. Prefer prepare_scene_plate ONCE/scene + feather per frame."""
     t0 = time.perf_counter()
+    if feather:
+        alpha_hd = feather_alpha(alpha_hd)
+    if seam_restore > 0:
+        plate_hd = restore_plate_ring(plate_hd, alpha_hd, strength=seam_restore)
     out = alpha_hd * fg_hd.astype(np.float32) + (1.0 - alpha_hd) * plate_hd.astype(np.float32)
     out = np.clip(out, 0, 255).astype(np.uint8)
     return out, (time.perf_counter() - t0) * 1000.0

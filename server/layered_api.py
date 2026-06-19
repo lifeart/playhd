@@ -40,6 +40,7 @@ import time
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import cv2
 import av
 
 # Prototype on sys.path (read-only). pipeline_api also does this, but layered_api must be
@@ -69,6 +70,11 @@ SCALE = lp.SCALE                     # 4
 PLATE_SAMPLE_CAP = 64
 FG_DILATE = 3                        # grow the FG gate so the matte-edge band stays foreground
 STATIC_THRESH_PX = 0.6               # |median MV| above this (px) => camera moves => fallback
+# R2-E3 seam-halo reduction (ON: it is a verified strict win -- seam ratio -> the uniform-x4plus
+# ceiling, halo -34%, subject core EXACTLY unchanged, ~+5 ms/frame). PASS A bakes a band-localized
+# plate-ring restore into the static plate ONCE per scene; PASS B feathers the matte alpha per
+# frame. lp.composite stays byte-identical with its defaults, so only the layered path changes.
+LAYERED_SEAM_FIX = True
 
 # Scene-cut detection now lives in scene_detect (ONE source of truth, shared with
 # pipeline_api.stream_gops). These constants are the layered defaults forwarded to it; the
@@ -258,6 +264,14 @@ def build_scene_plates(
                                                        hole_fill="inpaint")
         rep = bp.coverage_report(coverage, hole_mask)
         plate_hd = bp.sr_plate(plate_lr, scale=SCALE, model=sr_model)
+        if LAYERED_SEAM_FIX:
+            # R2-E3: restore the soft near-subject plate ring ONCE per scene over the swept
+            # alpha-union band (amortized like the plate SR). Union the sampled LR alphas, upscale
+            # to HD, and re-contrast the BG-side ring band toward the deep-BG level.
+            union_lr = np.maximum.reduce([p.astype(np.float32) for p in phas])
+            union_hd = cv2.resize(union_lr, (plate_hd.shape[1], plate_hd.shape[0]),
+                                  interpolation=cv2.INTER_LINEAR)[..., None]
+            plate_hd = lp.restore_plate_ring(plate_hd, union_hd, strength=0.8)
         plate_sr_ms = sr.last_latency_ms(sr_model)
         plate_path = os.path.join(plate_dir, f"plate_s{sid}.npy")
         np.save(plate_path, plate_hd)          # SPILL to disk -> PASS B holds one plate at a time
@@ -294,5 +308,7 @@ def composite_frame(img, pha, plate_hd, w_hd, h_hd):
     """alpha*compact_fg_hd + (1-alpha)*plate_hd for one frame. Returns uint8 HxWx3 RGB."""
     fg_hd, _ms = lp.foreground_compact(img)                 # compact per-frame FG SR
     alpha_hd = lp.alpha_to_hd(pha, (h_hd, w_hd))            # soft hair-edge alpha at HD
-    out, _c = lp.composite(fg_hd, alpha_hd, plate_hd)       # the layered composite
+    # R2-E3: feather the matte alpha (recover hair wisps, core untouched). The plate ring was
+    # already restored ONCE per scene in PASS A, so seam_restore stays 0 here.
+    out, _c = lp.composite(fg_hd, alpha_hd, plate_hd, feather=LAYERED_SEAM_FIX)
     return out

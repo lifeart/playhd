@@ -652,6 +652,65 @@ integrated the GO findings behind flags; the **synthetic regression stayed byte-
   and **E2c QHD-instant escalation** (5.27× recon cost, breaks real-time, eff-bicubic% unchanged since the
   fallback is still bicubic just higher-res).
 
+## Research round R2 — 4 parallel Opus experiments (2026-06-20)
+
+Continuing the autonomous experiment loop. Same discipline (READ-ONLY imports, honest metrics,
+lead-owned seam-verification, synthetic regression byte-identical). Reports in
+`experiments/r2_*/REPORT.md`.
+
+| # | experiment | verdict | status |
+|---|---|---|---|
+| **R2-E1** | Commercial-licensed matte for layered (replace non-commercial RVM) | **GO** | validated, drop-in `seg_matte.py` ready (not yet server-wired) |
+| **R2-E2** | Break the high-motion tOF↔fallback% tension | **frontier ESCAPED** (HF-only EMA) | validated, default-OFF spec ready |
+| **R2-E3** | Layered seam-halo / hair (the open V4) | **GO** | **INTEGRATED** (`LAYERED_SEAM_FIX=True`) |
+| **R2-E4** | Progressive-streaming hardening | **bug found** | **FIXED + verified** (GOTCHA #28-fix) |
+
+**R2-E4 — fixed a real ship-blocker in the just-shipped progressive feature.** `FragmentMuxer.close()`
+did `_feed_audio(float("inf"))`, draining the ENTIRE source audio track — so `GET /api/stream?frames=N`
+on a long clip muxed 2032 s of audio over 24 s of video and produced a corrupt, un-decodable file.
+Fix: `_feed_audio(self._video_time())` (the streaming loop already fed audio to ~`video_end +
+AUDIO_LOOKAHEAD_S`). Lead-verified: capped `frames=600` now decodes 600/600 clean, audio bounded 25 s
+(was 2032 s), 7.2 MB (was 19.6 MB corrupt); uncapped still clean. The non-AAC transcode, A/V-sync,
+long-clip-bound, and video-only paths all PASS; a constant ~80 ms encoder-side video-start offset (no
+edit list) is the only residual, harmless, non-accumulating.
+
+**R2-E3 — INTEGRATED (the layered seam fix; closes the open V4 item).** Key correction to the L4
+framing: the matte seam halo is a **soft-BACKGROUND problem, not a sharp-subject one** — the
+near-subject plate ring is real background softened by low temporal coverage + matte-edge
+contamination (var-Lap ~10.8 vs ~15.4 deep BG), and it is only ~8% inpaint (so a "better inpaint",
+lever c, was a NO-GO). Fix = a band-localized **plate-ring sharpness restore** (`restore_plate_ring`,
+baked ONCE per scene into the static plate in `layered_api` PASS A) + an **alpha-aware feather**
+(`feather_alpha`, per frame in PASS B). Result: x4plus-bbox seam-discontinuity ratio **5.02 → 3.22**
+(= the uniform-x4plus ceiling 3.45), halo moat **11.7 → 7.7 px**, subject core **EXACTLY unchanged**
+(it re-contrasts existing texture, fabricates nothing), ~+5 ms/frame. **Softening the FG edge was
+REJECTED** (wins the ratio only by smearing the subject). `lp.composite` keeps byte-identical defaults
+(`seam_restore=0, feather=False`); the server layered path turns it on via `LAYERED_SEAM_FIX=True`.
+Verified end-to-end: a layered run on `short.mp4` builds a plate (1 scene/0 fallback) and outputs valid
+QHD with the seam fix active.
+
+**R2-E1 — GO, validated, ready to wire (not yet server-integrated).** A permissive **torchvision
+DeepLabV3-MobileNetV3-Large (BSD-3) + alpha-EMA** matte replaces the **non-commercial RVM (CC
+BY-NC-SA)** with **no layered-plate regression** — plate coverage 74–79% (vs RVM 75.2%), holes 21–26%
+(vs 24.8%), sharpness 95–119%, edges 2.8–4.5× steadier with EMA, latency 0.59–0.85× RVM (faster). The
+only loss is RVM's wispy hair on the composite FG edge — irrelevant to the background plate (layered's
+whole value). Drop-in adapter `experiments/r2_e1_matte/seg_matte.py` covers the **plate path**
+(`matte_sequence`/`fg_mask_lr`) but **lacks `matte_frame`** (used by `layered_api` PASS B's per-frame
+matte) — add a stateless `matte_frame` adapter method before the server swap. Production target:
+**MediaPipe Selfie Segmentation (Apache-2.0)**, run in an isolated env (its protobuf<5 conflicts with
+this env). GOTCHA #17 handled via a display-order alpha-EMA standing in for RVM's recurrent state.
+
+**R2-E2 — the high-motion tOF↔fallback% frontier is ESCAPABLE, validated, default-OFF spec ready.**
+R1-E2 found a hard wall (no policy improves both); R2-E2 shows it is breakable — but ONLY by
+**high-frequency-only temporal smoothing**: `T = bicubic_current + EMA(sr − bicubic)` keeps the
+motion-tracking low-freq fresh (tOF-safe) and temporally smooths only the flickery HF detail (which
+carries little of the motion energy Farneback locks onto). Recommended `(c) gain=0.6, β=0.85,
+feather=31`: high-motion eff-bicubic 7.70 → 6.35% at tOF +2.0% (the R1 hard switch charged +20% for the
+same). **Spatial feathering sits on the frontier (no escape); naive temporal reuse — screen-space EMA /
+warp-blend — GHOSTS (tOF 2.4–3.7×)** and notably had *lower* |ΔF| while tOF rose (re-confirming tOF is
+the only honest temporal headline). The escape is **bounded** (only persistent disocclusions; freshly
+revealed pixels must stay bicubic). Default-OFF, instant-only spec (replaces `patch_high_fallback`'s
+hard SR with a feathered HF-EMA blend; reset the EMA buffer on I-frames/cuts) in the E2 report.
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a
