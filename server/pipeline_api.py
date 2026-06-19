@@ -92,6 +92,12 @@ SCALE = 4
 # chunk -- and thus peak HD memory -- stays bounded. 48 == the validated prototype window.
 SOFT_CAP_FRAMES = 48
 
+# V1 (improvement loop): the layered background plate is a STATIC image, so it gets ONE fixed
+# grain (this seed) baked in -> filmic texture WITHOUT per-frame flicker. Per-frame grain is then
+# applied only to the moving foreground (gated by alpha), so the layered mode's ~167x steadier
+# background is actually visible instead of being masked by full-frame per-frame grain.
+_PLATE_GRAIN_SEED = 12345
+
 # Mode -> exactly the flag combination the handoff recommends for each regime.
 MODE_CONFIG = {
     "instant": dict(sr_mode="realesrgan",          # compact realesr-general-x4v3 (~0.13 s/frame SR)
@@ -599,14 +605,24 @@ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
                         done = _quality_subchunk(sub, writer, done, total, t0, t_passB)
                         continue
                     if cur_plate_sid != sid:      # load ONE HD plate at a time (bounded)
-                        cur_plate = np.load(info["plate_path"])
+                        # V1: bake a FIXED grain into the plate ONCE per scene -> stable filmic bg.
+                        cur_plate = _grain.apply_grain(np.load(info["plate_path"]),
+                                                       _PLATE_GRAIN_SEED, "med")
                         cur_plate_sid = sid
                     if rvm_sid != sid:            # thread RVM recurrent state per scene
                         rec, rvm_sid = [None] * 4, sid
                     for (_ptype, img, _mvs) in sub:
                         pha, rec = _layered.matte_frame_np(model, img, rec, ratio, device)
-                        out = _layered.composite_frame(img, pha, cur_plate, w_hd, h_hd)
-                        out = _grain.apply_grain(out, done, "med")
+                        comp = _layered.composite_frame(img, pha, cur_plate, w_hd, h_hd)
+                        # V1: per-frame grain ONLY on the moving foreground (gate by alpha). The
+                        # background keeps the plate's fixed grain (stable); the subject gets fresh
+                        # per-frame grain -> the layered mode's steady background is now visible.
+                        comp_g = _grain.apply_grain(comp, done, "med")
+                        a = _layered.lp.alpha_to_hd(pha, (h_hd, w_hd))   # (H,W,1) soft alpha
+                        if a.ndim == 2:
+                            a = a[..., None]
+                        out = (a * comp_g.astype(np.float32)
+                               + (1.0 - a) * comp.astype(np.float32)).clip(0, 255).astype(np.uint8)
                         writer.write(out)
                         done += 1
                         _emit_frame_progress(done, total, t0, t_passB)
