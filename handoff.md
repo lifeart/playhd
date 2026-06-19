@@ -852,17 +852,20 @@ Visuals: `prototype/out_diffusion_real/`.
     calls `receive()` concurrently with Starlette's own disconnect listener on the same ASGI channel and
     BREAKS the cancellation (this was the bug before the fix).
 
-29. **Chrome's consumption of chunked fragmented-MP4 is UNVERIFIED — `<video src>` likely needs MSE**
-    (R1 progressive playback). The server produces valid, progressively-decodable fMP4 (PyAV re-decodes a
-    truncated byte prefix to frames = play-before-EOF proven), but in a real Chrome both a plain
-    `<video src>` and a hand-rolled MSE `SourceBuffer` held `readyState=0` (no decoded frame), and the
-    renderer repeatedly froze under CDP automation (local instability confounds the test). So browser
-    playback is **not yet confirmed**. The UI gates progressive streaming behind an **opt-in checkbox
-    (default OFF)** so instant keeps its proven buffered `POST /api/process → /outputs` path — no regression.
-    Next step to finish E1: confirm in a real browser; if `<video src>` won't play the live fMP4 (Chrome is
-    historically flaky for fMP4 without MSE), wire an MSE `SourceBuffer` in `index.html` (the E1 report calls
-    this a zero-server-change upgrade — the *same* bytes) with codec `avc1.640028` (the stream is H.264 High)
-    + `mp4a.40.2`, and verify `currentTime` advances while `/api/progress` still reports `streaming`.
+29. **Progressive-playback BROWSER consumption is IMPLEMENTED (MSE) but UNVERIFIABLE on this box's Chrome**
+    (R1 + R1.1). `index.html` now consumes the stream via a Media Source Extensions `SourceBuffer` (the
+    reliable way Chrome plays live fMP4): `MediaSource` + a `fetch().body` ReadableStream, append each chunk,
+    `sb.mode="sequence"`, evict already-played buffer on `QuotaExceededError` (so arbitrarily long clips
+    play), codec `avc1.640028`/`64001f`/`4d4028`+`mp4a.40.2`, with a plain `<video src>` fallback (Safari
+    plays fMP4 natively). The **server bytes are proven valid** (PyAV re-decodes a truncated prefix =
+    play-before-EOF). BUT in-browser playback **could not be verified here**: this machine's Chrome
+    `MediaSource` **never transitions to "open"** (`sourceopen` never fires, `video.error` is null) and the
+    CDP renderer froze repeatedly — a dead local media pipeline, NOT a code defect (MSE init with no error =
+    environment). So progressive streaming stays **opt-in (default OFF checkbox)**; instant keeps its proven
+    buffered `POST /api/process → /outputs` path — no regression. **To finish E1: load `/` in a WORKING
+    browser, check "▶ Play while processing", confirm `currentTime` advances + audio while `/api/progress`
+    reports `streaming`; then flip the default by defaulting the checkbox checked** (a one-line change in
+    `index.html`). Do NOT flip it default-on until a real browser confirms playback (test what the user sees).
 
 ## Known limitations / done since (Steps 1–4) and still NOT done
 

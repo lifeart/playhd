@@ -105,7 +105,7 @@ def _place_tile(hd_base, sr_tile, hd_bbox):
 
 
 def build_anchor_cache(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive", fallback_thresh=0.08,
-                       tile=False, gpu_cache=False):
+                       tile=False, gpu_cache=False, thresh_fn=None):
     """HYBRID anchor cache (the instant-mode default). Runs the SR net on:
       * the ANCHORS (I + first backbone), AND
       * any non-anchor BACKBONE (I/P) frame whose LR occlusion-fallback fraction exceeds
@@ -137,7 +137,12 @@ def build_anchor_cache(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive", fallbac
             continue
         m = _lr_fallback_mask(frames, i, backbone, occ_mode)
         bb_fracs[i] = float(m.mean())
-        if bb_fracs[i] > fallback_thresh:
+        # E2 (motion-keyed fallback): thresh_fn(i) returns a per-frame threshold (lower on
+        # high-motion frames) so a high-occlusion backbone frame gets a real compact-SR cache
+        # entry only where it matters; thresh_fn=None (default) -> the scalar threshold = today's
+        # behavior exactly (instant byte-identical).
+        thr = thresh_fn(i) if thresh_fn is not None else fallback_thresh
+        if bb_fracs[i] > thr:
             sr_set.add(i)
             bb_masks[i] = m
     t_scan = time.perf_counter() - t_scan0
@@ -181,7 +186,7 @@ def build_anchor_cache(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive", fallbac
 
 
 def patch_high_fallback(frames, R, w_hd, h_hd, sr_mode, fallback_thresh=0.08, skip=None,
-                        collect_info=True, tile=False):
+                        collect_info=True, tile=False, thresh_fn=None):
     """Adaptive safeguard for the LEAF frames (post-reconstruct). For each frame whose exact,
     anchor-invariant occlusion-fallback fraction (R[i]['hole_frac']) exceeds `fallback_thresh`
     and is NOT already SR'd in the cache (`skip` = the cache's sr_set), run the real SR net and
@@ -205,7 +210,8 @@ def patch_high_fallback(frames, R, w_hd, h_hd, sr_mode, fallback_thresh=0.08, sk
         fracs[i] = hf
         if i in skip or R[i].get("mask") is None:
             continue
-        if hf > fallback_thresh:
+        thr = thresh_fn(i) if thresh_fn is not None else fallback_thresh   # E2 motion-keyed
+        if hf > thr:
             mask = R[i]["mask"]
             if not torch.is_tensor(mask):
                 mask = torch.from_numpy(np.ascontiguousarray(mask)).to(R[i]["recon"].device)

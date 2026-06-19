@@ -210,20 +210,80 @@ async function runStreaming(btn) {
     $("stats").textContent = "mode : instant (progressive fMP4 — play-while-process)\nstreaming…";
     const v = $("player");
     v.muted = false;                          // play WITH sound
-    const done = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } btn.disabled = false; };
+    const url = `/api/stream?source=${encodeURIComponent(srcName)}&mode=instant`;
+    const finish = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } btn.disabled = false; };
     v.onplaying = () => { $("bar").style.width = "100%";
                           setStatus("Playing as it processes (instant — real-time 720p, with sound)."); };
-    v.onended = done;
-    v.onerror = () => { done();
-      setStatus("Stream failed — the server may be busy with another clip; try again in a moment.", true); };
-    v.src = `/api/stream?source=${encodeURIComponent(srcName)}&mode=instant`;
-    v.load();
-    v.play().catch(() => setStatus("Ready — click ▶ to play (browser blocked autoplay-with-sound)."));
+    v.onended = finish;
+
+    // The fragmented-MP4 stream is consumed via Media Source Extensions (MSE) — the reliable way
+    // Chrome plays live fMP4. We feed the same bytes a plain <video src> would, but appended to a
+    // SourceBuffer so playback starts after the first fragment. Falls back to <video src> on browsers
+    // without MSE (e.g. Safari plays fMP4 directly).
+    const MIME = ['video/mp4; codecs="avc1.640028,mp4a.40.2"',
+                  'video/mp4; codecs="avc1.64001f,mp4a.40.2"',
+                  'video/mp4; codecs="avc1.4d4028,mp4a.40.2"']
+                 .find(m => window.MediaSource && MediaSource.isTypeSupported(m));
+    if (window.MediaSource && MIME) {
+      playViaMSE(v, url, MIME, btn, finish);
+    } else {                                  // native fallback (Safari handles fMP4 over <video src>)
+      v.onerror = () => { finish(); setStatus("Stream failed — server may be busy; try again.", true); };
+      v.src = url; v.load();
+      v.play().catch(() => setStatus("Ready — click ▶ to play (autoplay-with-sound blocked)."));
+    }
   } catch (e) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     setStatus("Stream request failed: " + e, true);
     btn.disabled = false;
   }
+}
+
+// Append a live fragmented-MP4 stream to a MediaSource SourceBuffer. Pulls the HTTP response body
+// as a ReadableStream and appends each chunk; evicts already-played buffer on QuotaExceeded so
+// arbitrarily long clips keep playing. Starts playback as soon as the first fragment is appended.
+function playViaMSE(v, url, mime, btn, finish) {
+  const ms = new MediaSource();
+  v.src = URL.createObjectURL(ms);
+  ms.addEventListener("sourceopen", async () => {
+    let sb;
+    try { sb = ms.addSourceBuffer(mime); sb.mode = "sequence"; }
+    catch (e) { setStatus("MSE init failed: " + e, true); finish(); return; }
+    let resp;
+    try { resp = await fetch(url); } catch (e) { setStatus("Stream fetch failed: " + e, true); finish(); return; }
+    if (!resp.ok) {
+      setStatus("Stream failed — HTTP " + resp.status + (resp.status === 409 ? " (server busy)" : ""), true);
+      finish(); return;
+    }
+    const reader = resp.body.getReader();
+    const queue = [];
+    let reading = true, started = false;
+    sb.addEventListener("error", () => setStatus("Playback decode error.", true));
+    sb.addEventListener("updateend", pump);
+    function pump() {
+      if (sb.updating || !queue.length) {
+        if (!reading && !queue.length && !sb.updating && ms.readyState === "open") {
+          try { ms.endOfStream(); } catch (e) { /* already ended */ }
+        }
+        return;
+      }
+      try {
+        sb.appendBuffer(queue[0]); queue.shift();
+        if (!started) { started = true; v.play().catch(() => setStatus("Ready — click ▶ (autoplay blocked).")); }
+      } catch (e) {
+        if (e.name === "QuotaExceededError") {                 // evict already-played buffer, retry
+          const cur = v.currentTime;
+          if (sb.buffered.length && sb.buffered.start(0) < cur - 5) {
+            try { sb.remove(sb.buffered.start(0), cur - 5); } catch (_) {}
+          }
+        } else { setStatus("Append error: " + e, true); }
+      }
+    }
+    (async () => {
+      try {
+        while (true) { const { value, done } = await reader.read(); if (done) { reading = false; pump(); break; } queue.push(value); pump(); }
+      } catch (e) { reading = false; }
+    })();
+  });
 }
 
 $("go").onclick = async () => {

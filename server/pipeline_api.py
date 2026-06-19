@@ -94,6 +94,18 @@ except Exception:
 # occlusion regions on high-motion content; verified clean on talking-head at 0.50.
 INSTANT_FALLBACK_THRESH = 0.50
 
+# E2 (research round R1) -- MOTION-KEYED fallback threshold (default OFF). On HIGH-motion content
+# the 0.50 safeguard leaves ~24% of P-frame pixels on bicubic occlusion fallback; experiment E2
+# found that escalating only the high-motion frames (mean LR-MV magnitude > INSTANT_MOTION_GATE) to
+# a lower threshold (INSTANT_FALLBACK_THRESH_HI) halves the window-A bicubic weak spot (7.71%->3.65%)
+# at ZERO cost on talking-head (self-gating: it has no frame above 20% fallback). The honest tradeoff
+# (E2 report): on high motion this RAISES tOF (bicubic fallback is temporally smooth; fresh-SR
+# fallback shimmers) -- so it is OFF by default (the steady-but-soft baseline is the better default
+# for the fast tier) and exposed for sharpness-priority content. Instant-only; OFF -> byte-identical.
+INSTANT_MOTION_KEYED_FALLBACK = False
+INSTANT_FALLBACK_THRESH_HI = 0.20      # threshold used on high-motion frames when the flag is ON
+INSTANT_MOTION_GATE = 1.0              # mean LR-MV magnitude (px/frame) above which a frame is "high motion"
+
 # Lever 3 (tile-SR safeguard): SR only the bounding box of a high-fallback frame's occlusion
 # region instead of the full 2560x1280. DISABLED by default after measurement: on this real
 # footage the occlusion fallback is spatially SCATTERED (camera + complex motion), so a single
@@ -781,6 +793,29 @@ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
 # --------------------------------------------------------------------------- #
 # Main entry point
 # --------------------------------------------------------------------------- #
+def _motion_keyed_thresh_fn(chunk, base_thresh):
+    """E2 (default OFF): build the instant fast path's per-frame motion-keyed fallback threshold,
+    or None when the feature is OFF (-> callers use the scalar base_thresh => byte-identical). On a
+    frame whose mean LR motion-vector magnitude exceeds INSTANT_MOTION_GATE, return the lower
+    INSTANT_FALLBACK_THRESH_HI (escalate more occlusion-fallback pixels to compact-SR for crisper
+    high-motion); otherwise base_thresh. Reuses the already-decoded codec MVs -> ~free; the index i
+    is the same display-order 0-based index used everywhere (chunk/frames/R)."""
+    if not INSTANT_MOTION_KEYED_FALLBACK:
+        return None
+    h_lr, w_lr = chunk[0][1].shape[:2]
+
+    def thr(i):
+        pt, _, mvs = chunk[i]
+        if pt == "I" or mvs is None or len(mvs) == 0:
+            return base_thresh
+        fx, fy = derisk.build_lr_flow(mvs, h_lr, w_lr, want="all")
+        mag = np.sqrt(fx * fx + fy * fy)
+        m = float(np.nanmean(mag)) if np.isfinite(mag).any() else 0.0
+        return INSTANT_FALLBACK_THRESH_HI if m > INSTANT_MOTION_GATE else base_thresh
+
+    return thr
+
+
 def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=True):
     """STREAMING upscale of the WHOLE clip (or the first `max_frames` for testing).
 
@@ -854,13 +889,16 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     w_hd, h_hd = w_lr * eff_scale, h_lr * eff_scale
 
                 if fast:
+                    # E2 (default OFF): per-frame motion-keyed threshold -> escalate bicubic
+                    #    occlusion fallback to compact-SR only on high-motion frames. None when OFF.
+                    tfn = _motion_keyed_thresh_fn(chunk, INSTANT_FALLBACK_THRESH)
                     # 1) Lever 1: anchor-only SR cache -- SR the anchors + any high-fallback
                     #    BACKBONE frame (so its detail propagates); cv2 bicubic everywhere else.
                     ts = time.perf_counter()
                     perframe_cache, _ac, sr_set = anchor_sr.build_anchor_cache(
                         chunk, w_hd, h_hd, cfg["sr_mode"], occ_mode=cfg["occ"],
                         fallback_thresh=INSTANT_FALLBACK_THRESH,
-                        tile=INSTANT_TILE_SR, gpu_cache=INSTANT_GPU_CACHE)
+                        tile=INSTANT_TILE_SR, gpu_cache=INSTANT_GPU_CACHE, thresh_fn=tfn)
                     t_sr += time.perf_counter() - ts
 
                     # 2) Lever 4: reconstruct GPU-resident (download_output=False) -- the HD recon
@@ -877,7 +915,8 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     ts = time.perf_counter()
                     p_info = anchor_sr.patch_high_fallback(
                         chunk, R, w_hd, h_hd, cfg["sr_mode"],
-                        fallback_thresh=INSTANT_FALLBACK_THRESH, skip=sr_set, tile=INSTANT_TILE_SR)
+                        fallback_thresh=INSTANT_FALLBACK_THRESH, skip=sr_set, tile=INSTANT_TILE_SR,
+                        thresh_fn=tfn)
                     t_sr += time.perf_counter() - ts
                     n_sr_calls += p_info["n_sr_calls"]
                     n_upgrades += p_info["n_adaptive_upgrades"]
