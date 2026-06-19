@@ -115,6 +115,14 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 # (matches the README: "--sr realesrgan ... it is an x4 net => use --scale 4").
 SCALE = 4
 
+# Instant is the FAST / lower-quality tier -> it renders at HALF scale (x2 = ~720p, 1280x640
+# from 640x320) instead of full QHD x4. ~4x fewer output pixels means recon/grain/encode all
+# drop ~4x, taking instant to ~real-time (the recon warp on a 3.3 MP QHD frame was the floor).
+# SR still runs the x4 net and downscales (`upscale_to`) -> a sharp 720p, better than a native 2x.
+# Quality + Layered stay at full QHD (SCALE). The whole instant path is scale-parameterized
+# (anchor_sr derives `scale = w_hd // w_lr`; reconstruct takes `scale`), so this is just eff_scale.
+INSTANT_SCALE = 2
+
 # Max frames per processing chunk. A new chunk always starts at an I-frame; if a GOP is
 # longer than this, we also cut at the next P-frame (a forced fresh anchor) so a single
 # chunk -- and thus peak HD memory -- stays bounded. 48 == the validated prototype window.
@@ -796,6 +804,7 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
         # The quality mode keeps the original full-SR + region-aware + CPU-grain + libx264 path
         # untouched (HW encode is scoped to instant so quality/layered cannot regress).
         fast = (mode == "instant" and cfg["backend"] == "torch" and _gpu_ops is not None)
+        eff_scale = INSTANT_SCALE if fast else SCALE   # instant=720p (x2), quality=QHD (x4)
 
         writer = _VideoWriter(video_tmp, fps, codec=(None if fast else "libx264"))
         if fast:
@@ -827,7 +836,7 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                 n_chunks += 1
                 if w_lr is None:
                     h_lr, w_lr = chunk[0][1].shape[:2]
-                    w_hd, h_hd = w_lr * SCALE, h_lr * SCALE
+                    w_hd, h_hd = w_lr * eff_scale, h_lr * eff_scale
 
                 if fast:
                     # 1) Lever 1: anchor-only SR cache -- SR the anchors + any high-fallback
@@ -843,7 +852,7 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     #    chain stays on-device; no per-frame host round-trip in reconstruct.
                     tr = time.perf_counter()
                     _, R = derisk.reconstruct(
-                        chunk, None, SCALE, True, cfg["occ"], perframe_cache, set(),
+                        chunk, None, eff_scale, True, cfg["occ"], perframe_cache, set(),
                         backend=cfg["backend"], collect_metrics=False, download_output=False)
                     t_recon += time.perf_counter() - tr
 
