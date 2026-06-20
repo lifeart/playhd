@@ -1,0 +1,135 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>playhd — WebGPU GOP propagation chain (instant tier)</title>
+<style>
+  body{font:13px monospace;background:#111;color:#ddd;margin:16px}
+  canvas#play{border:1px solid #333;width:640px;height:320px;image-rendering:auto}
+  #log{white-space:pre-wrap;margin-top:10px}
+  .ok{color:#6f6}.err{color:#f66}.hd{color:#9cf}.dim{color:#888}
+</style>
+<h3 class="hd">playhd — codec-MV propagation CHAIN in WebGPU (SR 1 anchor, propagate the rest)</h3>
+<canvas id="play"></canvas>
+<div id="log"></div>
+<script type="module">
+const L = (m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R = {}; window.__gop = R;
+
+const png = async u => createImageBitmap(await (await fetch(u)).blob());
+const refData = (bmp,w,h)=>{const c=new OffscreenCanvas(w,h);const x=c.getContext("2d");x.drawImage(bmp,0,0);return x.getImageData(0,0,w,h).data;};
+
+async function main(){
+  if(!navigator.gpu){ L("WebGPU NOT available","err"); R.error="no-webgpu"; return; }
+  const meta = await (await fetch("../gop_data/meta.json")).json();
+  const {w_lr,h_lr,scale,w_hd,h_hd,fps,frames} = meta;
+  L(`GOP: ${frames.length} frames, ${frames.filter(f=>f.anchor).length} anchor(s) SR'd, `+
+    `${frames.filter(f=>!f.anchor).length} propagated; HD ${w_hd}x${h_hd} @ ${fps} fps`,"hd");
+  const dev = await (await navigator.gpu.requestAdapter()).requestDevice();
+  const samp = dev.createSampler({magFilter:"linear",minFilter:"linear",addressModeU:"clamp-to-edge",addressModeV:"clamp-to-edge"});
+
+  const hdTex = ()=>dev.createTexture({size:[w_hd,h_hd],format:"rgba8unorm",
+    usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+  const uploadHD = async (tex,url)=>{const b=await png(url);dev.queue.copyExternalImageToTexture({source:b},{texture:tex},[w_hd,h_hd]);};
+  const lrTexOf = async url=>{const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba8unorm",
+      usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.RENDER_ATTACHMENT});
+    const b=await png(url);dev.queue.copyExternalImageToTexture({source:b},{texture:t},[w_lr,h_lr]);return t;};
+  const flowTexOf = async url=>{const buf=new Float32Array(await (await fetch(url)).arrayBuffer());
+    const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba32float",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+    dev.queue.writeTexture({texture:t},buf,{bytesPerRow:w_lr*16,rowsPerImage:h_lr},[w_lr,h_lr]);return t;};
+
+  const uni = dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+  dev.queue.writeBuffer(uni,0,new Uint32Array([w_hd,h_hd,scale,0]));
+
+  // warp + hole-fallback: hole (fx<-1e8) -> bilinear-up of current LR (matches cv2.resize LINEAR);
+  // else sample prev recon at src=dst+flow*scale (matches warp_hd). Both clamp-to-edge.
+  const mod = dev.createShaderModule({code:`
+    struct U{w:u32,h:u32,scale:u32,_p:u32};
+    @group(0) @binding(0) var prevRecon: texture_2d<f32>;
+    @group(0) @binding(1) var samp: sampler;
+    @group(0) @binding(2) var flowTex: texture_2d<f32>;
+    @group(0) @binding(3) var lrTex: texture_2d<f32>;
+    @group(0) @binding(4) var<uniform> u:U;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{
+      var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3)); return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
+      let dst=vec2i(floor(pos.xy)); let lr=dst/i32(u.scale);
+      let f=textureLoad(flowTex,lr,0).xy;
+      // textureSampleLevel (explicit LOD 0) is callable from non-uniform control flow (no derivatives);
+      // textures have no mips so it == textureSample. Plain textureSample is illegal inside the hole branch.
+      if(f.x < -1.0e8){ // intra hole -> fallback to bilinear-upscaled current LR
+        return vec4f(textureSampleLevel(lrTex,samp,pos.xy/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0);
+      }
+      let src=vec2f(dst)+f*f32(u.scale);
+      return vec4f(textureSampleLevel(prevRecon,samp,(src+vec2f(0.5))/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0);
+    }`});
+  const ci = await mod.getCompilationInfo();
+  R.shaderMsgs = ci.messages.map(m=>`${m.type} L${m.lineNum}:${m.linePos} ${m.message}`);
+  if(R.shaderMsgs.length) L("SHADER: "+R.shaderMsgs.join(" | "), "err");
+  dev.pushErrorScope("validation");
+  const pipe = dev.createRenderPipeline({layout:"auto",
+    vertex:{module:mod,entryPoint:"vs"},fragment:{module:mod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},
+    primitive:{topology:"triangle-list"}});
+  R.pipeErr = await dev.popErrorScope().then(e=>e?e.message:"none");
+  if(R.pipeErr!=="none") L("PIPELINE: "+R.pipeErr,"err");
+
+  // build the recon chain: recon[i] = anchor SR (if anchor) else warp(recon[i-1]) + fallback
+  const recon = [];
+  const bpr = Math.ceil(w_hd*4/256)*256;
+  const mads = [];
+  for(const fr of frames){
+    const i=fr.i; const tex=hdTex();
+    if(fr.anchor){
+      await uploadHD(tex, `../gop_data/anchor_${i}.png`);
+    } else {
+      const flow=await flowTexOf(`../gop_data/flow_${i}.bin`);
+      const lr=await lrTexOf(`../gop_data/lr_${i}.png`);
+      const bind=dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[
+        {binding:0,resource:recon[i-1].createView()},{binding:1,resource:samp},
+        {binding:2,resource:flow.createView()},{binding:3,resource:lr.createView()},{binding:4,resource:{buffer:uni}}]});
+      const e=dev.createCommandEncoder();
+      const p=e.beginRenderPass({colorAttachments:[{view:tex.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});
+      p.setPipeline(pipe);p.setBindGroup(0,bind);p.draw(3);p.end();
+      dev.queue.submit([e.finish()]);
+    }
+    recon[i]=tex;
+    // parity vs python reference recon
+    const rbuf=dev.createBuffer({size:bpr*h_hd,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    const e2=dev.createCommandEncoder();
+    e2.copyTextureToBuffer({texture:tex},{buffer:rbuf,bytesPerRow:bpr,rowsPerImage:h_hd},[w_hd,h_hd]);
+    dev.queue.submit([e2.finish()]); await dev.queue.onSubmittedWorkDone();
+    await rbuf.mapAsync(GPUMapMode.READ); const g=new Uint8Array(rbuf.getMappedRange());
+    const ref=refData(await png(`../gop_data/ref_${i}.png`),w_hd,h_hd);
+    let s=0,mx=0,n=0; for(let y=0;y<h_hd;y++)for(let x=0;x<w_hd;x++){const gi=y*bpr+x*4,ri=(y*w_hd+x)*4;
+      for(let c=0;c<3;c++){const d=Math.abs(g[gi+c]-ref[ri+c]);s+=d;if(d>mx)mx=d;n++;}}
+    rbuf.unmap(); const mad=s/n; mads.push(mad);
+    L(`  frame ${String(i).padStart(2)} ${fr.type}${fr.anchor?"*":" "}  parity mean|Δ|=${mad.toFixed(3)} max=${mx}`, mad<2.5?"dim":"err");
+  }
+  const worst=Math.max(...mads); const avg=mads.reduce((a,b)=>a+b)/mads.length;
+  const pass=worst<2.5;
+  L(`CHAIN PARITY: avg mean|Δ|=${avg.toFixed(3)}, worst-frame mean|Δ|=${worst.toFixed(3)} over ${mads.length} frames -> ${pass?"PASS":"CHECK"}`,pass?"ok":"err");
+
+  // playback: draw recon[i] to canvas, paced at fps, looping (a passthrough blit)
+  const cv=document.getElementById("play");cv.width=w_hd;cv.height=h_hd;
+  const ctx=cv.getContext("webgpu");const fmt=navigator.gpu.getPreferredCanvasFormat();ctx.configure({device:dev,format:fmt,alphaMode:"opaque"});
+  const blit=dev.createShaderModule({code:`
+    @group(0) @binding(0) var t:texture_2d<f32>; @group(0) @binding(1) var s:sampler;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{return textureSample(t,s,pos.xy/vec2f(${w_hd}.0,${h_hd}.0));}`});
+  const bpipe=dev.createRenderPipeline({layout:"auto",vertex:{module:blit,entryPoint:"vs"},fragment:{module:blit,entryPoint:"fs",targets:[{format:fmt}]},primitive:{topology:"triangle-list"}});
+  let idx=0,last=0,drawn=0;
+  function frame(t){
+    if(t-last >= 1000/fps){
+      last=t; const tex=recon[idx%frames.length]; idx++; drawn++;
+      const bind=dev.createBindGroup({layout:bpipe.getBindGroupLayout(0),entries:[{binding:0,resource:tex.createView()},{binding:1,resource:samp}]});
+      const e=dev.createCommandEncoder();
+      const p=e.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});
+      p.setPipeline(bpipe);p.setBindGroup(0,bind);p.draw(3);p.end();dev.queue.submit([e.finish()]);
+      R.framesDrawn=drawn;
+    }
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+  Object.assign(R,{ok:true,avgMad:avg,worstMad:worst,pass,nFrames:frames.length,anchors:frames.filter(f=>f.anchor).length});
+  L(`PLAYING (looping ${frames.length}-frame GOP @ ${fps}fps). Chain built + parity-verified.`,"ok");
+}
+main().catch(e=>{L("ERROR: "+e.message,"err");window.__gop={error:e.message};});
+</script>

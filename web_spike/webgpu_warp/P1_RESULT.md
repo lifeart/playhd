@@ -46,3 +46,33 @@ substrate and the data contract (HD anchor texture + LR rgba32f fetch-flow) are 
 `python extract_warp_data.py` (writes `demo_data/`), then serve `web_spike/` over http
 (`python -m http.server`) and open `webgpu_warp/index.html` in a WebGPU browser; the parity + timing
 print to the page and to `window.__warp`.
+
+---
+
+# GOP propagation CHAIN — browser-verified (the full NEMO loop)
+
+`gop.html` extends the single warp to a **full GOP**: SR only the anchor (I-frame), reconstruct every
+other frame by warping the PREVIOUS recon with that frame's codec MVs, falling back to upscaled-LR at
+intra holes — then play it back to canvas. Verified in real Chrome WebGPU against a Python reference
+that runs the identical algorithm (`extract_gop_data.py`).
+
+**GOP:** 16 frames, **1 anchor SR'd + 15 propagated** (6.25% SR — the NEMO ratio), 640×320 → 1280×640, 25 fps.
+
+| metric | value |
+|---|---|
+| **chain parity vs Python reference** | **avg mean \|Δ\| = 0.016 codes, worst-frame = 0.065 (max 4)** over all 16 frames → PASS |
+| per-frame drift | frame 1: 0.004 → frame 15: 0.065 — **15 chained bilinear warps accumulate ~nothing** (bounded, not a drift catastrophe) |
+| playback | loops the GOP to `<canvas>` at 25 fps via `requestAnimationFrame` (visually coherent: the propagated title card) |
+
+**Bug found + fixed along the way (a real WebGPU gotcha worth recording):** `textureSample` may only be
+called from *uniform* control flow — calling it inside the data-dependent `if (hole)` branch is a WGSL
+compile error, which silently invalidated the pipeline and rendered every propagated frame **black**
+(caught via `pushErrorScope` + `getCompilationInfo`). Fix: **`textureSampleLevel(..., 0.0)`** (explicit
+LOD, no derivatives → legal in non-uniform flow; identical result since the textures have no mips). Any
+branchy WebGPU sampling (occlusion fallback, region gates) must use `textureSampleLevel`.
+
+**This verifies the whole instant-tier propagation core in-browser:** sparse-anchor SR + chained codec-MV
+warp + hole fallback + playback, parity-perfect vs the prototype. Remaining for a live P1: on-GPU compact
+SR (so anchors aren't offline-SR'd), the reactive occlusion mask (vs the intra-only holes used here), and
+the WASM MV-binding (live flow instead of the offline file). Reproduce: `python extract_gop_data.py` then
+open `webgpu_warp/gop.html`; results in `window.__gop`.

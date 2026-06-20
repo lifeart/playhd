@@ -3,3 +3,4 @@ package-lock.json
 sd600.mp4
 *.wasm
 demo_data/
+gop_data/
