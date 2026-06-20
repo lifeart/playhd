@@ -72,7 +72,46 @@ LOD, no derivatives → legal in non-uniform flow; identical result since the te
 branchy WebGPU sampling (occlusion fallback, region gates) must use `textureSampleLevel`.
 
 **This verifies the whole instant-tier propagation core in-browser:** sparse-anchor SR + chained codec-MV
-warp + hole fallback + playback, parity-perfect vs the prototype. Remaining for a live P1: on-GPU compact
-SR (so anchors aren't offline-SR'd), the reactive occlusion mask (vs the intra-only holes used here), and
-the WASM MV-binding (live flow instead of the offline file). Reproduce: `python extract_gop_data.py` then
+warp + hole fallback + playback, parity-perfect vs the prototype. Reproduce: `python extract_gop_data.py` then
 open `webgpu_warp/gop.html`; results in `window.__gop`.
+
+---
+
+# On-GPU compact SR — browser-verified, BIT-EXACT (removes the last offline dependency except MVs)
+
+`sr.html` runs the actual compact anchor net — **realesr-general-x4v3 / SRVGGNetCompact** (conv(3→64)+PReLU,
+32×[conv(64→64)+PReLU], conv(64→48), PixelShuffle(4), + nearest(×4) residual = **34 conv passes**, 1.21M
+params) — entirely in WebGPU, vs the PyTorch net. So the anchor no longer needs offline SR; only the MVs do.
+
+**How:** a generic conv+PReLU compute shader (channel-planar feature buffers, ping-pong, zero-pad, weights
+from a storage buffer at per-pass offsets), chained 34× in JS, then a PixelShuffle(4)+nearest-residual render
+pass. Weights exported from the .pth by `export_compact_weights.py` (matches PyTorch layout + the RGB/[0,1]
+preprocessing exactly).
+
+| metric | value |
+|---|---|
+| **parity vs PyTorch `sr.upscale`** | **mean \|Δ\| = 0.0000035 codes, max = 1** over 1024×1024×3 → essentially bit-exact (≈11 total codes of diff across 3.1M values; the 34-layer fp32 CNN reproduces PyTorch) |
+| visual | WebGPU SR and the PyTorch reference are pixel-indistinguishable |
+| timing (this naive conv) | ~1.33 s for 256×256→1024×1024 (x4) |
+
+**Honest perf note:** the 1.33 s is a *naive* conv (one invocation per output element — no shared-memory
+tiling, no fp16, no vec4). It's a one-time **anchor** (SR ~1 frame in 16–48; the warp at ~10,400 fps carries
+the rest), so it's amortized — but for a snappy live instant tier it wants the standard WGSL conv
+optimizations (tiled/workgroup-shared conv, fp16, vectorized MACs) or reusing websr/Anime4K-WebGPU's tuned
+kernels. That is a known optimization path, not a feasibility question — **the parity (bit-exact) is the
+result that matters: the real anchor net runs faithfully in the browser.**
+
+**Second instance of the texture-usage gotcha:** the display blit sampled the SR `out` texture, which was
+created `RENDER_ATTACHMENT|COPY_SRC` — missing `TEXTURE_BINDING` → the bind group was invalid → the blit drew
+black (parity was unaffected, since it reads via `COPY_SRC`). Any texture you later *sample* needs
+`TEXTURE_BINDING` in its usage. Fixed.
+
+## Web-port status after this step (offline deps remaining: just the MVs)
+- ✅ MV extraction in WASM — ~850–1000 fps (`SPIKE_RESULT.md`)
+- ✅ single MV warp in WebGPU — parity 0.002, ~430× real-time
+- ✅ full GOP propagation chain + playback — parity 0.016, browser-verified
+- ✅ **compact anchor SR in WebGPU — bit-exact (0.0000035), browser-verified** ← the anchor is now on-GPU
+- remaining: reactive occlusion mask (vs intra-only holes), the WASM MV-binding (live flow), conv perf opt,
+  and wiring the on-GPU SR into the GOP loop as the anchor source.
+
+Reproduce: `python export_compact_weights.py` then open `webgpu_warp/sr.html`; result in `window.__sr`.

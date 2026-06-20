@@ -1,0 +1,134 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>playhd — on-GPU compact SR (SRVGGNetCompact) in WebGPU</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}
+canvas{border:1px solid #333;image-rendering:pixelated;max-width:46%}#log{white-space:pre-wrap;margin-top:10px}
+.ok{color:#6f6}.err{color:#f66}.hd{color:#9cf}.row{display:flex;gap:12px}</style>
+<h3 class="hd">playhd — compact SR net (realesr-general-x4v3) running in WebGPU</h3>
+<div class="row"><div><div>WebGPU SR</div><canvas id="gpu"></canvas></div>
+<div><div>PyTorch reference (sr.upscale)</div><canvas id="ref"></canvas></div></div>
+<div id="log"></div>
+<script type="module">
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={}; window.__sr=R;
+const imgData=async(u,w,h)=>{const b=await createImageBitmap(await (await fetch(u)).blob());const c=new OffscreenCanvas(w,h);const x=c.getContext("2d");x.drawImage(b,0,0);return x.getImageData(0,0,w,h).data;};
+
+async function main(){
+  if(!navigator.gpu){L("WebGPU NOT available","err");R.error="no-webgpu";return;}
+  const meta=await (await fetch("../compact_data/layers.json")).json();
+  const {layers,upscale,H,W,n_passes}=meta; const HD=H*upscale, WD=W*upscale;
+  L(`compact net: ${n_passes} conv passes, ${H}x${W} -> ${HD}x${WD} (x${upscale})`,"hd");
+  const dev=await (await navigator.gpu.requestAdapter()).requestDevice();
+
+  // weights -> storage buffer
+  const wbuf=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
+  const W_gpu=dev.createBuffer({size:wbuf.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  dev.queue.writeBuffer(W_gpu,0,wbuf);
+
+  // feature buffers A,B (64 ch planar) + LR buffer (3 ch planar) for the residual
+  const FC=64, plane=H*W, fsize=FC*plane*4;
+  const A=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const B=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE});
+  const lrpix=await imgData("../compact_data/lr.png",W,H);
+  const lrPlanar=new Float32Array(3*plane);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;for(let c=0;c<3;c++)lrPlanar[c*plane+y*W+x]=lrpix[i+c]/255;}
+  const LR_gpu=dev.createBuffer({size:lrPlanar.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  dev.queue.writeBuffer(LR_gpu,0,lrPlanar);
+  // seed A with LR in its first 3 channels
+  const Ainit=new Float32Array(FC*plane); Ainit.set(lrPlanar.subarray(0,3*plane),0);
+  dev.queue.writeBuffer(A,0,Ainit);
+
+  // conv(+PReLU) compute shader, channel-planar, zero-pad, weights from a storage buffer at offsets
+  const conv=dev.createShaderModule({code:`
+    struct P{ H:u32,W:u32,in_c:u32,out_c:u32, w_off:u32,b_off:u32,prelu_off:u32,has_prelu:u32 };
+    @group(0) @binding(0) var<storage,read> fin: array<f32>;
+    @group(0) @binding(1) var<storage,read_write> fout: array<f32>;
+    @group(0) @binding(2) var<storage,read> Wt: array<f32>;
+    @group(0) @binding(3) var<uniform> u: P;
+    @compute @workgroup_size(8,8,1)
+    fn main(@builtin(global_invocation_id) g: vec3u){
+      let x=i32(g.x); let y=i32(g.y); let oc=i32(g.z);
+      if(x>=i32(u.W)||y>=i32(u.H)||oc>=i32(u.out_c)){return;}
+      var acc = Wt[u.b_off + u32(oc)];
+      let bw = u.w_off + u32(oc)*u.in_c*9u;
+      for(var ic=0u; ic<u.in_c; ic=ic+1u){
+        let pl = ic*u.H*u.W; let wic = bw + ic*9u;
+        for(var ky=0; ky<3; ky=ky+1){ let yy=y+ky-1; if(yy<0||yy>=i32(u.H)){continue;}
+          for(var kx=0; kx<3; kx=kx+1){ let xx=x+kx-1; if(xx<0||xx>=i32(u.W)){continue;}
+            acc = acc + Wt[wic+u32(ky*3+kx)] * fin[pl + u32(yy)*u.W + u32(xx)];
+          }}}
+      if(u.has_prelu==1u){ let s=Wt[u.prelu_off+u32(oc)]; if(acc<0.0){acc=acc*s;} }
+      fout[u32(oc)*u.H*u.W + u32(y)*u.W + u32(x)] = acc;
+    }`});
+  const ci=await conv.getCompilationInfo(); if(ci.messages.some(m=>m.type==="error")){L("CONV SHADER ERR: "+ci.messages.map(m=>m.message).join(" | "),"err");R.error="conv-shader";return;}
+  dev.pushErrorScope("validation");
+  const cpipe=dev.createComputePipeline({layout:"auto",compute:{module:conv,entryPoint:"main"}});
+  const pe=await dev.popErrorScope(); if(pe){L("CONV PIPELINE ERR: "+pe.message,"err");R.error="conv-pipe";return;}
+
+  const t0=performance.now();
+  let inb=A, outb=B;
+  for(let k=0;k<layers.length;k++){
+    const ly=layers[k];
+    const u=new Uint32Array([H,W,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+    const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}); dev.queue.writeBuffer(ub,0,u);
+    const bg=dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[
+      {binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:W_gpu}},{binding:3,resource:{buffer:ub}}]});
+    const e=dev.createCommandEncoder(); const p=e.beginComputePass();
+    p.setPipeline(cpipe); p.setBindGroup(0,bg);
+    p.dispatchWorkgroups(Math.ceil(W/8),Math.ceil(H/8),ly.out_c); p.end(); dev.queue.submit([e.finish()]);
+    [inb,outb]=[outb,inb];     // ping-pong; last output is in `inb`
+  }
+  const featLast=inb;  // conv_last output (48 ch)
+
+  // PixelShuffle(4) + nearest residual -> rgba8 HD texture (render pass; storage read in fragment)
+  const out=dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC|GPUTextureUsage.TEXTURE_BINDING});
+  const fin=dev.createShaderModule({code:`
+    struct P{ H:u32,W:u32,up:u32,_p:u32 };
+    @group(0) @binding(0) var<storage,read> feat: array<f32>;
+    @group(0) @binding(1) var<storage,read> lr: array<f32>;
+    @group(0) @binding(2) var<uniform> u:P;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
+      let X=i32(floor(pos.x)); let Y=i32(floor(pos.y)); let up=i32(u.up);
+      let x=X/up; let y=Y/up; let i=Y%up; let j=X%up; let plane=u.H*u.W;
+      var rgb=vec3f(0.0);
+      for(var c=0; c<3; c=c+1){
+        let ch=u32(c*up*up + i*up + j);                  // PixelShuffle channel order (C,r,r)
+        let v=feat[ch*plane + u32(y)*u.W + u32(x)] + lr[u32(c)*plane + u32(y)*u.W + u32(x)];
+        rgb[c]=clamp(v,0.0,1.0);
+      }
+      return vec4f(rgb,1.0);
+    }`});
+  const fci=await fin.getCompilationInfo(); if(fci.messages.some(m=>m.type==="error")){L("FINAL SHADER ERR: "+fci.messages.map(m=>m.message).join(" | "),"err");R.error="final-shader";return;}
+  const fp=dev.createRenderPipeline({layout:"auto",vertex:{module:fin,entryPoint:"vs"},fragment:{module:fin,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const fu=new Uint32Array([H,W,upscale,0]); const fub=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}); dev.queue.writeBuffer(fub,0,fu);
+  const fbg=dev.createBindGroup({layout:fp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:featLast}},{binding:1,resource:{buffer:LR_gpu}},{binding:2,resource:{buffer:fub}}]});
+  const e2=dev.createCommandEncoder();
+  const rp=e2.beginRenderPass({colorAttachments:[{view:out.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});
+  rp.setPipeline(fp); rp.setBindGroup(0,fbg); rp.draw(3); rp.end();
+  // readback for parity
+  const bpr=Math.ceil(WD*4/256)*256; const rb=dev.createBuffer({size:bpr*HD,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  e2.copyTextureToBuffer({texture:out},{buffer:rb,bytesPerRow:bpr,rowsPerImage:HD},[WD,HD]); dev.queue.submit([e2.finish()]);
+  await dev.queue.onSubmittedWorkDone(); const ms=performance.now()-t0;
+  L(`on-GPU SR (${n_passes} conv passes @ ${W}x${H} + pixelshuffle) done in ${ms.toFixed(0)} ms`,"ok");
+
+  // display + parity vs PyTorch sr_ref
+  const cv=document.getElementById("gpu");cv.width=WD;cv.height=HD;const ctx=cv.getContext("webgpu");const fmt=navigator.gpu.getPreferredCanvasFormat();ctx.configure({device:dev,format:fmt,alphaMode:"opaque"});
+  const blit=dev.createShaderModule({code:`@group(0) @binding(0) var t:texture_2d<f32>;@group(0) @binding(1) var s:sampler;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{return textureSampleLevel(t,s,pos.xy/vec2f(${WD}.0,${HD}.0),0.0);}`});
+  const bp=dev.createRenderPipeline({layout:"auto",vertex:{module:blit,entryPoint:"vs"},fragment:{module:blit,entryPoint:"fs",targets:[{format:fmt}]},primitive:{topology:"triangle-list"}});
+  const sm=dev.createSampler({magFilter:"linear",minFilter:"linear"});
+  const bbg=dev.createBindGroup({layout:bp.getBindGroupLayout(0),entries:[{binding:0,resource:out.createView()},{binding:1,resource:sm}]});
+  const e3=dev.createCommandEncoder();const rp2=e3.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp2.setPipeline(bp);rp2.setBindGroup(0,bbg);rp2.draw(3);rp2.end();dev.queue.submit([e3.finish()]);
+
+  const ref=await imgData("../compact_data/sr_ref.png",WD,HD); const rc=document.getElementById("ref");rc.width=WD;rc.height=HD;rc.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(ref),WD,HD),0,0);
+  await rb.mapAsync(GPUMapMode.READ); const g=new Uint8Array(rb.getMappedRange());
+  let s=0,mx=0,n=0; for(let y=0;y<HD;y++)for(let x=0;x<WD;x++){const gi=y*bpr+x*4,ri=(y*WD+x)*4;for(let c=0;c<3;c++){const d=Math.abs(g[gi+c]-ref[ri+c]);s+=d;if(d>mx)mx=d;n++;}}
+  rb.unmap(); const mad=s/n; const pass=mad<2.0;
+  L(`PARITY vs PyTorch compact SR: mean|Δ|=${mad.toFixed(3)} codes, max=${mx} -> ${pass?"PASS":"CHECK"}`,pass?"ok":"err");
+  Object.assign(R,{ok:true,mad,max:mx,ms,pass,passes:n_passes});
+  L("on-GPU compact SR COMPLETE","ok");
+}
+main().catch(e=>{L("ERROR: "+e.message,"err");window.__sr={error:e.message};});
+</script>
