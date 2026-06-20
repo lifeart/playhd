@@ -1,0 +1,87 @@
+<!doctype html>
+<meta charset="utf-8"><title>playhd — on-GPU compact SR, shared-memory tiled conv (WebGPU)</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}#log{white-space:pre-wrap}.ok{color:#6f6}.err{color:#f66}.hd{color:#9cf}</style>
+<h3 class="hd">playhd — compact SR net in WebGPU, workgroup-shared-memory TILED conv (bit-exact)</h3><div id="log"></div>
+<script type="module">
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={};window.__srt=R;
+const imgData=async(u,w,h)=>{const b=await createImageBitmap(await (await fetch(u)).blob());const c=new OffscreenCanvas(w,h);const x=c.getContext("2d");x.drawImage(b,0,0);return x.getImageData(0,0,w,h).data;};
+async function main(){
+  const adapter=await navigator.gpu.requestAdapter();
+  const dev=await adapter.requestDevice({requiredLimits:{maxComputeWorkgroupStorageSize:Math.min(32768,adapter.limits.maxComputeWorkgroupStorageSize)}});
+  const meta=await (await fetch("../compact_data/layers.json")).json();const {layers,upscale,H,W,n_passes}=meta;const HD=H*upscale,WD=W*upscale;
+  L(`tiled compact net: ${n_passes} passes, ${H}x${W} -> ${HD}x${WD} (x${upscale})`,"hd");
+  const wf=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
+  const W_gpu=dev.createBuffer({size:wf.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(W_gpu,0,wf);
+  const FC=64,plane=H*W,fsize=FC*plane*4;
+  const A=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});const B=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE});
+  const px=await imgData("../compact_data/lr.png",W,H);const lp=new Float32Array(3*plane);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){const i=(y*W+x)*4;for(let c=0;c<3;c++)lp[c*plane+y*W+x]=px[i+c]/255;}
+  const LR=dev.createBuffer({size:lp.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(LR,0,lp);
+  const Ai=new Float32Array(FC*plane);Ai.set(lp.subarray(0,3*plane),0);dev.queue.writeBuffer(A,0,Ai);
+  // TILED conv: workgroup = one 8x8 output tile; cooperatively load the (10x10 x in_c) input tile into
+  // shared memory ONCE, then every output pixel x output channel reads inputs from shared mem (low
+  // latency) instead of reloading from global. Same MAC order -> bit-exact. in_c<=64 -> 10*10*64=6400 f32 (25.6KB<32KB).
+  const conv=dev.createShaderModule({code:`
+    struct P{H:u32,W:u32,in_c:u32,out_c:u32,w_off:u32,b_off:u32,prelu_off:u32,has_prelu:u32};
+    @group(0) @binding(0) var<storage,read> fin:array<f32>;@group(0) @binding(1) var<storage,read_write> fout:array<f32>;
+    @group(0) @binding(2) var<storage,read> Wt:array<f32>;@group(0) @binding(3) var<uniform> u:P;
+    var<workgroup> tile:array<f32,6400>;   // (8+2)*(8+2)*64
+    @compute @workgroup_size(8,8,1)
+    fn main(@builtin(workgroup_id) wg:vec3u,@builtin(local_invocation_id) lid:vec3u,@builtin(local_invocation_index) li:u32){
+      let ox0=i32(wg.x)*8; let oy0=i32(wg.y)*8;                       // tile origin in output space
+      let n=i32(u.in_c)*100;                                          // elements to load (in_c * 10*10)
+      for(var idx=i32(li); idx<n; idx=idx+64){
+        let c=idx/100; let r=idx%100; let ty=r/10; let tx=r%10;
+        let gx=ox0+tx-1; let gy=oy0+ty-1;                            // -1 halo
+        var v=0.0; if(gx>=0&&gx<i32(u.W)&&gy>=0&&gy<i32(u.H)){v=fin[u32(c)*u.H*u.W+u32(gy)*u.W+u32(gx)];}
+        tile[idx]=v;
+      }
+      workgroupBarrier();
+      let ox=ox0+i32(lid.x); let oy=oy0+i32(lid.y);
+      if(ox>=i32(u.W)||oy>=i32(u.H)){return;}
+      let tx=i32(lid.x); let ty=i32(lid.y);                           // this pixel's top-left in the tile
+      for(var oc=0; oc<i32(u.out_c); oc=oc+1){
+        var acc=Wt[u.b_off+u32(oc)]; let bw=u.w_off+u32(oc)*u.in_c*9u;
+        for(var ic=0; ic<i32(u.in_c); ic=ic+1){
+          let tb=u32(ic)*100u; let wic=bw+u32(ic)*9u;
+          for(var ky=0; ky<3; ky=ky+1){ for(var kx=0; kx<3; kx=kx+1){
+            acc=acc+Wt[wic+u32(ky*3+kx)]*tile[tb+u32((ty+ky)*10+(tx+kx))];}}
+        }
+        if(u.has_prelu==1u){let s=Wt[u.prelu_off+u32(oc)];if(acc<0.0){acc=acc*s;}}
+        fout[u32(oc)*u.H*u.W+u32(oy)*u.W+u32(ox)]=acc;
+      }
+    }`});
+  const ci=await conv.getCompilationInfo();if(ci.messages.some(m=>m.type==="error")){L("CONV ERR: "+ci.messages.map(m=>`L${m.lineNum}: ${m.message}`).join(" | "),"err");R.error="conv";return;}
+  dev.pushErrorScope("validation");
+  const cpipe=dev.createComputePipeline({layout:"auto",compute:{module:conv,entryPoint:"main"}});
+  const pe=await dev.popErrorScope();R.pipeErr=pe?pe.message:"none";if(pe){L("PIPELINE ERR: "+pe.message,"err");}
+  const t0=performance.now();let inb=A,outb=B;const bgs=[];
+  for(const ly of layers){const u=new Uint32Array([H,W,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+    const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
+    bgs.push(dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:W_gpu}},{binding:3,resource:{buffer:ub}}]}));[inb,outb]=[outb,inb];}
+  const enc=dev.createCommandEncoder();for(const bg of bgs){const p=enc.beginComputePass();p.setPipeline(cpipe);p.setBindGroup(0,bg);p.dispatchWorkgroups(Math.ceil(W/8),Math.ceil(H/8),1);p.end();}dev.queue.submit([enc.finish()]);
+  const featLast=inb;
+  const out=dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+  const psh=dev.createShaderModule({code:`
+    struct P{H:u32,W:u32,up:u32,_p:u32};@group(0) @binding(0) var<storage,read> feat:array<f32>;@group(0) @binding(1) var<storage,read> lr:array<f32>;@group(0) @binding(2) var<uniform> u:P;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
+      var rgb=vec3f(0.0);for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(feat[ch*pl+u32(y)*u.W+u32(x)]+lr[u32(c)*pl+u32(y)*u.W+u32(x)],0.0,1.0);}return vec4f(rgb,1.0);}`});
+  const fp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const fu=new Uint32Array([H,W,upscale,0]);const fub=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(fub,0,fu);
+  const fbg=dev.createBindGroup({layout:fp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:featLast}},{binding:1,resource:{buffer:LR}},{binding:2,resource:{buffer:fub}}]});
+  const e2=dev.createCommandEncoder();const rp=e2.beginRenderPass({colorAttachments:[{view:out.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(fp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();
+  const bpr=Math.ceil(WD*4/256)*256;const rb=dev.createBuffer({size:bpr*HD,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  e2.copyTextureToBuffer({texture:out},{buffer:rb,bytesPerRow:bpr,rowsPerImage:HD},[WD,HD]);dev.queue.submit([e2.finish()]);
+  await dev.queue.onSubmittedWorkDone();const ms=performance.now()-t0;
+  const ref=await imgData("../compact_data/sr_ref.png",WD,HD);
+  await rb.mapAsync(GPUMapMode.READ);const g=new Uint8Array(rb.getMappedRange());
+  let s=0,mx=0,n=0;for(let y=0;y<HD;y++)for(let x=0;x<WD;x++){const gi=y*bpr+x*4,ri=(y*WD+x)*4;for(let c=0;c<3;c++){const d=Math.abs(g[gi+c]-ref[ri+c]);s+=d;if(d>mx)mx=d;n++;}}
+  rb.unmap();const mad=s/n;
+  L(`tiled SR done in ${ms.toFixed(0)} ms (naive fp32 was ~1330 ms, fp16 ~1270 ms)`,"ok");
+  L(`PARITY vs PyTorch fp32 ref: mean|Δ|=${mad.toFixed(5)} codes, max=${mx} -> ${mad<0.01?"BIT-EXACT":"CHECK"}`,mad<0.01?"ok":"err");
+  Object.assign(R,{ok:true,mad,max:mx,ms});
+}
+main().catch(e=>{L("ERROR: "+e.message,"err");window.__srt={error:e.message};});
+</script>

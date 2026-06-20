@@ -38,11 +38,27 @@ than native — it amortizes away per-frame heavy SR, the browser's single worst
 
 ## Performance characterization
 - **Warp / occlusion / playback**: negligible (warp ~0.1 ms; these are texture-sample passes) — real-time with huge headroom.
-- **Anchor SR (the cost)**: ~1.3 s for 256×256→1024×1024 with a **naive** conv. Established **compute-bound**
-  (batching 34 submits → 1 gave no speedup). It is a one-time **amortized** anchor (SR ~1 frame in 12–48; the
-  warp carries the rest), so fine for a **render-then-play** UX. A truly real-time anchor needs a **tuned conv
-  kernel** (fp16 and/or tiled/vectorized, or reuse websr / Anime4K-WebGPU's shaders) — a known, sizable
-  optimization, **not** a feasibility question.
+- **Anchor SR (the cost)**: ~1.3 s for 256×256→1024×1024 with a **naive** conv. It is a one-time **amortized**
+  anchor (SR ~1 frame in 12–48; the warp carries the rest), so fine for a **render-then-play** UX.
+
+### Conv-perf investigation (measured; `sr.html` naive, `sr_f16.html` fp16, `sr_tiled.html` shared-mem)
+Profiled empirically (no GPU profiler available) by trying the obvious levers and measuring:
+| variant | time | parity vs PyTorch fp32 | takeaway |
+|---|---|---|---|
+| naive fp32 | ~1330 ms | **0.0000035** (bit-exact) | baseline |
+| batch 34 submits → 1 | ~1330 ms | bit-exact | **not** submit/overhead-bound |
+| **fp16** (f16 storage, f32 accum) | ~1270 ms | 0.0015 (visually identical) | **not** bandwidth-bound (halving load traffic ≈ no change) |
+| shared-mem **input tile** | ~1586 ms (slower) | bit-exact | **not** input-latency-bound; the tiled structure made each thread do all 64 oc → far fewer threads → **occupancy regression** |
+
+**Diagnosis:** the kernel runs at ~65 GFLOP/s — far below the GPU's TFLOP peak — so it's **latency/occupancy-bound**,
+not bandwidth- or compute-peak-bound. The naive structure's high thread count (W×H×OC, one output channel each)
+is actually reasonable; input-tiling *reduced* parallelism. fp16 helps only memory (which isn't the bottleneck).
+**A real speedup needs the right thing cached (the weights, reused across all pixels — but 144 KB/layer >
+32 KB shared, so it needs oc-chunked weight tiling) or an interleaved-channel layout enabling vec4 MACs — i.e.
+a profiler-guided rewrite, or (the pragmatic path) reuse websr / Anime4K-WebGPU's hand-tuned WGSL conv kernels
+rather than hand-rolling.** Conclusion: the naive conv is the correctness reference (bit-exact); the
+amortized 1.3 s anchor is fine for render-then-play; a real-time anchor is a tuned-kernel integration, not a
+one-line change. fp16 is validated (0.0015) and ready if a 2× memory win ever matters.
 
 ## Roadmap to a shippable in-browser tier (all engineering, no open feasibility)
 1. **WASM MV-binding** (the long pole; needs `emsdk` — parked): expose
