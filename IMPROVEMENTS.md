@@ -14,7 +14,8 @@
 >   instant tier** (`INSTANT_SCALE=2`) → instant **~409 → 41 ms/frame = 10.0× = ~24 fps = real-time**.
 > - ✅ **Scene-cut detection (DONE, `397f461`, `server/scene_detect.py`):** robust cut detector
 >   (1.00/1.00 prec/recall on `sample.mp4`) forces a fresh anchor at every cut → no cross-cut smear.
-> - ◻ **Still open:** V4 (layered seam/hair), and the BROWSER half of progressive playback.
+> - ✅ **Progressive playback — browser half DONE (verified in Chrome, default ON):** see the R-rounds
+>   update below + handoff GOTCHA #29–31. (V4 layered seam/hair also landed; see handoff.)
 >
 > Tile-SR (P1's Lever 3) was measured and **DISABLED** (`INSTANT_TILE_SR=False`): the occlusion
 > fallback is spatially scattered on real footage so a bbox covers ~97% of the frame → no win.
@@ -25,9 +26,12 @@
 >   ~1.24× faster, PSNR(fp16,fp32) 71.7 dB = visually identical; instant stays fp32 (byte-identical).
 > - ✅ **V2 motion-modulated grain — DONE (GO):** `grain.apply_grain_motion`, quality mode
 >   `grain_motion=True`. Static |ΔF| 5.649→2.313 (≈ no-grain floor); moving keeps fresh grain.
-> - ◐ **Progressive play-while-process — SERVER DONE, browser PENDING:** `server/progressive.py` +
->   `GET /api/stream` (fMP4 over chunked HTTP). HTTP/decode-verified (play-before-EOF, audio, 409,
->   disconnect-frees-lock); browser playback unconfirmed → shipped opt-in (default OFF). See GOTCHAs #28–29.
+> - ✅ **Progressive play-while-process — DONE (browser-verified, default ON):** `server/progressive.py` +
+>   `GET /api/stream` (fMP4 over chunked HTTP), consumed via MSE in `index.html`. HTTP/decode-verified
+>   (play-before-EOF, audio, 409, disconnect-frees-lock) AND **browser-verified in Chrome** (MSE opens +
+>   decodes the live fMP4, frame renders, plays). Now **default ON**; Auto also streams when it probes to
+>   instant (`GET /api/recommend`). Robust playback: `<video muted autoplay>` + sound-with-unmute fallback.
+>   See GOTCHAs #28–31 + handoff "## UX finishing".
 > - ◻ **V3 graphic-edge:** detector validated (0% face mis-fire) but **pinning NO-GO** — the title card is
 >   zero-MV skip-coded so NEMO anchor-reuse already out-stabilises per-frame SR. Detector ready as a util.
 > - **NO-GO (settled):** color-box clamp `--clamp` (structural — RD-MVs land the ghost inside the box);

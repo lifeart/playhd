@@ -85,7 +85,7 @@ prototype/out_quality/ # Step 8 artifacts: detail_drift.png/.csv, ab_anchor_*, g
 prototype/out_matting/ out_plate/ out_layered/  # LAYERED L1/L2/L3 artifacts
 prototype/out*/        # generated artifacts (see prototype/README.md ## Artifacts) — all gitignored
 server/                # PRODUCT LAYER — Stage-1 web app (FastAPI + browser console)
-server/app.py          #   FastAPI: GET / (console) + /api/sources, /api/process, /api/progress, /outputs/*.mp4, + R1: /api/stream (progressive), /api/upload
+server/app.py          #   FastAPI: GET / (console) + /api/sources, /api/process, /api/progress, /outputs/*.mp4, /api/stream (progressive fMP4), /api/upload, /api/recommend (Auto-mode probe)
 server/progressive.py  #   R1 E1: fragmented-MP4 play-while-process core (GET /api/stream) — server-verified, browser-pending (opt-in)
 server/pipeline_api.py #   STREAMING constant-memory GOP-chunk processing of the WHOLE clip + source-audio mux + faststart (instant/quality); instant takes the Levers-1–4 fast path
 server/layered_api.py  #   the LAYERED mode (two-pass-per-scene: build+heavy-SR one bg plate/scene, composite the moving FG per frame)
@@ -962,6 +962,28 @@ the OFF flags are genuine tier-specific tradeoffs (motion-keyed / soft-occlusion
 shimmerier; right for the real-time tier), explicit user choices (smooth-2×), a measured no-win (tile-SR),
 or an honestly-marginal residual (texture-gate without the killed tile-skip). Nothing valuable is buried OFF.
 
+## UX finishing — Auto-streams, robust playback, UI polish (post-R7, 2026-06-20)
+
+A finishing pass after a frank "is this real or busywork" review (the kept work is in `## Default-flag
+audit` above + this; the marginal tile-skip was assessed and dropped). All in `server/`; verified live.
+
+- **Flags flipped ON (real wins, were off out of over-caution):** progressive playback (browser-VERIFIED:
+  Chrome MSE opens + decodes the live fMP4, GOTCHA #29) and the **low-light saturation cap**, re-gated on
+  **intra-fraction > 0.8** (the principled "encoder gave up = noise" signal) so it fires ONLY on real noise
+  → byte-identical on title-reveals/clean content, holds real-time on noise (c3: SR calls 1 vs 24).
+- **Auto plays-while-processing** (GOTCHA #31): `GET /api/recommend` probe + client routing → the DEFAULT
+  "Auto" streams progressively when it resolves to instant (previously only the explicit Instant streamed,
+  so Auto on the 34-min default clip showed nothing live).
+- **Robust result playback** (GOTCHA #30): `<video muted autoplay>` + a `playResult()` helper (try sound →
+  fall back to muted + a one-tap "🔊 Tap for sound" button). Fixes a real "no video / spinner" bug — the
+  page was calling `play()` unmuted after the gesture window expired, so the video never started even though
+  the output mp4 is valid (it plays when opened directly). Verified: the result frame now renders + plays.
+- **UI polish** (`server/index.html`, self-contained, no external assets): inline-SVG favicon + header logo;
+  a real progress bar (shows % when the total is known; an indeterminate sliding animation during
+  probing/segmenting/streaming; friendly state labels); a button spinner while a job runs; status line with
+  info/ok/err/live(pulsing) dots; a "Result" panel with a mode-aware badge ("LIVE · Instant 720p" while
+  streaming, "Instant 720p · done" etc.) and stats in a bordered box. Verified in Chrome with no console errors.
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a
@@ -1175,6 +1197,27 @@ Visuals: `prototype/out_diffusion_real/`.
     issue; a real foreground tab, with sound, plays.) So the **"▶ Play while processing" checkbox is now
     DEFAULT ON** for instant mode; it falls back to a plain `<video>` if MSE is unavailable, and to the
     buffered `POST /api/process` path if unchecked. The server bytes were already proven (PyAV play-before-EOF).
+
+30. **The result `<video>` must use `muted autoplay`; an unmuted `play()` after a long render is BLOCKED →
+    the video never starts (spinner, looks like "no playback")** (post-R7 UX fix). The output mp4 is valid
+    (it plays when opened directly: readyState 4, dimensions, currentTime advances) — but the PAGE never
+    started it: the element had `autoplay` without `muted`, and the page called `v.play()` *unmuted* after
+    the render. Chrome's user-activation from the click is **transient (~5 s)**; after a multi-second render
+    the gesture window has expired, so **unmuted autoplay is blocked** and the `<video>` sits at a buffering
+    spinner. (Streaming "worked" only by luck — its `play()` fired ~2 s after the click, still inside the
+    window.) FIX (`index.html`): give the element **`muted autoplay`** (muted autoplay is ALWAYS allowed →
+    the frame renders immediately) + a `playResult(v)` helper that tries unmuted (sound), and on rejection
+    falls back to **muted playback + a one-tap "🔊 Tap for sound" button** — never a paused/spinner video the
+    user must hunt for ▶. Wired into all three play paths (buffered done, MSE stream start, native fallback).
+
+31. **Progressive streaming only fires for `instant` — Auto must PROBE and route to it** (post-R7 UX fix).
+    The "Play while processing" path only triggered on the *explicit* "Instant" mode; the DEFAULT mode is
+    "Auto", which ran `process_clip("auto")` over the BUFFERED `POST /api/process` path → on a long clip
+    (the default `sample.mp4` is 34 min) there was NO live video for the whole render = "I can't see it
+    play". FIX: `GET /api/recommend?source=` (a cheap `recommend_mode` probe → `{mode, reason}`); the client,
+    when "Play while processing" is checked and the mode is Auto, probes and — if it resolves to `instant` —
+    routes to the progressive `/api/stream` path (Auto resolving to quality/layered correctly stays buffered,
+    they are not real-time). So the DEFAULT "Auto" now plays-while-processing on instant-suitable content.
 
 ## Known limitations / done since (Steps 1–4) and still NOT done
 

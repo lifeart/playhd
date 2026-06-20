@@ -6,10 +6,13 @@ can, in a browser: pick a source mp4 (or upload one), choose Instant / Quality, 
 
 Endpoints:
   GET  /                -> server/index.html (the demo console)
-  GET  /api/sources     -> available source mp4s + the two modes
-  POST /api/process     -> run the whole-clip streaming pipeline (source|upload + mode)
+  GET  /api/sources     -> available source mp4s + the modes (auto|instant|quality|layered)
+  POST /api/process     -> run the whole-clip BUFFERED pipeline (source|upload + mode + smooth)
                            -> {url, source, stats}.  One job at a time (409 if busy).
-  GET  /api/progress     -> live {state, done, total, elapsed_s, eta_s, ms_per_frame}
+  GET  /api/progress    -> live {state, done, total, elapsed_s, eta_s, ms_per_frame}
+  GET  /api/stream      -> PROGRESSIVE play-while-process: live fragmented-MP4 (instant tier)
+  GET  /api/recommend   -> cheap Auto-mode probe -> {mode, reason} (client routes Auto -> /api/stream)
+  POST /api/upload      -> save an uploaded mp4 -> {name} (so /api/stream can stream an upload)
   GET  /outputs/<f>.mp4 -> the produced mp4 (StaticFiles: video/mp4 + HTTP Range -> seek)
 
 Run:
