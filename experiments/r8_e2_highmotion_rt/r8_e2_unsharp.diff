@@ -1,0 +1,121 @@
+--- a/server/anchor_sr.py
++++ b/server/anchor_sr.py
+@@ -62,6 +62,48 @@
+ 
+ 
+ # --------------------------------------------------------------------------- #
++# R8-E2: cheap UNSHARP-MASK fallback fill (default OFF; `amount=0.0` -> byte-identical). The
++# occlusion-fallback band is filled by upscaling the CURRENT LR frame (the warp is invalid there);
++# the deployed fill is bicubic (temporally smooth but soft). R8-E2 measured that a light unsharp of
++# that bicubic fill beats bicubic on full-reference PSNR/SSIM/LPIPS (synthetic /2 ground truth) at
++# truth-matching temporal dF, and STRICTLY dominates the compact-SR escalation lever (which HURTS
++# PSNR on genuine high motion -- hallucinated detail -- and raises tOF ~60%). Cost ~+1.2 ms per
++# non-anchor (on-device blur+lerp) vs the ~31 ms 720p warp floor -> real-time held. It is read ONLY
++# at fallback pixels (perframe is consumed only there), changes NO mask/threshold, and touches no
++# anchor (anchors are full SR, not base_hd) -> the fallback band is the only output that differs.
++# --------------------------------------------------------------------------- #
++_UNSHARP_GAUSS = {}   # (sigma, device, channels) -> (kx, ky, pad) separable gaussian kernels
++
++
++def _gpu_unsharp(bic_t, amount, sigma):
++    """bic_t: [1,3,H,W] float (0..255) device tensor. out = clamp(bic + amount*(bic - blur))."""
++    import torch
++    import torch.nn.functional as F
++    c = bic_t.shape[1]
++    key = (round(float(sigma), 4), str(bic_t.device), c)
++    ker = _UNSHARP_GAUSS.get(key)
++    if ker is None:
++        r = max(1, int(3 * sigma + 0.5))
++        x = torch.arange(-r, r + 1, dtype=torch.float32, device=bic_t.device)
++        k = torch.exp(-(x * x) / (2 * sigma * sigma))
++        k = (k / k.sum())
++        kx = k.view(1, 1, 1, -1).expand(c, 1, 1, k.shape[-1]).contiguous()
++        ky = k.view(1, 1, -1, 1).expand(c, 1, k.shape[-1], 1).contiguous()
++        ker = (kx, ky, k.shape[-1] // 2)
++        _UNSHARP_GAUSS[key] = ker
++    kx, ky, pad = ker
++    b = F.conv2d(bic_t, kx, padding=(0, pad), groups=c)
++    b = F.conv2d(b, ky, padding=(pad, 0), groups=c)
++    return (bic_t + amount * (bic_t - b)).clamp_(0.0, 255.0)
++
++
++def _cpu_unsharp(bic_u8, amount, sigma):
++    """bic_u8: HxWx3 uint8. cv2 gaussian unsharp -> HxWx3 uint8."""
++    blur = cv2.GaussianBlur(bic_u8, (0, 0), float(sigma))
++    return cv2.addWeighted(bic_u8, 1.0 + float(amount), blur, -float(amount), 0)
++
++
++# --------------------------------------------------------------------------- #
+ # Lever 3: tile super-resolution -- SR only the bounding box of a frame's occlusion-fallback
+ # region. The SR there is consumed ONLY at fallback pixels (a backbone P reads pf at occ pixels;
+ # a B leaf overwrites all but the both-occluded pixels), so the rest of the frame never reads it.
+@@ -105,7 +147,7 @@
+ 
+ 
+ def build_anchor_cache(frames, w_hd, h_hd, sr_mode, occ_mode="adaptive", fallback_thresh=0.08,
+-                       tile=False, gpu_cache=False, thresh_fn=None):
++                       tile=False, gpu_cache=False, thresh_fn=None, unsharp=0.0, unsharp_sigma=1.0):
+     """HYBRID anchor cache (the instant-mode default). Runs the SR net on:
+       * the ANCHORS (I + first backbone), AND
+       * any non-anchor BACKBONE (I/P) frame whose LR occlusion-fallback fraction exceeds
+@@ -153,8 +195,14 @@
+     cache, tile_area = {}, []
+ 
+     def base_hd(i):
+-        return _gpu_bicubic(frames[i][1], w_hd, h_hd) if gpu_cache else \
+-            cv2.resize(frames[i][1], (w_hd, h_hd), interpolation=cv2.INTER_CUBIC)
++        # R8-E2 unsharp fallback fill: when `unsharp` > 0 the bicubic fill is lightly sharpened
++        # (read ONLY at occlusion-fallback pixels). unsharp == 0.0 (default) -> EXACTLY today's
++        # bicubic value on both the gpu_cache and cpu paths -> instant byte-identical.
++        if gpu_cache:
++            up = _gpu_bicubic(frames[i][1], w_hd, h_hd)
++            return _gpu_unsharp(up, unsharp, unsharp_sigma) if unsharp > 0.0 else up
++        up = cv2.resize(frames[i][1], (w_hd, h_hd), interpolation=cv2.INTER_CUBIC)
++        return _cpu_unsharp(up, unsharp, unsharp_sigma) if unsharp > 0.0 else up
+ 
+     def full_sr(i):
+         sr = _srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode)
+--- a/server/pipeline_api.py
++++ b/server/pipeline_api.py
+@@ -136,6 +136,19 @@
+ # cv2.resize + a full 9.8 MB HD host->device upload per frame -> kills reconstruct's upload_perframe.
+ INSTANT_GPU_CACHE = True
+ 
++# R8-E2 -- UNSHARP fallback fill (default OFF; amount 0.0 == byte-identical to today). The instant
++# occlusion-fallback band is filled by bicubic-upscaling the current LR frame (temporally smooth but
++# soft). R8-E2 measured that a LIGHT unsharp of that bicubic fill beats bicubic on full-reference
++# PSNR/SSIM/LPIPS (synthetic /2 ground truth) at truth-matching temporal dF, and STRICTLY dominates
++# the compact-SR escalation lever (INSTANT_MOTION_KEYED_FALLBACK): compact-SR HURTS PSNR on genuine
++# high motion (hallucinated detail: 27.7/29.5 dB vs bicubic 30.0/33.9) AND raises tOF ~60%, whereas
++# unsharp is fidelity-POSITIVE at ~+1.2 ms/non-anchor on-device (+~2.7% of the instant budget ->
++# real-time held) and tOF +1.5..6.7%. It is a sharper-vs-marginally-shimmerier TRADEOFF (so default
++# OFF, like the other instant quality levers); amount 0.5 is the measured knee. Instant-only (read
++# ONLY at fallback pixels; changes no mask/threshold/anchor) -> OFF -> byte-identical.
++INSTANT_FALLBACK_UNSHARP = 0.0          # unsharp amount on the bicubic fallback fill (0.0 = OFF). Knee ~0.5
++INSTANT_FALLBACK_UNSHARP_SIGMA = 1.0    # gaussian sigma (HD px) of the unsharp mask
++
+ # R3-E3 -- HF-only temporal-EMA soft-occlusion (default OFF). Replaces the hard patch_high_fallback
+ # SR-patch with a feathered, temporally-smoothed HF injection that escapes the high-motion
+ # tOF<->fallback% frontier (eff-bic 7.70->6.35% at tOF +2.0% vs the hard switch's +20%; verified
+@@ -1285,7 +1298,8 @@
+                     perframe_cache, _ac, sr_set = anchor_sr.build_anchor_cache(
+                         chunk, w_hd, h_hd, cfg["sr_mode"], occ_mode=cfg["occ"],
+                         fallback_thresh=INSTANT_FALLBACK_THRESH,
+-                        tile=INSTANT_TILE_SR, gpu_cache=INSTANT_GPU_CACHE, thresh_fn=tfn)
++                        tile=INSTANT_TILE_SR, gpu_cache=INSTANT_GPU_CACHE, thresh_fn=tfn,
++                        unsharp=INSTANT_FALLBACK_UNSHARP, unsharp_sigma=INSTANT_FALLBACK_UNSHARP_SIGMA)
+                     t_sr += time.perf_counter() - ts
+ 
+                     # 2) Lever 4: reconstruct GPU-resident (download_output=False) -- the HD recon
+--- a/server/progressive.py
++++ b/server/progressive.py
+@@ -278,7 +278,8 @@
+             perframe_cache, _ac, sr_set = anchor_sr.build_anchor_cache(
+                 chunk, self.w_hd, self.h_hd, cfg["sr_mode"], occ_mode=cfg["occ"],
+                 fallback_thresh=pipe.INSTANT_FALLBACK_THRESH,
+-                tile=pipe.INSTANT_TILE_SR, gpu_cache=pipe.INSTANT_GPU_CACHE)
++                tile=pipe.INSTANT_TILE_SR, gpu_cache=pipe.INSTANT_GPU_CACHE,
++                unsharp=pipe.INSTANT_FALLBACK_UNSHARP, unsharp_sigma=pipe.INSTANT_FALLBACK_UNSHARP_SIGMA)
+             _, R = derisk.reconstruct(
+                 chunk, None, self.eff_scale, True, cfg["occ"], perframe_cache, set(),
+                 backend=cfg["backend"], collect_metrics=False, download_output=False)

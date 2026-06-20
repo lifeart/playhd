@@ -503,6 +503,30 @@ def _apply_region_gate_np(R, N, region_gate, scale):
         R[i]["recon"] = _rq.blend_region_aware(R[i]["recon"], compact[i], a_lr, scale)
 
 
+def blend_anchor_cache(heavy_cache, compact_cache, beta):
+    """R8-E3 anchor output-pass (DEFAULT OFF -> byte-identical). IN-PLACE per-frame lerp of
+    the HEAVY (x4plus) anchor cache toward the COMPACT anchor:
+        heavy[i] <- compact[i] + beta*(heavy[i] - compact[i])
+    beta=None or >=1.0 -> unchanged x4plus. beta in [0,1) admixes compact to CANCEL x4plus's
+    MISALIGNED high-frequency detail (R6-E3's hallucination-cancel mechanism). R8-E3 measured
+    (TRUE AlexNet LPIPS, R6-E1 degrade-restore: 5 windows x {moderate=R5-E2 real, heavy,
+    gritty} + a real-libx264 OOD check): beta=0.85 is <= x4plus on EVERY cell and strictly
+    better on smooth/moderate-degrade content (mean -5.7%, smooth-moderate -8.9% LPIPS) with
+    ZERO regressions under either operator family; beta=0.50 (R6-E3) REGRESSES up to +0.0195
+    LPIPS on textured/gritty content. A LOCAL/degrade-adaptive beta is a measured NO-GO (it is
+    dominated by this global constant -- experiments/r8_e3_degrade_blend/REPORT.md). `compact_cache`
+    MUST be index-aligned with `heavy_cache` (both dict[int]->HxWx3 uint8 at HD); region_gate['compact']
+    already is. NB: measured on the ANCHOR only; the propagation/tOF effect is UNMEASURED -> default OFF."""
+    if beta is None or float(beta) >= 1.0 - 1e-9:
+        return heavy_cache
+    b = float(beta)
+    for i in list(heavy_cache.keys()):
+        h = heavy_cache[i].astype(np.float32)
+        c = compact_cache[i].astype(np.float32)
+        heavy_cache[i] = np.clip(np.round(c + b * (h - c)), 0, 255).astype(np.uint8)
+    return heavy_cache
+
+
 def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache, anchor_set,
                 backend="numpy", collect_metrics=True, download_output=True, region_gate=None):
     """Pure backbone+B reconstruction for an arbitrary ANCHOR SET (Step 4 re-anchoring).
@@ -1004,7 +1028,8 @@ def _build_region_gate(frames, w_hd, h_hd, scale, lo=0.2, hi=1.0, feather=61,
 
 def run(frames, hd_frames, scale, use_residual, out_dir, occ_mode="full", sr_mode="bicubic",
         reanchor="none", quality_margin=1.0, fallback_budget=1.0, adapt_metric="fallback",
-        perframe_cache=None, anchor_set=None, backend="numpy", grain="off", region_aware=False):
+        perframe_cache=None, anchor_set=None, backend="numpy", grain="off", region_aware=False,
+        anchor_blend_beta=None):
     """Single-run entry point: build the per-frame-SR cache, resolve the re-anchoring policy
     into an anchor set, reconstruct, then write CSV/samples/plots and compute tOF. Defaults
     (reanchor='none', anchor_set=None, backend='numpy') reproduce the Step-3 backbone exactly."""
@@ -1030,6 +1055,12 @@ def run(frames, hd_frames, scale, use_residual, out_dir, occ_mode="full", sr_mod
     # per-frame COMPACT source via the temporally-stable motion gate. The propagation chain stays
     # single-model (heavy = perframe_cache); the gate/compact only re-paint the OUTPUT copy.
     region_gate = (_build_region_gate(frames, w_hd, h_hd, scale) if region_aware else None)
+    # R8-E3 (DEFAULT OFF): blend the HEAVY anchor cache toward COMPACT at a global beta before
+    # propagation (reuses region_gate's compact cache -> zero extra SR). None -> byte-identical.
+    if anchor_blend_beta is not None:
+        _cc = region_gate["compact"] if region_gate is not None else \
+            build_perframe_cache(frames, w_hd, h_hd, "realesrgan")
+        blend_anchor_cache(perframe_cache, _cc, anchor_blend_beta)
     rows, R = reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache,
                           anchor_set, backend=backend, region_gate=region_gate)
 

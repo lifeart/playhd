@@ -109,62 +109,6 @@ INSTANT_MOTION_KEYED_FALLBACK = False
 INSTANT_FALLBACK_THRESH_HI = 0.20      # threshold used on high-motion frames when the flag is ON
 INSTANT_MOTION_GATE = 1.0              # mean LR-MV magnitude (px/frame) above which a frame is "high motion"
 
-# R8-E1 -- MOVING graphic-edge stabilization (default OFF). On the instant path (occ=reactive,
-# region_aware=False, anchor-only SR) the warped anchor's HF TEXT EDGES of a MOVING high-contrast
-# graphic (scrolling ticker / sliding lower-third) wobble frame-to-frame along the RD-optimal codec
-# MVs -- measured registered-dF 1.45-4.8x the per-frame-SR floor across 5 windows/motions, and NOT
-# routed to occlusion fallback (reactive fb 2.5-19%), so the pipeline does NOT self-heal it on
-# instant. When ON, pin the detected MOVING-bimodal-graphic pixels to a temporally-stable per-frame
-# COMPACT SR crop (registered-dF 0.486->0.274, ~1.8x steadier). DEFAULT OFF because: (1) QUALITY mode
-# already neutralizes this for free via the region-aware blend (a_lr~0.085 on the high-motion bar ->
-# output == compact per-frame SR; redundant there); (2) the EFFECTIVE pin costs ~one compact-SR crop
-# (~13% area) on graphic frames (a persistent ticker -> instant ~24->~17 fps); the zero-SR bicubic
-# pin is a wash at realistic 70% detector recall (0.471 vs 0.486); (3) like INSTANT_MOTION_KEYED_
-# FALLBACK above it trades tOF (which mildly FAVORS the smooth propagation) for the HF edge-flicker
-# metric. The detector REQUIRES non-zero motion, so it is BYTE-IDENTICAL on the static USACHEV card
-# (R1-E3 NO-GO preserved) and 0% on the talking-head face. Instant-only; OFF -> byte-identical.
-# See experiments/r8_e1_graphic_edge/REPORT.md.
-INSTANT_GRAPHIC_PIN = False
-INSTANT_GRAPHIC_BIMODAL_THR = 0.06     # min local min(white-frac,dark-frac) -> the FP guard (text only)
-INSTANT_GRAPHIC_MOTION_THR = 0.6       # min codec |MV| (LR px/frame); >0 EXCLUDES the static card
-
-
-def _graphic_pin_one(recon_t, frame, h_lr, w_lr, scale, sr_mode):
-    """OUTPUT-ONLY moving-graphic pin for ONE instant frame. Detects MOVING high-contrast bimodal
-    text (region_quality MV magnitude + a local bimodality FP guard), SRs only that bbox with the
-    compact net, and returns a NEW tensor with those pixels replaced (recon_t is never mutated, so
-    it cannot enter the reference chain). No-op (returns recon_t) when nothing fires. Seam: recon_t
-    is [1,3,H,W] on device; frame=(ptype, lr_rgb, mvs); base SR is uploaded to the same device."""
-    import numpy as _np
-    import cv2 as _cv2
-    import region_quality as _rq          # prototype, READ-ONLY (MV magnitude)
-    import sr as _sr                       # prototype, READ-ONLY (compact SR net)
-    lr = frame[1]
-    y = _cv2.cvtColor(lr, _cv2.COLOR_RGB2YCrCb)[:, :, 0].astype(_np.float32)
-    fb = _cv2.boxFilter((y > 235).astype(_np.float32), -1, (13, 13))
-    fd = _cv2.boxFilter((y < 20).astype(_np.float32), -1, (13, 13))
-    bm = _np.minimum(fb, fd)
-    mag, no_mv = _rq.motion_mag_lr(frame[2], h_lr, w_lr, want="all")
-    mag = _np.where(no_mv, 0.0, mag).astype(_np.float32)
-    region = (bm > INSTANT_GRAPHIC_BIMODAL_THR) & (mag > INSTANT_GRAPHIC_MOTION_THR)
-    region = _cv2.dilate(region.astype(_np.uint8),
-                         _cv2.getStructuringElement(_cv2.MORPH_ELLIPSE, (9, 9))) > 0
-    if not region.any():
-        return recon_t                     # byte-identical (static card / natural content)
-    ys, xs = _np.where(region)
-    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
-    crop_sr = _sr.upscale(_np.ascontiguousarray(lr[y0:y1, x0:x1]), model=sr_mode)  # compact SR crop
-    base_hd = _cv2.resize(lr, (w_lr * scale, h_lr * scale), interpolation=_cv2.INTER_CUBIC)
-    base_hd[y0 * scale:y1 * scale, x0 * scale:x1 * scale] = crop_sr[: (y1 - y0) * scale,
-                                                                    : (x1 - x0) * scale]
-    m_hd = _cv2.resize(region.astype(_np.uint8), (w_lr * scale, h_lr * scale),
-                       interpolation=_cv2.INTER_NEAREST).astype(bool)
-    import torch as _torch
-    base_t = _gpu_ops.img_to_dev(base_hd)
-    m_t = _torch.from_numpy(m_hd.astype("float32")).to(recon_t.device)[None, None]
-    return recon_t * (1.0 - m_t) + base_t * m_t     # NEW tensor; recon_t untouched
-
-
 # R4-E3 -- FALLBACK-SATURATION CAP (default ON, intra-gated). Fixes the low-light/noise real-time
 # cliff: noisy content makes the encoder intra-code ~99% of blocks -> ~95-99% occlusion-fallback on
 # EVERY frame -> all frames blow the 0.50 safeguard -> a full per-frame compact-SR runs for ZERO
@@ -288,17 +232,6 @@ MODE_CONFIG = {
                     grain_motion=True,             # E3 V2: freeze grain on static (region-gated) pixels,
                                                    # fresh per-frame grain only on motion -> removes the
                                                    # ~100% grain-induced static-region flicker.
-                    anchor_blend_beta=0.85,        # R8-E3 (ON): global compact<->x4plus anchor lerp
-                                                   # out = compact + 0.85*(x4plus-compact). <= x4plus on
-                                                   # every measured anchor cell (LPIPS -5.7% mean on
-                                                   # degraded content, DISTS-corroborated R8-E4), ZERO
-                                                   # extra SR (reuses region_gate['compact']). Flipped ON
-                                                   # after the integrated propagation+tOF A/B PASSED
-                                                   # (|dF| +-0.0%, tOF -0.1..-2.4% vs full x4plus -> adds
-                                                   # NO temporal flicker; V6: x4plus HF flickers more under
-                                                   # warp than compact). Win scales with input degradation
-                                                   # (the target: compressed low-scaled video); safely
-                                                   # neutral on already-clean SD. Set None to disable.
                     label="Quality (x4plus anchor, region-aware blend, grain)"),
 }
 
@@ -775,8 +708,6 @@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
     perframe_cache = derisk.build_perframe_cache(
         sub, w_hd, h_hd, cfg["sr_mode"], half=cfg.get("fp16", False))   # E4 fp16 anchor
     region_gate = derisk._build_region_gate(sub, w_hd, h_hd, SCALE)
-    if cfg.get("anchor_blend_beta") is not None:           # R8-E3 (OFF by default) -- zero extra SR
-        derisk.blend_anchor_cache(perframe_cache, region_gate["compact"], cfg["anchor_blend_beta"])
     grain_static_hd = (cv2.resize(region_gate["a_lr"], (w_hd, h_hd), interpolation=cv2.INTER_LINEAR)
                        if cfg.get("grain_motion") else None)            # E3 V2 motion gate
     _, R = derisk.reconstruct(
@@ -1410,12 +1341,6 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     #    emit an MV-interp MIDPOINT (output-only) BEFORE each real frame -> 2x output fps.
                     for i in range(len(chunk)):
                         recon_t = R[i]["recon"]                  # [1,3,H,W] float, GPU-resident (RAW)
-                        # ---- R8-E1 moving graphic-edge pin (default OFF; byte-identical when OFF).
-                        #      OUTPUT-ONLY: builds a NEW tensor, never writes R[] -> cannot enter the
-                        #      reference chain. Fires only on MOVING high-contrast bimodal text.
-                        if INSTANT_GRAPHIC_PIN:
-                            recon_t = _graphic_pin_one(recon_t, chunk[i], h_lr, w_lr, eff_scale,
-                                                       cfg["sr_mode"])
                         # ---- R7-E1 INSERTED midpoint (default OFF): the half-step that PRECEDES real
                         #      frame i. left = prev chunk's last recon (i==0) else R[i-1]['recon'] (RAW --
                         #      grain writes a NEW tensor, never mutates R[]); connecting field = frame i's
@@ -1467,9 +1392,6 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                 #    per-frame COMPACT source for the OUTPUT-only blend (this chunk's frames).
                 region_gate = (derisk._build_region_gate(chunk, w_hd, h_hd, SCALE)
                                if cfg["region_aware"] else None)
-                if cfg.get("anchor_blend_beta") is not None and region_gate is not None:
-                    derisk.blend_anchor_cache(perframe_cache, region_gate["compact"],
-                                              cfg["anchor_blend_beta"])   # R8-E3 OFF by default
                 # E3 V2: HD motion gate (1=static) for grain freezing -- reuse the region gate's a_lr.
                 grain_static_hd = None
                 if cfg.get("grain_motion") and region_gate is not None:

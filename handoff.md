@@ -937,6 +937,82 @@ byte-identical when off) — NOT landed (an unused flag whose payoff needs the t
 integrated propagation+tOF A/B before flipping default). Filed as a 2-part follow-up. Keep compact (never
 bicubic) as the low-detail fallback.
 
+## Research round R8 — 4 parallel Opus experiments: the QUALITY frontier (2026-06-20)
+
+A focused round on the one remaining frontier (R1–R7 closed the speed/UX levers): **upscale quality**.
+Four parallel Opus experiments, each READ-ONLY on `prototype/`+`server/`, each required to **adversarially
+refute its own win** before a GO (the discipline that caught R5-E2's false "compact ≥ x4plus"). Reports in
+`experiments/r8_*/REPORT.md`. The shape of the round is telling: **every framed hypothesis refuted; each
+experiment found a real adjacent result.** The lead then independently seam-verified (byte-identical-when-off
+via real `process_clip` md5 runs, not the agents' say-so) and ran the one measurement the experiments could
+not — the E3 propagation A/B — before deciding defaults.
+
+| # | experiment | framed hypothesis | outcome | shipped |
+|---|---|---|---|---|
+| **R8-E1** | moving graphic/text-edge shimmer (open V3) | pin moving high-contrast text | hypothesis real but **quality self-heals it** | `INSTANT_GRAPHIC_PIN` **default-OFF** |
+| **R8-E2** | high-motion instant @ real-time | clustered-tile SR / anchor budget | both **NO-GO**; unsharp fallback-fill GO | `INSTANT_FALLBACK_UNSHARP` **default-OFF** |
+| **R8-E3** | local-degrade-adaptive anchor blend | β adapts to local degrade | local **NO-GO**; global **β=0.85** wins | `anchor_blend_beta=0.85` **default-ON** |
+| **R8-E4** | perceptual metric triangulation (DISTS/VMAF) | does any decision rest on LPIPS alone? | **0/15** flips — DISTS confirms all | (validation; no patch) |
+
+**R8-E1 — moving graphic-edge shimmer is REAL but quality already self-heals it → default-OFF hook.** The
+open half of V3 (the *static* title card was a settled R1-E3 NO-GO — zero-MV skip-coded, anchor-reuse already
+out-stabilises). For *moving* high-contrast text (scrolling ticker / sliding lower-third), propagation shimmers
+at **1.45–4.8× the per-frame-SR floor** (registered-ΔF, motion-compensated, robust across 5 windows/motions,
+re-encoded H.264 so the RD-MVs are real). Instant does **not** self-heal it (reactive occlusion fallback only
+2.9% on integer-motion text). **BUT quality mode neutralises it for free**: the region-aware blend gives
+a_lr≈0.085 on the high-motion bar → output == compact per-frame SR → within 1.0–1.3× of floor (a quality-mode
+strength worth recording). The only *effective* instant fix (pin→compact-SR crop, 0.486→0.274) costs ~17 ms/
+graphic-frame (ticker clips ~24→17 fps) and trades tOF (which mildly favours the smooth propagation — it is
+blind to HF edge wobble); the free bicubic pin is a wash. Hence **`INSTANT_GRAPHIC_PIN=False`** (additions-only
+→ byte-identical OFF; detector requires |MV|>0.6 so byte-identical on the static USACHEV card, 0% on faces).
+Seam-verified end-to-end (ON path runs clean; OFF byte-identical, instant md5 `f517234a…` unchanged).
+
+**R8-E2 — clustered-tile SR + anchor-budget NO-GO; cheap unsharp fallback-fill GO (default-OFF).** The prior
+tile-SR NO-GO is now firmly settled with hard numbers: on real footage the occlusion-fallback mask gets **more
+scattered** as motion rises (extreme window 47.5% mean hole, 87–301 connected components, 77–99% of tiles
+touched even at 32×16) → the "fast object → tight band" premise is false → no bbox win. Anchor budget is also
+NO-GO (the weak spot is *occlusion holes*, not propagation drift — anchors can't fill them). **The real find:**
+a one-Gaussian **unsharp of the bicubic fallback fill** beats bicubic on **PSNR+SSIM+LPIPS** on every window
+(window A 31.05→32.56 dB, LPIPS 0.082→0.055) for **+1.19 ms/non-anchor (+2.7% of budget — real-time held,
+measured 70.1 vs 74.9 ms/frame, zero extra SR)**, and **strictly supersedes `INSTANT_SOFTOCC`** (which *hurts*
+PSNR on genuine high motion — hallucinated detail — and raises tOF ~60%). Cost: tOF +1.5–6.7% (it is sharper),
+so a sharpness-priority opt-in → **`INSTANT_FALLBACK_UNSHARP=0.0`** (knee 0.5). Wired on all three instant
+call sites (`pipeline_api` + `progressive.py` streaming); OFF byte-identical (`torch.equal` + md5).
+
+**R8-E3 — local-adaptive β NO-GO; global β=0.85 anchor blend WINS → flipped default-ON.** The framed
+local-adaptive β is a measured NO-GO: no cheap local signal (texture / LR-HF / compact-vs-x4plus disagreement)
+sees the *global* degrade level, which is the real discriminator — all three adaptive variants were dominated.
+The stronger result it surfaced: a **global fixed β=0.85** blend `out = compact + 0.85·(x4plus − compact)` is
+**≤ x4plus on all 15 cells** of the R6-E1 matrix (5 windows × 3 degrades) **and** a real-libx264 OOD check,
+**−5.7% mean / −8.9% smooth-moderate TRUE LPIPS**, **zero extra SR** (reuses `region_gate["compact"]`). This
+*closes R6-E3's open item*: the fix for "fixed-0.5 loses on gritty" was a more conservative constant (β=0.50
+regresses up to +0.0195 LPIPS on textured/gritty; β=0.85 does not, under either operator family), not adaptivity.
+**The lead then ran the integrated propagation+tOF A/B the experiment named as its one gate** (grain-off quality,
+β=None vs β=0.85, real `process_clip`, short.mp4 + sample.mp4): **|ΔF| ±0.0%, tOF −0.1…−2.4%** — pre-blending the
+anchor adds **zero** temporal flicker (slightly less, exactly as V6 predicts: x4plus's hallucinated HF flickers
+more under warp than compact). With the gate passed, anchor-quality ≤ x4plus everywhere, DISTS-corroborated
+(E4), and zero cost, **`anchor_blend_beta` was flipped to 0.85 default-ON for quality mode** (and the layered
+moving-scene fallback). Honest magnitude note: the win **scales with input degradation** (the target —
+compressed low-scaled video); on already-clean SD the blend is near-inert (~0.06 codes) but safely neutral.
+
+**R8-E4 — DISTS triangulation CONFIRMS every LPIPS decision (0/15 flips); the quality program does not rest on
+LPIPS alone.** Added the texture-sensitive full-reference metric **DISTS** (via `pyiqa 0.1.15`, validity gate
+passed: identity 1.8e-7, monotone with blur) alongside the project's AlexNet LPIPS + PSNR, and re-ran R6-E1's
+matrix (5 windows × 3 degrades × {compact, x4plus, +0.5 blend}) + the grain A/B. **0/15 hard disagreements:**
+DISTS independently credits **x4plus > compact on 8/9 textured cells** (the worry that LPIPS over-credits
+x4plus's texture is refuted → keep x4plus); DISTS rises monotonically with grain → **grain-OFF-for-fidelity
+confirmed**; instant=compact confirmed. One cross-experiment signal: DISTS likes the blend *even more* than
+LPIPS but flagged a **denoise confound at the aggressive β=0.50** (PSNR rises everywhere) — which is exactly why
+E3's chosen **β=0.85** wins LPIPS on textured cells where PSNR is *lower* than x4plus (aligned detail, not
+denoise): the two experiments triangulate consistently. **VMAF could not run** (no libvmaf in PyAV, broken
+ffmpeg CLI, no pip wheel) — documented, not blocked on (it is compression-trained/secondary anyway).
+
+**R8 net:** one quality DEFAULT improved (quality mode β=0.85 anchor blend, propagation-verified, zero-cost),
+two validated default-OFF opt-ins (unsharp high-motion fill; moving-graphic pin), one independent
+metric-triangulation that **de-risks the entire quality program** (DISTS agrees with LPIPS on every shipped
+call). Every framed hypothesis was refuted and each experiment still produced a real result — the frontier is
+now genuinely thin (default-OFF opt-ins with honest tradeoffs + a strong "the existing decisions are correct").
+
 ## Default-flag audit — why each is ON/OFF (speed × accuracy × quality)
 
 A deliberate pass over every optional flag (the goal is speed AND accuracy AND quality — flags are only
@@ -945,6 +1021,7 @@ of over-caution); the rest are justified.
 
 | flag | default | reason |
 |---|---|---|
+| **`anchor_blend_beta` (quality, R8-E3)** | **0.85 ON (flipped)** | global compact↔x4plus anchor lerp. ≤ x4plus on every measured anchor cell (LPIPS −5.7% mean on degraded content, DISTS-corroborated R8-E4), **zero extra SR**, and the integrated propagation+tOF A/B PASSED (\|ΔF\| ±0.0%, tOF −0.1…−2.4% → adds no flicker; V6: x4plus HF flickers more under warp than compact). The one reason it was OFF (unmeasured propagation) is now measured. Win scales with input degradation (the target); safely neutral on clean SD. **Quality win, on.** |
 | fp16 (quality x4plus) | **ON** | free ~1.23× + perceptually identical (LPIPS(fp16,fp32) ~0.00003, verified R2-E4 + R5-E2). **Speed win, on.** |
 | V2 motion-grain (quality) | **ON** | static-region grain flicker → ~0; **quality win, on.** |
 | layered seam fix (`LAYERED_SEAM_FIX`) | **ON** | strict win (seam → uniform-x4plus ceiling, subject core untouched); **quality win, on.** |
@@ -952,15 +1029,18 @@ of over-caution); the rest are justified.
 | **low-light saturation cap** (`INSTANT_FALLBACK_SATURATION_CAP=0.70`) | **ON (flipped)** | fixes the 3.9× noise real-time cliff. Re-gated on **intra-fraction > 0.8** (the encoder intra-codes ~99% on noise = nothing to propagate) instead of the crude motion gate → fires ONLY on true noise, byte-identical on title-reveals + clean content (verified). **Speed win, now on.** |
 | fp16 (instant compact) | off | instant SR is anchor-only ~8 ms — NOT the bottleneck (the 3.3 MP warp is); fp16 on the compact net is only ~1.15× → <1 ms/frame. Negligible; not worth a 2nd precision path. |
 | motion-keyed fallback (`INSTANT_MOTION_KEYED_FALLBACK`) | off | **REAL tradeoff, not caution:** on high motion it lowers bicubic-fallback% but RAISES tOF (E2: bicubic fallback is tOF-optimal — sharper-but-shimmerier). The fast tier should stay STEADY; for max sharpness use the quality mode. |
-| HF-EMA soft-occlusion (`INSTANT_SOFTOCC`) | off | **REAL speed tradeoff:** the *better* high-motion quality lever (escapes the tOF↔fallback frontier) but costs ~1 compact-SR per non-anchor frame → erases the anchor-only speedup → breaks instant real-time. Off keeps instant real-time; available for a sharpness-priority instant render. |
+| HF-EMA soft-occlusion (`INSTANT_SOFTOCC`) | off | **REAL speed tradeoff:** the *better* high-motion quality lever (escapes the tOF↔fallback frontier) but costs ~1 compact-SR per non-anchor frame → erases the anchor-only speedup → breaks instant real-time. **R8-E2 SUPERSEDES it** for high-motion sharpness (unsharp fill is fidelity-positive AND real-time). Off. |
+| **unsharp fallback fill (`INSTANT_FALLBACK_UNSHARP`, R8-E2)** | off | sharpens the instant occlusion-fallback bicubic band: beats bicubic on PSNR+SSIM+LPIPS at **+1.2 ms/non-anchor (real-time held), zero extra SR**, and strictly dominates `INSTANT_SOFTOCC`. But it is a sharper-vs-marginally-shimmerier TRADEOFF (tOF +1.5–6.7%), so default-OFF like the other instant sharpness levers (the fast tier stays STEADY; opt-in for a sharpness-priority instant render). Knee 0.5. |
+| **moving graphic-edge pin (`INSTANT_GRAPHIC_PIN`, R8-E1)** | off | stabilises *moving* high-contrast text (ticker/lower-third) on instant (registered-ΔF 0.486→0.274). Default-OFF because (1) **quality mode already self-heals it for free** (region-aware blend → output==compact there); (2) the effective pin costs ~17 ms/graphic-frame (ticker ~24→17 fps); (3) it trades tOF. Byte-identical OFF + static-card-safe (needs \|MV\|>0.6). A capability for ticker-heavy instant renders. |
 | smooth-2× interpolation (`INSTANT_INTERP_2X`) | off (UI toggle) | doubling fps ~halves throughput; whether you want 2× fps is a USER preference (a render option), so it is an explicit checkbox, not a silent default. |
 | texture-gate (`texture_aware` on `_build_region_gate`) | off | its main value was the COMPUTE saving, which needs a tiled x4plus pass (assessed marginal: tiling-bound, and the big saving is on smooth content that Auto routes to layered/instant, not quality). As a pure OUTPUT tweak it's a small/narrow quality gain (changes quality output → needs a tOF A/B). Honestly marginal; flag kept (default-OFF, byte-identical) for the follow-up. |
 | tile-SR (`INSTANT_TILE_SR`) | off | measured NO win — on real footage the occlusion fallback is spatially scattered so a bbox covers ~97% of the frame. |
 
-**Net:** speed/accuracy/quality wins are ON (fp16-quality, V2 grain, seam fix, progressive, low-light cap);
-the OFF flags are genuine tier-specific tradeoffs (motion-keyed / soft-occlusion = sharper-but-slower-or-
-shimmerier; right for the real-time tier), explicit user choices (smooth-2×), a measured no-win (tile-SR),
-or an honestly-marginal residual (texture-gate without the killed tile-skip). Nothing valuable is buried OFF.
+**Net:** speed/accuracy/quality wins are ON (fp16-quality, V2 grain, seam fix, progressive, low-light cap,
+**R8-E3 anchor blend β=0.85**); the OFF flags are genuine tier-specific tradeoffs (motion-keyed / soft-occ /
+**R8-E2 unsharp** = sharper-but-shimmerier, right for the real-time tier; **R8-E1 graphic-pin** = redundant
+with quality mode + a throughput cost), explicit user choices (smooth-2×), a measured no-win (tile-SR), or an
+honestly-marginal residual (texture-gate without the killed tile-skip). Nothing valuable is buried OFF.
 
 ## UX finishing — Auto-streams, robust playback, UI polish (post-R7, 2026-06-20)
 

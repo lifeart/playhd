@@ -49,6 +49,30 @@
 >   plate-validity guard (composite-vs-LR consistency → auto-fallback) + a chroma/structural term in the
 >   cut detector. Other modes unaffected. Quality cliffs: instant on low-light noise (3.6× slower) and on
 >   high motion (tOF 3.18). See `experiments/r3_e2_robustness/REPORT.md`.
+>
+> **UPDATE — research round R8 (the QUALITY frontier; see `handoff.md` → "## Research round R8" +
+> `experiments/r8_*/REPORT.md`):** 4 parallel Opus experiments; every framed hypothesis refuted, each found a
+> real adjacent result; lead independently seam-verified (byte-identical-when-off via real `process_clip` md5)
+> + ran the one measurement the experiments couldn't.
+> - ✅ **R8-E3 anchor blend — DONE, flipped default-ON (`anchor_blend_beta=0.85`):** global compact↔x4plus
+>   anchor lerp `compact + 0.85·(x4plus−compact)`, ≤ x4plus on every measured cell (TRUE LPIPS −5.7% mean on
+>   degraded content, OOD-checked, DISTS-corroborated by R8-E4), **zero extra SR**. The integrated
+>   propagation+tOF A/B (the named gate) PASSED — |ΔF| ±0.0%, tOF −0.1…−2.4% → no added flicker. **Closes
+>   R6-E3's open item** (β=0.50 was too aggressive; the gritty regression was a too-aggressive-constant, not a
+>   need for adaptivity — local degrade-adaptive β was a measured NO-GO). Win scales with input degradation
+>   (the target: compressed low-scaled video); neutral-safe on already-clean SD.
+> - ◻ **V3 graphic/text shimmer — characterized + a default-OFF instant hook (`INSTANT_GRAPHIC_PIN`, R8-E1):**
+>   moving high-contrast text DOES shimmer under propagation (1.45–4.8× the per-frame-SR floor) and instant
+>   does not self-heal it — **but QUALITY mode already neutralizes it for free** (region-aware blend → compact
+>   there). So V3's *moving* case is handled by routing to quality, not a new default; the instant pin is a
+>   ticker-render opt-in (throughput + tOF tradeoff). The static-title-card case stays the settled R1-E3 NO-GO.
+> - ◻ **High-motion instant (standing weak spot) — `INSTANT_FALLBACK_UNSHARP` default-OFF (R8-E2):** clustered-
+>   tile SR + anchor-budget both NO-GO (the fallback mask gets *more* scattered with motion; the weak spot is
+>   occlusion holes, not drift). A cheap unsharp of the bicubic fallback fill beats bicubic on PSNR+SSIM+LPIPS
+>   at +1.2 ms/non-anchor (real-time held) and **supersedes `INSTANT_SOFTOCC`**; default-OFF (sharper-vs-shimmerier).
+> - ✅ **Metric triangulation (R8-E4):** DISTS (texture-aware FR) CONFIRMS every LPIPS-based decision — **0/15
+>   flips** (x4plus>compact on textured, grain-OFF-for-fidelity, instant=compact all re-confirmed). The quality
+>   program does not rest on LPIPS alone. VMAF could not run (no libvmaf; documented).
 
 Performance + visual-quality "poke", 2026-06-19. Read-only analysis of existing code, the
 documented Step 6/7 profiling, and the shipped `server/outputs/*.mp4`, plus light new

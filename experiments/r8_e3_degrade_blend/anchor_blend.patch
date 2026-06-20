@@ -1,0 +1,103 @@
+R8-E3 integration: a GLOBAL fixed-beta anchor blend for quality/layered mode.
+DEFAULT-OFF -> byte-identical (anchor_blend_beta absent/None skips the blend entirely;
+region_aware and every other path unchanged). This is NOT the local-adaptive-beta the
+thread set out to land (that is a measured NO-GO -- see REPORT.md); it is the simpler,
+stronger result the experiment surfaced: out = compact + beta*(x4plus - compact) with a
+single global beta=0.85 is <= x4plus on EVERY (window x degrade) cell of the R6-E1 matrix
+(5 windows x 3 operators) AND on a real-H.264 OOD spot-check, strictly better on
+smooth/moderate-degrade content (mean -5.7%, smooth-moderate -8.9% TRUE LPIPS). It closes
+R6-E3's filed open item: the fix for "fixed-0.5 loses on gritty" is a more conservative
+constant (0.85), not adaptivity. beta=0.50 (R6-E3) regresses up to +0.0195 LPIPS on
+textured/gritty content; 0.85 does not regress under either operator family.
+
+Cost: the COMPACT anchor cache already exists (region_gate["compact"], built for the
+region-aware output blend) -> the blend is ONE per-frame CPU lerp, ZERO extra SR.
+
+SEAM (verified by verify_patch.py): caller `derisk.blend_anchor_cache(perframe_cache,
+region_gate["compact"], beta)` -> handler `def blend_anchor_cache(heavy_cache,
+compact_cache, beta)`; both caches are dict[int]->HxWx3 uint8 at HD, identical keys,
+identical shapes; in-place, returns the same dict. blend math == the measured eval math.
+
+NB (honest scope, same discipline as R6-E3/R7-E2): the win is measured on the ANCHOR
+(single-frame degrade-restore SR, TRUE LPIPS). The propagation/temporal (tOF) effect of
+pre-blending anchors before MV warp is UNMEASURED -> ship default-OFF, flip to 0.85 only
+after an integrated propagation+tOF A/B.
+
+================================================================================
+--- a/prototype/derisk.py
++++ b/prototype/derisk.py
+@@ def _apply_region_gate_np(R, N, region_gate, scale):
+     import region_quality as _rq
+     a_lr, compact = region_gate["a_lr"], region_gate["compact"]
+     for i in range(N):
+         R[i]["recon"] = _rq.blend_region_aware(R[i]["recon"], compact[i], a_lr, scale)
+
+
++def blend_anchor_cache(heavy_cache, compact_cache, beta):
++    """R8-E3 anchor output-pass (DEFAULT OFF -> byte-identical). IN-PLACE per-frame lerp of
++    the HEAVY (x4plus) anchor cache toward the COMPACT anchor:
++        heavy[i] <- compact[i] + beta*(heavy[i] - compact[i])
++    beta=None or >=1.0 -> unchanged x4plus. beta in [0,1) admixes compact to CANCEL x4plus's
++    MISALIGNED high-frequency detail (R6-E3's hallucination-cancel mechanism). R8-E3 measured
++    (TRUE AlexNet LPIPS, R6-E1 degrade-restore: 5 windows x {moderate=R5-E2 real, heavy,
++    gritty} + a real-libx264 OOD check): beta=0.85 is <= x4plus on EVERY cell and strictly
++    better on smooth/moderate-degrade content (mean -5.7%, smooth-moderate -8.9% LPIPS) with
++    ZERO regressions under either operator family; beta=0.50 (R6-E3) REGRESSES up to +0.0195
++    LPIPS on textured/gritty content. A LOCAL/degrade-adaptive beta is a measured NO-GO (it is
++    dominated by this global constant -- REPORT.md). `compact_cache` MUST be index-aligned with
++    `heavy_cache` (both dict[int]->HxWx3 uint8 at HD); region_gate['compact'] already is.
++    NB: measured on the ANCHOR only; the propagation/tOF effect is UNMEASURED -> default OFF."""
++    if beta is None or float(beta) >= 1.0 - 1e-9:
++        return heavy_cache
++    b = float(beta)
++    for i in list(heavy_cache.keys()):
++        h = heavy_cache[i].astype(np.float32)
++        c = compact_cache[i].astype(np.float32)
++        heavy_cache[i] = np.clip(np.round(c + b * (h - c)), 0, 255).astype(np.uint8)
++    return heavy_cache
++
++
+ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache, anchor_set,
+                 backend="numpy", collect_metrics=True, download_output=True, region_gate=None):
+
+@@ def run(frames, hd_frames, scale, use_residual, out_dir, occ_mode="full", sr_mode="bicubic",
+-        reanchor="none", quality_margin=1.0, fallback_budget=1.0, adapt_metric="fallback",
+-        perframe_cache=None, anchor_set=None, backend="numpy", grain="off", region_aware=False):
++        reanchor="none", quality_margin=1.0, fallback_budget=1.0, adapt_metric="fallback",
++        perframe_cache=None, anchor_set=None, backend="numpy", grain="off", region_aware=False,
++        anchor_blend_beta=None):
+@@
+     region_gate = (_build_region_gate(frames, w_hd, h_hd, scale) if region_aware else None)
++    # R8-E3 (DEFAULT OFF): blend the HEAVY anchor cache toward COMPACT at a global beta before
++    # propagation (reuses region_gate's compact cache -> zero extra SR). None -> byte-identical.
++    if anchor_blend_beta is not None:
++        _cc = region_gate["compact"] if region_gate is not None else \
++            build_perframe_cache(frames, w_hd, h_hd, "realesrgan")
++        blend_anchor_cache(perframe_cache, _cc, anchor_blend_beta)
+     rows, R = reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache,
+                           anchor_set, backend=backend, region_gate=region_gate)
+
+================================================================================
+--- a/server/pipeline_api.py
++++ b/server/pipeline_api.py
+@@ MODE_CONFIG = {
+     "quality": dict(sr_mode="realesrgan-x4plus",   # heavy RRDBNet x4plus (~2.2 s/frame, +61% sharper)
+                     ...
+                     region_aware=True,             # OUTPUT-only motion-gated heavy/compact blend
++                    anchor_blend_beta=None,        # R8-E3 DEFAULT OFF (set 0.85 after an integrated
++                                                   # propagation+tOF A/B): global compact<->x4plus
++                                                   # anchor lerp, <= x4plus on every measured cell.
+                     ...),
+ }
+
+@@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
+     region_gate = derisk._build_region_gate(sub, w_hd, h_hd, SCALE)
++    if cfg.get("anchor_blend_beta") is not None:           # R8-E3 (OFF by default) -- zero extra SR
++        derisk.blend_anchor_cache(perframe_cache, region_gate["compact"], cfg["anchor_blend_beta"])
+
+@@ def process_clip(...):  # quality chunk loop
+                 region_gate = (derisk._build_region_gate(chunk, w_hd, h_hd, SCALE)
+                                if cfg["region_aware"] else None)
++                if cfg.get("anchor_blend_beta") is not None and region_gate is not None:
++                    derisk.blend_anchor_cache(perframe_cache, region_gate["compact"],
++                                              cfg["anchor_blend_beta"])   # R8-E3 OFF by default
