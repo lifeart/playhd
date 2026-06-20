@@ -305,9 +305,20 @@ $("go").onclick = async () => {
   $("bar").style.width = "0%";
   $("progressText").textContent = "starting…";
 
-  // Opt-in progressive play-while-process (instant only). Default OFF so instant keeps the proven
-  // buffered path; the streaming path is server-verified but browser fMP4 support varies.
-  if (selectedMode === "instant" && $("stream").checked) { return runStreaming(btn); }
+  // Progressive play-while-process. Triggers for explicit Instant, AND for Auto when the cheap
+  // probe resolves to instant (so the DEFAULT "Auto" plays-while-processing too, not just Instant).
+  // Quality/Layered (and Auto resolving to them) use the buffered path below -- they aren't real-time.
+  if ($("stream").checked && (selectedMode === "instant" || selectedMode === "auto")) {
+    if (selectedMode === "instant") { return runStreaming(btn); }
+    if (!$("file").files[0]) {                          // Auto + server-side source: probe the mode
+      try {
+        const rec = await fetch("/api/recommend?source=" + encodeURIComponent($("source").value))
+                          .then((r) => r.json());
+        if (rec.mode === "instant") { setStatus("Auto → <b>instant</b> — streaming…"); return runStreaming(btn); }
+        setStatus(`Auto → <b>${rec.mode}</b> — rendering (this mode isn't streamed live).`);
+      } catch (e) { /* probe failed -> fall through to the buffered path */ }
+    }
+  }
 
   let modeNote = ".";
   if (selectedMode === "auto") modeNote = " — analyzing content (~2 s) to pick the best mode…";

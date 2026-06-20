@@ -126,6 +126,19 @@ async def api_process(
     return JSONResponse({"url": url, "source": src_name, "stats": stats})
 
 
+@app.get("/api/recommend")
+def api_recommend(source: str = "sample.mp4"):
+    """Cheap probe -> which mode Auto would pick (instant|quality|layered) + why. Lets the client
+    route an Auto job to the PROGRESSIVE /api/stream path when Auto resolves to instant (so 'Auto'
+    plays-while-processing too, not just an explicit 'Instant')."""
+    try:
+        input_path = pipe.resolve_source(source)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    rec = pipe.recommend_mode(input_path)
+    return {"mode": rec.mode, "reason": rec.reason}
+
+
 @app.post("/api/upload")
 async def api_upload(file: UploadFile = File(...)):
     """Save an uploaded mp4 to uploads/ and return its name, so the progressive GET /api/stream
