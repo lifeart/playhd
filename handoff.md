@@ -907,6 +907,36 @@ halfway to compact, so on the **heavy/gritty textured** content where x4plus's f
 the blend would *pull back* that HF and lose — so it is **NOT a safe quality default** (it helps moderate
 degrade, hurts gritty). Filed as a content/degrade-adaptive option, not landed.
 
+## Research round R7 — ship the last feature + a quality-mode optimization (2026-06-20)
+
+A lean 2-experiment round. Reports in `experiments/r7_*/REPORT.md`.
+
+**R7-E1 — INTEGRATED + verified: "smooth 2×" MV interpolation (default-OFF).** The validated R4-E2
+interpolation, landed for real: `server/interp_pass.py` (new) + a 2-flag wire in
+`server/pipeline_api.py::process_clip` (`INSTANT_INTERP_2X=False`, `INTERP_CUT_THRESH=0.5`). When ON, the
+instant fast path inserts one MV-reuse midpoint between consecutive output frames → 2× output fps. **Lead-
+verified through the real `process_clip`:** OFF is **byte-identical** (the whole output mp4 md5 is unchanged
+`ef8d4835405a` + 40/40 frame hashes), so instant/quality/layered cannot regress; ON gives exactly 2× frames
+at 2× fps with a valid audio-synced mp4; the midpoint is output-only (never enters `R[]`, never called when
+OFF); the scene-cut guard duplicates the last real frame (no ghost) at the I-frame boundary. Both R4-E2
+ship-blockers (intra-hole-only routing, cut guard) intact. Optional follow-up: a UI toggle (a `smooth_2x`
+param on `app.py`'s `process_clip` call; it ~halves instant throughput so it's a render option, not real-time).
+
+**R7-E2 — texture-gated region-aware blend: GO (quality-safe), validated-ready, NOT landed.** Acting on
+R6-E1 (x4plus only wins on TEXTURED content): a texture term `a' = a_motion · a_texture` (texture = the FREE
+local-std of the already-computed compact source) routes the heavy x4plus only where static AND textured.
+**Quality-safe + slightly BETTER:** on the static-but-smooth talking-head face it IMPROVES LPIPS by ~0.02
+(fixes the motion-only gate over-applying misaligned heavy HF, exactly R6-E1's prediction) and cuts the
+effective heavy-SR fraction 74%→~12%; on detailed graphics it's neutral (LPIPS ±0.001, heavy kept ~28%).
+**BUT the compute win is NOT realized by the flag alone** — today the gate is an OUTPUT-ONLY blend (both
+heavy + compact are already computed), so it only changes output; the real saving needs a **follow-up
+tile-skip wiring** (run the x4plus anchor SR only on textured-static tiles), and the saving is tiling-bound
+(scattered talking-head texture → ideal −83%, coarse 16–32px tiles only −18 to −33%). Delivered as a
+**default-OFF `texture_aware` flag** diff (`experiments/r7_e2_texgate/derisk_build_region_gate.patch`,
+byte-identical when off) — NOT landed (an unused flag whose payoff needs the tile-skip follow-up + an
+integrated propagation+tOF A/B before flipping default). Filed as a 2-part follow-up. Keep compact (never
+bicubic) as the low-detail fallback.
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a

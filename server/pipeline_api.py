@@ -83,6 +83,7 @@ import background_plate as _bp    # noqa: E402  (AUTO mode: static-vs-moving cam
 import anchor_sr                 # noqa: E402  (Lever 1: anchor-only SR cache + adaptive safeguard)
 import fast_grain                # noqa: E402  (GPU/MPS film grain)
 import pipe_encode               # noqa: E402  (Lever 2: threaded encode + chunk prefetch overlap)
+import interp_pass               # noqa: E402  (R7-E1: "smooth 2x" MV-reuse frame interpolation, default OFF)
 try:
     import gpu_ops as _gpu_ops   # noqa: E402  (Lever 4: GPU-resident recon -> single host download)
 except Exception:
@@ -146,6 +147,22 @@ SOFTOCC_GAIN = 0.6
 SOFTOCC_BETA = 0.85
 SOFTOCC_FEATHER = 31
 SOFTOCC_MOTION_GATE = None
+
+# R7-E1 -- "SMOOTH 2x" MV-reuse frame interpolation (default OFF). When ON, the instant fast path emits
+# a motion-compensated MIDPOINT before each real recon frame -- it warps BOTH neighbours by the codec
+# 'past' MV field we ALREADY extract (build_lr_flow) + an intra-hole-only blend (interp_pass) -- which
+# DOUBLES the output frame rate (out_fps = fps*2). It is OUTPUT-ONLY: it only READS R[t]['recon'] AFTER
+# reconstruct() returns and emits an EXTRA frame between neighbours; the midpoint is NEVER stored back
+# into R[] so it can never become a propagation reference (GOTCHA #16). Two NON-optional ship-blockers
+# baked into interp_pass and verified in experiments/r4_e2_interp_wire: (1) intra-hole routing ONLY (the
+# full Ruder/reactive mask over-flags large motion -> re-ghosts); (2) scene-cut guard -- a connecting
+# field whose intra-hole fraction exceeds INTERP_CUT_THRESH (scene cut / chaotic intro) -> FRAME-DUP, not
+# a ghosting blend. Quality reproduces R3-E1 exactly (+3.6..+8.9 dB PSNR over dup/linear-blend). Instant-
+# ONLY; OFF -> n_emit==done, out_fps==fps, real-frame grain seed unchanged -> BYTE-IDENTICAL to today.
+# NOTE: NOT free real-time -- ~halves instant throughput (2 warps + blend per inserted frame).
+INSTANT_INTERP_2X = False
+INTERP_CUT_THRESH = 0.5                 # intra-hole fraction above which the midpoint DUPLICATES (cut guard)
+_MID_GRAIN_SEED_BASE = 1 << 20          # midpoint grain seeds live ABOVE real-frame seeds (no collision)
 
 SAMPLE_MP4 = os.path.join(_REPO, "sample.mp4")
 OUTPUTS_DIR = os.path.join(_HERE, "outputs")
@@ -1200,13 +1217,23 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
         # untouched (HW encode is scoped to instant so quality/layered cannot regress).
         fast = (mode == "instant" and cfg["backend"] == "torch" and _gpu_ops is not None)
         eff_scale = INSTANT_SCALE if fast else SCALE   # instant=720p (x2), quality=QHD (x4)
+        # R7-E1: "smooth 2x" is instant-fast-path-only + default OFF. When ON, every real frame is
+        # preceded by an MV-interp midpoint -> the encoded stream carries 2x the frames and must run at
+        # DOUBLE fps (out_fps) so it plays back over the SAME wall-clock duration (audio stays in sync).
+        # OFF -> smooth is False -> out_fps==fps and the loop below never inserts a frame (byte-identical).
+        smooth = fast and INSTANT_INTERP_2X
+        out_fps = fps * 2 if smooth else fps
 
-        writer = _VideoWriter(video_tmp, fps, codec=(None if fast else "libx264"))
+        writer = _VideoWriter(video_tmp, out_fps, codec=(None if fast else "libx264"))
         if fast:
             # Lever 2: encode on a worker thread so the VideoToolbox media engine runs frame i
             # while the GPU produces frame i+1 (the encode no longer sits on the critical path).
             writer = pipe_encode.ThreadedEncoder(writer, maxsize=8)
         done = 0
+        n_emit = 0                          # R7-E1: TOTAL frames written (real + inserted); == done when OFF
+        interp_carry = None                 # R7-E1: previous chunk's LAST recon (cross-chunk midpoint left)
+        mid_count = 0                       # R7-E1: inserted-frame counter (midpoint grain seed offset)
+        n_interp = n_interp_dup = 0         # R7-E1: inserted total / how many fell back to a duplicate
         n_chunks = 0
         w_lr = h_lr = w_hd = h_hd = None
         t_sr = t_recon = t_grain = t_encode = 0.0
@@ -1281,19 +1308,46 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                         ggrain = fast_grain.GpuGrain(h_hd, w_hd, _gpu_ops.device())
 
                     # 4) Lever 2 grain on-device + the single GPU->host download (HW encode needs
-                    #    a CPU frame) + Lever 3 HW encode, then free the chunk.
+                    #    a CPU frame) + Lever 3 HW encode, then free the chunk. R7-E1: when `smooth`,
+                    #    emit an MV-interp MIDPOINT (output-only) BEFORE each real frame -> 2x output fps.
                     for i in range(len(chunk)):
-                        recon_t = R[i]["recon"]                  # [1,3,H,W] float, GPU-resident
+                        recon_t = R[i]["recon"]                  # [1,3,H,W] float, GPU-resident (RAW)
+                        # ---- R7-E1 INSERTED midpoint (default OFF): the half-step that PRECEDES real
+                        #      frame i. left = prev chunk's last recon (i==0) else R[i-1]['recon'] (RAW --
+                        #      grain writes a NEW tensor, never mutates R[]); connecting field = frame i's
+                        #      codec 'past' MV (reused, zero new flow). OUTPUT-ONLY: reads R[], never
+                        #      writes it, so it is structurally incapable of entering the ref chain.
+                        if smooth:
+                            left = interp_carry if i == 0 else R[i - 1]["recon"]
+                            if left is not None:
+                                fx, fy = interp_pass.connecting_flow(
+                                    chunk, i, h_lr, w_lr, _build_lr_flow=derisk.build_lr_flow)
+                                mid_t, minfo = interp_pass.midpoint_torch(
+                                    left, recon_t, fx, fy, eff_scale,
+                                    cut_thresh=INTERP_CUT_THRESH, _G=_gpu_ops)
+                                if cfg["grain"] != "off":
+                                    mid_t = ggrain.apply(mid_t, _MID_GRAIN_SEED_BASE + mid_count,
+                                                         cfg["grain"])
+                                writer.write(fast_grain.download_rgb(mid_t))
+                                n_emit += 1
+                                mid_count += 1
+                                n_interp += 1
+                                if minfo["duplicated"]:
+                                    n_interp_dup += 1
+                        # ---- real frame i (UNCHANGED from today's pipeline; grain seed == done) ----
                         tg = time.perf_counter()
-                        if cfg["grain"] != "off":
-                            recon_t = ggrain.apply(recon_t, done, cfg["grain"])
-                        recon = fast_grain.download_rgb(recon_t)  # contiguous-HWC GPU->host (~5x)
+                        rt = ggrain.apply(recon_t, done, cfg["grain"]) if cfg["grain"] != "off" else recon_t
+                        recon = fast_grain.download_rgb(rt)       # contiguous-HWC GPU->host (~5x)
                         t_grain += time.perf_counter() - tg
                         te = time.perf_counter()
                         writer.write(recon)
                         t_encode += time.perf_counter() - te
                         done += 1
+                        n_emit += 1
                         _emit()
+                    # R7-E1: carry THIS chunk's last recon (clone BEFORE freeing R) so the NEXT chunk's
+                    #        first frame interpolates from it. None when OFF -> no extra GPU memory held.
+                    interp_carry = R[len(chunk) - 1]["recon"].clone() if smooth else None
                     del perframe_cache, R, chunk
                     _free_gpu()
                     continue
@@ -1344,15 +1398,29 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
 
                 del perframe_cache, region_gate, grain_static_hd, R, chunk
                 _free_gpu()                         # release MPS cache between chunks (see _free_gpu)
+            # R7-E1: trailing midpoint AFTER the global last real frame. It has no successor to warp
+            #        toward, so it is a plain DUPLICATE of the last frame -> the stream closes at exactly
+            #        2x (n_emit == 2*done). Only fires when smooth and a clip was actually produced.
+            if smooth and interp_carry is not None:
+                rt = (ggrain.apply(interp_carry, _MID_GRAIN_SEED_BASE + mid_count, cfg["grain"])
+                      if cfg["grain"] != "off" else interp_carry)
+                writer.write(fast_grain.download_rgb(rt))
+                n_emit += 1
+                mid_count += 1
+                n_interp += 1
+                n_interp_dup += 1
         finally:
             writer.close()
 
         if done == 0:
             raise RuntimeError(f"no frames decoded from {input_path}")
 
-        # 5) mux audio into the final container (copy AAC / transcode / none).
+        # 5) mux audio into the final container (copy AAC / transcode / none). R7-E1: when smooth, the
+        #    encoded stream has n_emit (==2*done) frames at out_fps (==2*fps) -> SAME wall duration as the
+        #    real frames, so the audio stays in sync. OFF -> mux_n==done & out_fps==fps -> byte-identical.
         _set_progress(state="muxing", message="muxing audio")
-        audio_note = _mux_av(video_tmp, input_path, out_path, done, fps)
+        mux_n = n_emit if smooth else done
+        audio_note = _mux_av(video_tmp, input_path, out_path, mux_n, out_fps)
 
         total_s = time.perf_counter() - t0
         LAST_STATS.clear()
@@ -1365,7 +1433,14 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
             "t_sr_s": round(t_sr, 2), "t_recon_s": round(t_recon, 2),
             "t_total_s": round(total_s, 2),
             "ms_per_frame": round(total_s * 1000.0 / max(1, done), 1),
+            # R7-E1: total ENCODED frames + the rate they play at. OFF -> n_video_frames==n_frames &
+            # out_fps==fps, so existing readers (and _verify_mp4 in __main__) are unchanged.
+            "n_video_frames": mux_n, "out_fps": float(out_fps),
         })
+        if smooth:                                 # R7-E1 "smooth 2x" extras (instant-only, opt-in)
+            LAST_STATS.update({
+                "smooth_2x": True, "n_interp": n_interp, "n_interp_dup": n_interp_dup,
+            })
         if fast:                                   # instant fast-path extras (Levers 1-4)
             LAST_STATS.update({
                 "t_grain_io_s": round(t_grain, 2),     # GPU grain + the single host download
@@ -1468,7 +1543,7 @@ if __name__ == "__main__":
     s = LAST_STATS
     print(f"[pipeline] wrote {out}")
     print(f"[pipeline] stats: {s}")
-    ok, info = _verify_mp4(out, s["n_frames"], s["out_resolution"])
+    ok, info = _verify_mp4(out, s.get("n_video_frames", s["n_frames"]), s["out_resolution"])
     print(f"[pipeline] re-decode check: ok={ok}  {info}")
     if a.mem and peak["rss"]:
         print(f"[pipeline] peak RSS: {peak['rss']/1e6:.0f} MB over {len(samples)} samples "

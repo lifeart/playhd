@@ -1,0 +1,67 @@
+R7-E2 integration: texture-aware gate option for derisk._build_region_gate.
+DEFAULT-PRESERVING: texture_aware=False -> a_lr is byte-identical to today (the
+texture branch is skipped entirely). Flip to True only after an integrated end-to-end
+A/B (propagation + tOF), per the R6-E1 "measure before landing" rule.
+
+Recommended shipping config (measured sweet spot, compact-sourced, R7-E2):
+    tex_lo=6.0, tex_hi=14.0, tex_feather=21, tex_k=7   (== the defaults below)
+
+Apply to prototype/derisk.py, replacing the current _build_region_gate body
+(currently lines ~957-973). Uses only cv2/np already imported at derisk top level
+and the compact_cache that the function already builds (zero extra SR compute).
+
+--- a/prototype/derisk.py
++++ b/prototype/derisk.py
+@@ def _build_region_gate
+-def _build_region_gate(frames, w_hd, h_hd, scale, lo=0.2, hi=1.0, feather=61,
+-                       compact_model="realesrgan", compact_cache=None):
++def _build_region_gate(frames, w_hd, h_hd, scale, lo=0.2, hi=1.0, feather=61,
++                       compact_model="realesrgan", compact_cache=None,
++                       texture_aware=False, tex_lo=6.0, tex_hi=14.0,
++                       tex_feather=21, tex_k=7):
+     """Build the Stream-1 region-aware gate + compact source for the OUTPUT-only blend.
+     REUSES region_quality (no math duplicated):
+       * region_masks() -> the (free) per-frame MV-magnitude temporal-mean map `meanmag`,
+       * window_static_weight(meanmag, lo, hi, feather) -> the TEMPORALLY-STABLE, widely-feathered
+         motion gate a_lr in [0,1] (1=static->heavy detail; 0=dynamic->stable compact). hi=1.0 LR
+         px/frame is the physical 'can't carry heavy HF stably under warp' threshold.
+     `compact` = the per-frame COMPACT SR (the same fallback-source family used for occlusion).
+     Pass compact_cache to reuse a precomputed cache (the heavy chain stays single-model).
+
++    R7-E2 (texture_aware, DEFAULT OFF -> a_lr byte-identical): the MOTION gate alone spends the
++    heavy x4plus on STATIC-but-SMOOTH regions (still face / sky) where R6-E1 proved with TRUE
++    LPIPS that x4plus's extra HF is MISALIGNED -> ~0 gain (sometimes worse). With texture_aware,
++    a_lr is multiplied by a CHEAP, GT-FREE local-detail weight a_tex in [0,1] -- the temporal-mean
++    local luma STD of the ALREADY-COMPUTED compact source (thresholded tex_lo..tex_hi, feathered) --
++    so a' = a_motion * a_tex: heavy ONLY where BOTH static AND textured. Measured (R7-E2 degrade-
++    restore, AlexNet LPIPS, talking-head + graphics mix): on talking-head this cuts the effective
++    heavy fraction ~74% -> ~12% at LPIPS -0.018..-0.023 (BETTER, not worse); on detailed graphics
++    it KEEPS heavy (~66% -> ~28%) at LPIPS within +-0.001 (neutral). NB: as an OUTPUT-only blend
++    this is quality-neutral-to-better but saves NO compute by itself -- the compute win needs the
++    heavy anchor SR to actually SKIP tiles where a'~0 (a tiled/region-cropped x4plus pass); a_tex
++    is the mask that enables that. Default OFF pending an integrated end-to-end A/B (propagation +
++    tOF), per R6-E1 'measure before landing'."""
+     import region_quality as _rq
+     h_lr, w_lr = frames[0][1].shape[:2]
+     if compact_cache is None:
+         compact_cache = build_perframe_cache(frames, w_hd, h_hd, compact_model)
+     _, _, meanmag, _ = _rq.region_masks(frames, h_lr, w_lr, 45.0, 80.0)
+     a_lr = _rq.window_static_weight(meanmag, lo, hi, feather=feather)
++    if texture_aware:
++        # temporal-mean local-std of the compact source at the LR gate resolution (FREE: the
++        # compact cache is already built). High on text/edges/texture, low on smooth skin/sky.
++        acc = np.zeros((h_lr, w_lr), np.float32)
++        for i in range(len(frames)):
++            y = cv2.cvtColor(compact_cache[i], cv2.COLOR_RGB2GRAY).astype(np.float32)
++            if y.shape[:2] != (h_lr, w_lr):
++                y = cv2.resize(y, (w_lr, h_lr), interpolation=cv2.INTER_AREA)
++            mu = cv2.boxFilter(y, -1, (tex_k, tex_k))
++            std = np.sqrt(np.maximum(cv2.boxFilter(y * y, -1, (tex_k, tex_k)) - mu * mu, 0.0))
++            acc += std
++        std_map = acc / max(len(frames), 1)
++        a_tex = np.clip((std_map - tex_lo) / max(tex_hi - tex_lo, 1e-6), 0.0, 1.0).astype(np.float32)
++        if tex_feather and tex_feather >= 3:
++            kk = int(tex_feather) | 1
++            a_tex = cv2.GaussianBlur(a_tex, (kk, kk), 0)
++        a_lr = (a_lr * a_tex).astype(np.float32)
+     return dict(a_lr=a_lr, compact=compact_cache)
