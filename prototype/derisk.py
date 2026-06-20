@@ -454,7 +454,7 @@ def _warp_one(ref_recon, ref_oracle, lr_cur, lr_ref, mvs, want, scale,
 # --------------------------------------------------------------------------- #
 # Experiment: reference-backbone reconstruction (I/P chain) + bidirectional B leaves
 # --------------------------------------------------------------------------- #
-def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False):
+def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False, deblock_cfg=None):
     """Per-frame upscale (the SR placeholder) computed ONCE for every frame and cached.
     bicubic (default; byte-identical to all prior runs) OR a real lightweight SR network
     (realesr-general-x4v3, x4). The SAME perframe image is reused for (1) the anchor
@@ -463,7 +463,23 @@ def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False):
     anchor-placement SWEEP cheap: only warp/blend re-runs across operating points, SR runs 0x.
 
     half=True runs the SR net in fp16 on a GPU (experiment E4: ~1.24x faster on the x4plus anchor,
-    visually identical). Default fp16=OFF keeps the byte-identical fp32 path."""
+    visually identical). Default fp16=OFF keeps the byte-identical fp32 path.
+
+    R10-E2 (DEFAULT OFF): deblock_cfg runs an optional codec-artifact-removal PREPROCESSOR on the
+    LR frame BEFORE the anchor SR. None/empty => identity => byte-identical. GATED GO: raises the
+    quality ceiling only on HEAVILY-compressed, low/mid-detail anchors (LPIPS -13% / DISTS -17% on
+    the gated heavy subset); the cfg gate ('qp' with bitstream QP, else a 'blockiness' LR proxy)
+    keeps it OFF on light compression and dense texture where it over-smooths. See
+    experiments/r10_e2_deblock_pre/REPORT.md. Module/weights live there (single validated source);
+    only imported when deblock_cfg is set, so OFF never touches it."""
+    _pre = None
+    if deblock_cfg:
+        import sys as _sys
+        _dbdir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                              "experiments", "r10_e2_deblock_pre")
+        if _dbdir not in _sys.path:
+            _sys.path.insert(0, _dbdir)
+        import deblock_pre as _pre
     N = len(frames)
     cache = {}
     if sr_mode in ("realesrgan", "realesrgan-x4plus"):
@@ -476,7 +492,11 @@ def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False):
         for i in range(N):
             PROF.ftype, PROF.fidx = frames[i][0], i
             with PROF.time("sr"):
-                cache[i] = _srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode, half=half)
+                lr_i = frames[i][1]
+                if _pre is not None:
+                    qp_i = frames[i][3] if len(frames[i]) > 3 else None   # bitstream QP if carried
+                    lr_i = _pre.apply(lr_i, deblock_cfg, qp=qp_i)
+                cache[i] = _srmod.upscale_to(lr_i, w_hd, h_hd, model=sr_mode, half=half)
         return cache
     for i in range(N):
         PROF.ftype, PROF.fidx = frames[i][0], i

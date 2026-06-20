@@ -1,0 +1,56 @@
+R10-E2 codec-deblock preprocessor hook for the anchor SR path.
+Default-OFF (deblock_cfg=None) => byte-identical to the current pipeline.
+Minimal, additive: one optional kwarg + one preprocess call inside the realesrgan branch.
+The cfg is threaded from MODE_CONFIG["quality"]["deblock_pre"] at the two run()/server
+call sites (same pattern R8-E3's anchor_blend.patch used for anchor_blend_beta).
+
+--- a/prototype/derisk.py
++++ b/prototype/derisk.py
+@@ -454,7 +454,7 @@
+-def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False):
++def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False, deblock_cfg=None):
+     """Per-frame upscale (the SR placeholder) computed ONCE for every frame and cached.
+     bicubic (default; byte-identical to all prior runs) OR a real lightweight SR network
+     (realesr-general-x4v3, x4). The SAME perframe image is reused for (1) the anchor
+     reconstruction, (2) the disocclusion/fallback source, and (3) the per-frame-SR baseline
+     -- so with --sr realesrgan, `perframe` IS per-frame SR. Caching it once is what makes the
+     anchor-placement SWEEP cheap: only warp/blend re-runs across operating points, SR runs 0x.
+
+     half=True runs the SR net in fp16 on a GPU (experiment E4: ~1.24x faster on the x4plus anchor,
+     visually identical). Default fp16=OFF keeps the byte-identical fp32 path."""
++    # R10-E2: optional codec-artifact-removal preprocessor on the LR frame BEFORE the anchor SR.
++    # deblock_cfg None/empty => identity => byte-identical. GATED GO: only helps on HEAVILY-
++    # compressed, low/mid-detail anchors (see experiments/r10_e2_deblock_pre/REPORT.md); the cfg
++    # gate ("qp" with bitstream QP, or "blockiness" proxy) keeps it off on light compression and
++    # dense texture where it over-smooths.
++    _pre = None
++    if deblock_cfg:
++        import sys as _sys, os as _os
++        _sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..",
++                                          "experiments", "r10_e2_deblock_pre"))
++        import deblock_pre as _pre
+     N = len(frames)
+     cache = {}
+     if sr_mode in ("realesrgan", "realesrgan-x4plus"):
+         import sr as _srmod
+         _srmod.load_model(sr_mode, half=half)
+         # warm up MPS graph compilation on the real frame size, then reset latency stats so
+         # the reported per-frame latency is steady-state (not the one-off compile cost).
+         _srmod.upscale(frames[0][1], model=sr_mode, half=half)
+         _srmod.reset_latency(sr_mode)
+         for i in range(N):
+             PROF.ftype, PROF.fidx = frames[i][0], i
+             with PROF.time("sr"):
+-                cache[i] = _srmod.upscale_to(frames[i][1], w_hd, h_hd, model=sr_mode, half=half)
++                lr_i = frames[i][1]
++                if _pre is not None:
++                    # qp=frames[i][3] if the frame tuple carries the decoded bitstream QP; else proxy
++                    qp_i = frames[i][3] if len(frames[i]) > 3 else None
++                    lr_i = _pre.apply(lr_i, deblock_cfg, qp=qp_i)
++                cache[i] = _srmod.upscale_to(lr_i, w_hd, h_hd, model=sr_mode, half=half)
+         return cache
+     for i in range(N):
+         PROF.ftype, PROF.fidx = frames[i][0], i
+         with PROF.time("sr"):
+             cache[i] = cv2.resize(frames[i][1], (w_hd, h_hd), interpolation=cv2.INTER_CUBIC)
+     return cache

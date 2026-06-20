@@ -288,6 +288,13 @@ MODE_CONFIG = {
                     grain_motion=True,             # E3 V2: freeze grain on static (region-gated) pixels,
                                                    # fresh per-frame grain only on motion -> removes the
                                                    # ~100% grain-induced static-region flicker.
+                    deblock_pre=None,              # R10-E2 (DEFAULT OFF): codec-artifact-removal
+                                                   # preprocessor before the x4plus anchor. GATED GO
+                                                   # (heavy-compression + low/mid-detail only: LPIPS
+                                                   # -13% / DISTS -17% on the gated heavy subset).
+                                                   # Set e.g. {"model":"scunet_color_real_psnr.pth",
+                                                   # "gate":"blockiness","block_min":1.30} to enable.
+                                                   # None -> byte-identical. See r10_e2_deblock_pre.
                     anchor_blend_beta=0.85,        # R8-E3 (ON): global compact<->x4plus anchor lerp
                                                    # out = compact + 0.85*(x4plus-compact). <= x4plus on
                                                    # every measured anchor cell (LPIPS -5.7% mean on
@@ -773,7 +780,8 @@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
     h_lr, w_lr = sub[0][1].shape[:2]
     w_hd, h_hd = w_lr * SCALE, h_lr * SCALE
     perframe_cache = derisk.build_perframe_cache(
-        sub, w_hd, h_hd, cfg["sr_mode"], half=cfg.get("fp16", False))   # E4 fp16 anchor
+        sub, w_hd, h_hd, cfg["sr_mode"], half=cfg.get("fp16", False),   # E4 fp16 anchor
+        deblock_cfg=cfg.get("deblock_pre"))                            # R10-E2 (None -> byte-identical)
     region_gate = derisk._build_region_gate(sub, w_hd, h_hd, SCALE)
     if cfg.get("anchor_blend_beta") is not None:           # R8-E3 (OFF by default) -- zero extra SR
         derisk.blend_anchor_cache(perframe_cache, region_gate["compact"], cfg["anchor_blend_beta"])
@@ -1462,7 +1470,8 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                 #    on instant keeps that path byte-identical).
                 ts = time.perf_counter()
                 perframe_cache = derisk.build_perframe_cache(
-                    chunk, w_hd, h_hd, cfg["sr_mode"], half=cfg.get("fp16", False))
+                    chunk, w_hd, h_hd, cfg["sr_mode"], half=cfg.get("fp16", False),
+                    deblock_cfg=cfg.get("deblock_pre"))                # R10-E2 (None -> byte-identical)
                 # 2) region-aware gate (quality only): temporally-stable motion gate + the
                 #    per-frame COMPACT source for the OUTPUT-only blend (this chunk's frames).
                 region_gate = (derisk._build_region_gate(chunk, w_hd, h_hd, SCALE)

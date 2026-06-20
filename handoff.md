@@ -1055,6 +1055,52 @@ The remaining genuine headroom is external: a *codec-trained* SR model (R9-E2) a
 clips to confirm/extend the adaptive-β slice (R9-E1) — neither available here. The quality frontier is, for
 now, **converged**.
 
+## Research round R10 — push the model ceiling (user-directed): replace vs augment the anchor (2026-06-20)
+
+R9 said "the obtainable models can't beat x4plus." R10 (the user chose this direction) pushed the one open path
+two ways: **replace** the anchor with a genuinely codec-trained model (E1), and **augment** it by removing the
+codec artifacts x4plus never trained on (E2). E1 settles the replacement frontier (NO-GO across 6 model
+families now); **E2 found the real win — a default-OFF, compression-gated codec-deblock PREPROCESSOR that
+raises the ceiling exactly where x4plus struggles: heavily-compressed low-scaled video.** Reports in
+`experiments/r10_*/REPORT.md`.
+
+**R10-E1 — codec/compression-trained anchor does NOT beat x4plus → frontier settled across 6 families.**
+Obtained 4 architecturally-NOVEL compression-trained x4 models via HuggingFace Hub (resumable — fixed R9-E2's
+truncated download): **DAT2** (RealWebPhoto, JPG+WebP), **ATD** + **HAT-L** (Nomos8k OTF-JPEG) transformers, and
+**ESRGAN** (Nomos8kSC — R9-E2's exact blocker, now downloaded). A/B vs x4plus on real libx264 crops (5 windows ×
+2 CRF, TRUE LPIPS+DISTS+PSNR). **Every one LOSES on LPIPS AND DISTS** — x4plus 0.1179/0.1614; closest (ATD)
+0.1282/0.1833 = +9%/+14% worse; **0 of 10 cells** see any codec model beat x4plus on both. **The trap fired as
+OVER-SMOOTHING this time** (var-Lap *below* GT — the JPEG-priors scrub real H.264 texture as compression noise;
+ATD wins PSNR by softening but **DISTS rejects it**, pixel-peep confirms smeared text) — the mirror of
+diffusion/UltraSharp's over-sharpening, same full-reference loss. Transformers also cost **3–8× x4plus latency**.
+The replacement frontier is now settled across diffusion + RRDB-real + DAT2 + ATD + HAT-L + SwinIR/Span. The one
+untried path: a model finetuned on TRUE libx264 (deblock/motion-comp) degradation, not JPEG/WebP — **and this
+round's harness IS the degradation operator such a finetune would need** (the concrete external next step).
+
+**R10-E2 — codec-deblock PREPROCESSOR before x4plus: GATED GO, INTEGRATED default-OFF.** The principled response
+to E1's over-smoothing finding: don't replace x4plus, feed it a *cleaner* input. A 1× restoration pass
+(**SCUNet `scunet_color_real_psnr`**, spandrel-loaded; FBCNN isn't on HF) on the LR *before* x4plus, on R9-E2's
+real-libx264 harness. **The win is entirely CRF-gated and DISTS-validated:** on heavy compression (CRF 35) it
+beats x4plus on **LPIPS −4.7%, DISTS −6.8%, AND PSNR +0.33 dB**, 4/4 per-frame on graphics/text/low-detail
+(gated subset **−13% LPIPS / −17% DISTS / +0.5 dB**), with var-Lap == x4plus (artifact-removal, NOT blur). It
+**must be gated**: on moderate compression (CRF 27) it loses both (strips real detail), and on dense photographic
+texture even at CRF 35 it over-smooths — **the DISTS guard caught this unanimously (0/4 on texture46k)**, exactly
+the trap an LPIPS-only read would ship. **Integrated default-OFF** (`MODE_CONFIG["quality"]["deblock_pre"]=None`):
+`build_perframe_cache(..., deblock_cfg=None)` runs `deblock_pre.apply(lr, cfg, qp)` before the anchor SR; None ⇒
+byte-identical (lead-verified: instant `f517234a…` + quality `5e88a866…` both unchanged), ON lead-verified
+end-to-end (SCUNet loads + applies + valid output differing from OFF). Gate = a `blockiness` LR proxy today (true
+bitstream-QP threading is the documented graduation step), + an optional dense-texture skip-guard. ~+60%
+amortized anchor cost, paid only when the gate fires. **Default-OFF because:** gate not yet QP-threaded/per-genre-
+tuned, anchor-only (propagation/tOF unmeasured, same caveat R8-E3 closed via an A/B), single-clip n=4, and it
+adds a spandrel+72 MB-model dependency (lazy, only when ON). A real, on-target, well-guarded ceiling-raise for
+the literal use case — shipped as an opt-in pending those follow-ups before any default-flip.
+
+**R10 net:** the model-REPLACEMENT frontier is definitively closed (E1, 6 families); the model-AUGMENTATION angle
+opened a genuine win (E2) — codec-artifact removal IS the missing piece x4plus needs, but only on heavily-
+compressed non-dense anchors, so it ships QP-gated/default-OFF. The honest external frontier is now sharp: a
+**libx264-finetuned** restoration/SR model (E1's harness is the training operator; E2's SCUNet stand-in would be
+beaten by a true H.264 deblocker), which needs an off-box training run.
+
 ## Default-flag audit — why each is ON/OFF (speed × accuracy × quality)
 
 A deliberate pass over every optional flag (the goal is speed AND accuracy AND quality — flags are only
@@ -1063,6 +1109,7 @@ of over-caution); the rest are justified.
 
 | flag | default | reason |
 |---|---|---|
+| **`deblock_pre` (quality, R10-E2)** | **off (None)** | codec-artifact-removal preprocessor (SCUNet) before the x4plus anchor. **GATED GO** — a real ceiling-raise (LPIPS −13% / DISTS −17% / +0.5 dB) but ONLY on heavily-compressed (CRF≥~33) low/mid-detail anchors; on moderate compression it strips detail and on dense texture it over-smooths (DISTS-caught). Default-OFF: gate is a blockiness proxy (true-QP threading + per-genre tuning pending), anchor-only (propagation unmeasured), single-clip, adds a lazy spandrel+72 MB dependency. A real opt-in for heavily-compressed low-scaled video; byte-identical OFF. |
 | **`anchor_blend_beta` (quality, R8-E3)** | **0.85 ON (flipped)** | global compact↔x4plus anchor lerp. ≤ x4plus on every measured anchor cell (LPIPS −5.7% mean on degraded content, DISTS-corroborated R8-E4), **zero extra SR**, and the integrated propagation+tOF A/B PASSED (\|ΔF\| ±0.0%, tOF −0.1…−2.4% → adds no flicker; V6: x4plus HF flickers more under warp than compact). The one reason it was OFF (unmeasured propagation) is now measured. Win scales with input degradation (the target); safely neutral on clean SD. **Quality win, on.** |
 | fp16 (quality x4plus) | **ON** | free ~1.23× + perceptually identical (LPIPS(fp16,fp32) ~0.00003, verified R2-E4 + R5-E2). **Speed win, on.** |
 | V2 motion-grain (quality) | **ON** | static-region grain flicker → ~0; **quality win, on.** |

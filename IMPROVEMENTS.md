@@ -88,6 +88,21 @@
 >   β=0.85) is a **validated local optimum** for the tools obtainable here; remaining headroom is external
 >   (a codec-trained model; independent smooth-content clips).
 
+> **UPDATE — research round R10 (user-directed "push the model ceiling": replace vs augment the anchor; see
+> `handoff.md` → "## Research round R10"):**
+> - ◻ **Replace the anchor (R10-E1) — NO-GO, frontier settled across 6 model families:** 4 NOVEL compression-
+>   trained x4 models (DAT2/ATD/HAT-L transformers + ESRGAN, via HF Hub) ALL lose to x4plus on LPIPS AND DISTS
+>   on real libx264 crops (0/10 cells); they OVER-SMOOTH real H.264 texture (DISTS-caught; the mirror of
+>   diffusion/UltraSharp over-sharpening) + cost 3–8× latency. x4plus stays the ceiling. The one untried path:
+>   a model finetuned on TRUE libx264 degradation (this round's harness is the operator) — off-box training.
+> - ✅ **Augment the anchor (R10-E2) — GATED GO, INTEGRATED default-OFF (`deblock_pre`):** a codec-artifact-
+>   removal preprocessor (SCUNet) BEFORE x4plus raises the ceiling on heavily-compressed low/mid-detail anchors
+>   (LPIPS −13% / DISTS −17% / +0.5 dB on the gated heavy subset, var-Lap==x4plus so artifact-removal not blur).
+>   GATED: loses on moderate compression + over-smooths dense texture (DISTS guard caught it). Wired into
+>   `build_perframe_cache` default-OFF/byte-identical (lead seam-verified OFF + ON end-to-end). The principled
+>   answer to E1's over-smoothing finding: keep x4plus, feed it a cleaner input. Follow-ups before default-flip:
+>   true-QP gate threading, propagation+tOF A/B, broader validation.
+
 Performance + visual-quality "poke", 2026-06-19. Read-only analysis of existing code, the
 documented Step 6/7 profiling, and the shipped `server/outputs/*.mp4`, plus light new
 measurement (one 24-frame instant run; a few-frame visual diff on real outputs). No
