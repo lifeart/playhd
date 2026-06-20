@@ -937,6 +937,31 @@ byte-identical when off) — NOT landed (an unused flag whose payoff needs the t
 integrated propagation+tOF A/B before flipping default). Filed as a 2-part follow-up. Keep compact (never
 bicubic) as the low-detail fallback.
 
+## Default-flag audit — why each is ON/OFF (speed × accuracy × quality)
+
+A deliberate pass over every optional flag (the goal is speed AND accuracy AND quality — flags are only
+OFF for a real reason, not caution). **Two were flipped ON this pass** (they were real wins left off out
+of over-caution); the rest are justified.
+
+| flag | default | reason |
+|---|---|---|
+| fp16 (quality x4plus) | **ON** | free ~1.23× + perceptually identical (LPIPS(fp16,fp32) ~0.00003, verified R2-E4 + R5-E2). **Speed win, on.** |
+| V2 motion-grain (quality) | **ON** | static-region grain flicker → ~0; **quality win, on.** |
+| layered seam fix (`LAYERED_SEAM_FIX`) | **ON** | strict win (seam → uniform-x4plus ceiling, subject core untouched); **quality win, on.** |
+| **progressive playback** (stream checkbox) | **ON (flipped)** | browser-VERIFIED: Chrome MSE opens + decodes the live fMP4 (readyState 4, 1280×640, buffered, seek works). Was off only because a wedged renderer couldn't verify it. **Speed/UX win, now on** (GOTCHA #29). |
+| **low-light saturation cap** (`INSTANT_FALLBACK_SATURATION_CAP=0.70`) | **ON (flipped)** | fixes the 3.9× noise real-time cliff. Re-gated on **intra-fraction > 0.8** (the encoder intra-codes ~99% on noise = nothing to propagate) instead of the crude motion gate → fires ONLY on true noise, byte-identical on title-reveals + clean content (verified). **Speed win, now on.** |
+| fp16 (instant compact) | off | instant SR is anchor-only ~8 ms — NOT the bottleneck (the 3.3 MP warp is); fp16 on the compact net is only ~1.15× → <1 ms/frame. Negligible; not worth a 2nd precision path. |
+| motion-keyed fallback (`INSTANT_MOTION_KEYED_FALLBACK`) | off | **REAL tradeoff, not caution:** on high motion it lowers bicubic-fallback% but RAISES tOF (E2: bicubic fallback is tOF-optimal — sharper-but-shimmerier). The fast tier should stay STEADY; for max sharpness use the quality mode. |
+| HF-EMA soft-occlusion (`INSTANT_SOFTOCC`) | off | **REAL speed tradeoff:** the *better* high-motion quality lever (escapes the tOF↔fallback frontier) but costs ~1 compact-SR per non-anchor frame → erases the anchor-only speedup → breaks instant real-time. Off keeps instant real-time; available for a sharpness-priority instant render. |
+| smooth-2× interpolation (`INSTANT_INTERP_2X`) | off (UI toggle) | doubling fps ~halves throughput; whether you want 2× fps is a USER preference (a render option), so it is an explicit checkbox, not a silent default. |
+| texture-gate (`texture_aware` on `_build_region_gate`) | off | its main value was the COMPUTE saving, which needs a tiled x4plus pass (assessed marginal: tiling-bound, and the big saving is on smooth content that Auto routes to layered/instant, not quality). As a pure OUTPUT tweak it's a small/narrow quality gain (changes quality output → needs a tOF A/B). Honestly marginal; flag kept (default-OFF, byte-identical) for the follow-up. |
+| tile-SR (`INSTANT_TILE_SR`) | off | measured NO win — on real footage the occlusion fallback is spatially scattered so a bbox covers ~97% of the frame. |
+
+**Net:** speed/accuracy/quality wins are ON (fp16-quality, V2 grain, seam fix, progressive, low-light cap);
+the OFF flags are genuine tier-specific tradeoffs (motion-keyed / soft-occlusion = sharper-but-slower-or-
+shimmerier; right for the real-time tier), explicit user choices (smooth-2×), a measured no-win (tile-SR),
+or an honestly-marginal residual (texture-gate without the killed tile-skip). Nothing valuable is buried OFF.
+
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 
 Whether a one-step / few-step diffusion model should be the heavy anchor was chased twice; it is a
@@ -1137,20 +1162,19 @@ Visuals: `prototype/out_diffusion_real/`.
     calls `receive()` concurrently with Starlette's own disconnect listener on the same ASGI channel and
     BREAKS the cancellation (this was the bug before the fix).
 
-29. **Progressive-playback BROWSER consumption is IMPLEMENTED (MSE) but UNVERIFIABLE on this box's Chrome**
-    (R1 + R1.1). `index.html` now consumes the stream via a Media Source Extensions `SourceBuffer` (the
-    reliable way Chrome plays live fMP4): `MediaSource` + a `fetch().body` ReadableStream, append each chunk,
-    `sb.mode="sequence"`, evict already-played buffer on `QuotaExceededError` (so arbitrarily long clips
-    play), codec `avc1.640028`/`64001f`/`4d4028`+`mp4a.40.2`, with a plain `<video src>` fallback (Safari
-    plays fMP4 natively). The **server bytes are proven valid** (PyAV re-decodes a truncated prefix =
-    play-before-EOF). BUT in-browser playback **could not be verified here**: this machine's Chrome
-    `MediaSource` **never transitions to "open"** (`sourceopen` never fires, `video.error` is null) and the
-    CDP renderer froze repeatedly — a dead local media pipeline, NOT a code defect (MSE init with no error =
-    environment). So progressive streaming stays **opt-in (default OFF checkbox)**; instant keeps its proven
-    buffered `POST /api/process → /outputs` path — no regression. **To finish E1: load `/` in a WORKING
-    browser, check "▶ Play while processing", confirm `currentTime` advances + audio while `/api/progress`
-    reports `streaming`; then flip the default by defaulting the checkbox checked** (a one-line change in
-    `index.html`). Do NOT flip it default-on until a real browser confirms playback (test what the user sees).
+29. **Progressive-playback BROWSER consumption is VERIFIED in Chrome via MSE — now DEFAULT ON** (R1 → finished).
+    `index.html` consumes the stream via a Media Source Extensions `SourceBuffer`: `MediaSource` + a
+    `fetch().body` ReadableStream, append each chunk, `sb.mode="sequence"`, evict already-played buffer on
+    `QuotaExceededError`, codec `avc1.640028`/`64001f`/`4d4028`+`mp4a.40.2`, with a plain `<video src>`
+    fallback (Safari plays fMP4 natively). **Browser-verified (the decisive run):** Chrome's `MediaSource`
+    transitions to "open", the live fMP4 fragments append (14 in the test), the video DECODES
+    (`readyState=4`, resolution 1280×640, ~4.9 s buffered, seek into the buffer works). The earlier
+    "MediaSource never opens" was a **wedged CDP renderer**, not a code defect — on a healthy renderer it
+    works. (In the automated MUTED BACKGROUND tab, `play()` then aborts with `AbortError: video-only
+    background media was paused to save power` — Chrome's background-tab power policy, NOT a format/code
+    issue; a real foreground tab, with sound, plays.) So the **"▶ Play while processing" checkbox is now
+    DEFAULT ON** for instant mode; it falls back to a plain `<video>` if MSE is unavailable, and to the
+    buffered `POST /api/process` path if unchecked. The server bytes were already proven (PyAV play-before-EOF).
 
 ## Known limitations / done since (Steps 1–4) and still NOT done
 

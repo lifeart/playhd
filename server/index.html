@@ -73,10 +73,11 @@
 
     <div id="estimate" class="hint" style="margin:8px 0 2px"></div>
     <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin:10px 0 2px">
-      <input type="checkbox" id="stream" style="width:auto" />
+      <input type="checkbox" id="stream" style="width:auto" checked />
       <span class="hint">▶ Play while processing (instant only — streams the upscaled clip as it is
-      produced so playback starts in ~1–2 s instead of waiting for the whole clip).
-      Experimental: needs a browser that plays fragmented MP4.</span>
+      produced via Media Source Extensions so playback starts in ~1–2 s instead of waiting for the
+      whole clip). On by default (verified in Chrome/Safari; falls back to a normal &lt;video&gt; if MSE
+      is unavailable). Uncheck to render the whole clip first.</span>
     </label>
     <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin:6px 0 2px">
       <input type="checkbox" id="smooth2x" style="width:auto" />

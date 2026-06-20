@@ -109,19 +109,19 @@ INSTANT_MOTION_KEYED_FALLBACK = False
 INSTANT_FALLBACK_THRESH_HI = 0.20      # threshold used on high-motion frames when the flag is ON
 INSTANT_MOTION_GATE = 1.0              # mean LR-MV magnitude (px/frame) above which a frame is "high motion"
 
-# R4-E3 -- FALLBACK-SATURATION CAP (default OFF = 1.0). Fixes the low-light/noise real-time cliff:
-# noisy content makes the encoder intra-code ~99% of blocks -> ~95-99% occlusion-fallback on EVERY
-# frame -> all frames blow the 0.50 safeguard -> a full per-frame compact-SR runs for ZERO
-# propagation benefit (nothing to warp from) -> ms/frame 31->121 (3.9x). Setting CAP=0.70 declines to
-# escalate any frame whose fallback exceeds it AND whose motion is low (= noise) -> bicubic floor ->
-# real-time held (verified 121->31 ms/frame on c3). DEFAULT OFF because the cap also fires on NON-noise
-# high-fallback + low-motion frames (e.g. a title-card reveal/dissolve: short.mp4 n_sr 3->1), trading
-# their SR fallback for the bicubic floor -- a small but real behaviour change, so it is opt-in. The
-# product avoids the noise cliff at the mode level instead: R4-E4 auto-mode routes noise -> quality.
-# Set CAP=0.70 to enable for instant-on-noise; the agent's hardening note prefers an intra-fraction>0.8
-# gate (the true "nothing to propagate" signal) to spare title reveals if enabling broadly.
-INSTANT_FALLBACK_SATURATION_CAP = 1.0    # fallback fraction above which SR escalation is declined (1.0 = OFF)
-INSTANT_SAT_CAP_MOTION_GATE = 8.0        # mean LR-MV mag (px/frame); cap only fires BELOW this
+# R4-E3 -- FALLBACK-SATURATION CAP (default ON, intra-gated). Fixes the low-light/noise real-time
+# cliff: noisy content makes the encoder intra-code ~99% of blocks -> ~95-99% occlusion-fallback on
+# EVERY frame -> all frames blow the 0.50 safeguard -> a full per-frame compact-SR runs for ZERO
+# propagation benefit (nothing to warp from) -> ms/frame 31->121 (3.9x). The cap declines SR
+# escalation on a frame that has HIGH fallback AND is ~all-intra (intra-fraction > the gate = the
+# encoder gave up = no MVs to propagate) -> bicubic floor -> real-time held. The INTRA gate (not the
+# old crude motion gate) is the principled "nothing to propagate" signal: it fires ONLY on genuine
+# noise, NOT on a title-card reveal/dissolve (which intra-codes only a LOCAL region) -- so it is safe
+# DEFAULT ON with no clean-content regression (verified byte-identical on short.mp4 + clean; real-time
+# held on c3 noise). Set CAP=1.0 to disable.
+INSTANT_FALLBACK_SATURATION_CAP = 0.70   # fallback fraction above which SR escalation is declined (1.0 = OFF)
+INSTANT_SAT_CAP_INTRA_GATE = 0.80        # intra-coded fraction above which a high-fallback frame = NOISE
+INSTANT_SAT_CAP_MOTION_GATE = 8.0        # (legacy; kept for back-compat, no longer used by the cap)
 
 # Lever 3 (tile-SR safeguard): SR only the bounding box of a high-fallback frame's occlusion
 # region instead of the full 2560x1280. DISABLED by default after measurement: on this real
@@ -1125,7 +1125,7 @@ def _motion_keyed_thresh_fn(chunk, base_thresh):
         return None
     h_lr, w_lr = chunk[0][1].shape[:2]
     _anchors, _backbone = anchor_sr.anchor_indices(chunk)
-    _mmemo, _fmemo = {}, {}
+    _mmemo, _fmemo, _imemo = {}, {}, {}
 
     def _mag(i):
         if i not in _mmemo:
@@ -1144,14 +1144,29 @@ def _motion_keyed_thresh_fn(chunk, base_thresh):
                          else anchor_sr._lr_fallback_fraction(chunk, i, _backbone, "reactive"))
         return _fmemo[i]
 
+    def _intra(i):
+        # fraction of the frame with NO motion vector at all (intra-coded blocks). On NOISE the
+        # encoder intra-codes ~99% of blocks (inter-prediction on noise is RD-worthless) -> ~1.0;
+        # a title-card reveal / dissolve intra-codes only the LOCAL new region -> well below 0.8.
+        # This is the principled "nothing to propagate" signal that separates noise from a reveal.
+        if i not in _imemo:
+            mvs = chunk[i][2]
+            if mvs is None or len(mvs) == 0:
+                _imemo[i] = 1.0
+            else:
+                fx, _ = derisk.build_lr_flow(mvs, h_lr, w_lr, want="all")
+                _imemo[i] = float(np.mean(~np.isfinite(fx)))
+        return _imemo[i]
+
     def thr(i):
         b = base_thresh
         if INSTANT_MOTION_KEYED_FALLBACK and chunk[i][0] != "I" and _mag(i) > INSTANT_MOTION_GATE:
             b = INSTANT_FALLBACK_THRESH_HI
-        # R4-E3: a noise-saturated frame (high fallback + low motion = unreliable MVs, nothing to
-        # propagate) -> return an unreachable threshold so SR escalation is DECLINED (bicubic floor,
-        # real-time held). Genuine fast-motion (mag >= gate) is spared.
-        if cap_on and _frac(i) > INSTANT_FALLBACK_SATURATION_CAP and _mag(i) < INSTANT_SAT_CAP_MOTION_GATE:
+        # R4-E3 saturation cap: a NOISE-saturated frame (high fallback AND ~all-intra = no MVs to
+        # propagate from) -> return an unreachable threshold so SR escalation is DECLINED (bicubic
+        # floor, real-time held). The intra-fraction gate fires ONLY on genuine noise, NOT on a
+        # title-reveal/dissolve (localized intra) -> safe to default ON with no clean-content regression.
+        if cap_on and _frac(i) > INSTANT_FALLBACK_SATURATION_CAP and _intra(i) > INSTANT_SAT_CAP_INTRA_GATE:
             return 2.0
         return b
 
