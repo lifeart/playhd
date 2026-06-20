@@ -1,0 +1,4 @@
+node_modules/
+package-lock.json
+sd600.mp4
+*.wasm

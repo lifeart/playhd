@@ -4,7 +4,14 @@
 > **entirely in a browser**, no server? Verdict below is from current-web-platform research (June 2026)
 > + this repo's architecture. **TL;DR: FEASIBLE — and the architecture is a *better* fit for the browser
 > than for native**, because it amortizes away exactly the cost the browser is worst at (per-frame SR).
-> One make-or-break seam needs a de-risk spike: getting codec motion vectors in-browser.
+> One make-or-break seam needed a de-risk spike: getting codec motion vectors in-browser.
+>
+> **✅ SPIKE DONE — GO (`web_spike/SPIKE_RESULT.md`).** Measured the seam: **`+export_mvs` runs in real
+> WebAssembly** (ffmpeg.wasm Emscripten core, V8/WASM == Chrome's engine; codecview rendered the extracted
+> MVs), and **SD decode + MV extraction hits ~850–1000 fps single-threaded = ~34–40× real-time** (native
+> 2392 fps; WASM penalty only ~2.4× because the heavy ffmpeg.wasm cost is *encode*, not decode; MV export
+> adds ~0%; payload ~45 KB/frame ≈ 1.1 MB/s). **The MV seam is not a throughput risk** — what remains is a
+> binding task (expose the raw MV side-data to JS), not a feasibility question. Proceed to P1.
 
 ## Why this architecture *wants* to be in a browser
 
