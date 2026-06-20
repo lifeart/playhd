@@ -52,6 +52,10 @@ def index():
 @app.get("/api/sources")
 def api_sources():
     return {"sources": pipe.list_sources(), "modes": [
+        {"id": "auto", "label": "Auto (recommended)",
+         "desc": "Analyzes the first ~2 s of the clip (codec motion, occlusion, scene cuts, "
+                 "static-camera + human check) and picks Instant / Quality / Layered for you — "
+                 "no per-mode render. The chosen mode and why are shown after processing."},
         {"id": "instant", "label": "Instant",
          "desc": "Compact x4 anchor on the GPU, motion-propagated. Real-time (720p tier) — "
                  "plays as it processes (starts in ~1-2 s, no wait for the whole clip)."},

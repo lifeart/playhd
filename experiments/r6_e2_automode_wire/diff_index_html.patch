@@ -1,0 +1,58 @@
+diff --git a/server/index.html b/server/index.html
+index d53b06e..fb3d9ae 100644
+--- a/server/index.html
++++ b/server/index.html
+@@ -94,7 +94,7 @@
+ 
+ <script>
+ const $ = (id) => document.getElementById(id);
+-let selectedMode = "instant";
++let selectedMode = "auto";
+ let pollTimer = null;
+ let sourcesData = [];
+ 
+@@ -114,6 +114,11 @@ function updateEstimate() {
+     el.style.color = "";
+     return;
+   }
++  if (selectedMode === "auto") {           // auto picks the mode server-side after a quick probe
++    el.textContent = "Auto — analyzes the first ~2 s and picks Instant / Quality / Layered for you.";
++    el.style.color = "";
++    return;
++  }
+   const src = sourcesData.find((x) => x.name === $("source").value);
+   if (!src || !src.est_s || src.est_s[selectedMode] == null) { el.textContent = ""; return; }
+   const est = src.est_s[selectedMode];
+@@ -298,7 +303,8 @@ $("go").onclick = async () => {
+   if (selectedMode === "instant" && $("stream").checked) { return runStreaming(btn); }
+ 
+   let modeNote = ".";
+-  if (selectedMode === "quality") modeNote = " — heavy x4plus anchor, this is the slow path.";
++  if (selectedMode === "auto") modeNote = " — analyzing content (~2 s) to pick the best mode…";
++  else if (selectedMode === "quality") modeNote = " — heavy x4plus anchor, this is the slow path.";
+   else if (selectedMode === "layered")
+     modeNote = " — SR the static background once per scene, composite the moving subject per "
+       + "frame. Slowest (buffered) path; needs a roughly static camera + a human subject. "
+@@ -336,7 +342,11 @@ $("go").onclick = async () => {
+     v.load();
+     v.play().catch(() => setStatus("Done — click ▶ to play (browser blocked autoplay-with-sound)."));
+ 
+-    let statsText =
++    let statsText = "";
++    if (s.auto_requested) {                  // Auto → <chosen>: <why>
++      statsText += `auto         : → ${s.auto_chosen} — ${s.auto_reason}\n`;
++    }
++    statsText +=
+       `source       : ${data.source}\n` +
+       `mode         : ${s.label || s.mode}\n` +
+       `frames       : ${s.n_frames} @ ${Number(s.fps).toFixed(2)} fps (${s.n_chunks} chunks, cap ${s.soft_cap})\n` +
+@@ -352,7 +362,8 @@ $("go").onclick = async () => {
+         `server time  : ${s.t_total_s}s total (sr ${s.t_sr_s}s, recon ${s.t_recon_s}s) = ${s.ms_per_frame} ms/frame`;
+     }
+     $("stats").textContent = statsText;
+-    setStatus(`Done — ${s.out_resolution}, ${s.n_frames} frames in ${s.t_total_s}s server-side.`);
++    const autoPrefix = s.auto_requested ? `Auto → <b>${s.auto_chosen}</b>. ` : "";
++    setStatus(`${autoPrefix}Done — ${s.out_resolution}, ${s.n_frames} frames in ${s.t_total_s}s server-side.`);
+   } catch (e) {
+     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+     setStatus("Request failed: " + e, true);

@@ -845,18 +845,67 @@ ms/frame, ~1.1× real-time, deterministic), **quality SHIP** (ETA honestly conse
 and-restore protocol (SD = pseudo-HD GT → degrade 2× → restore → score vs GT) with a `real` codec-like
 degrade operator. Headline LPIPS (talking-head / high-motion, `real`): instant **0.108 / 0.008**, quality
 **0.108–0.123**, layered-plate **0.123 / 0.009**. **Three findings that should shape strategy:**
-1. **The heavy x4plus is NOT a quality win on this content** — the COMPACT model beats it on every
-   full-reference metric (LPIPS 0.108 vs 0.123, PSNR +1.7 dB) at **1/10 the compute**. x4plus synthesizes
-   2.7× more HF (var-Lap 256 vs 93) but it is *misaligned* with the true GT → "sharper" by var-Lap yet worse
-   by LPIPS — **a live GOTCHA #23**. Implication: lean the quality mode's region-aware blend toward compact;
-   x4plus is only clearly defensible on the **layered static plate** (cost amortized, HF doesn't flicker).
-   CAVEAT (honest): one clip + a moderate degrade operator; x4plus is built for heavier degradation and may
-   pull ahead on grittier sources — do NOT rip x4plus out, just stop assuming it's the quality ceiling.
+1. **[REFUTED by R6-E1 — see below] The heavy x4plus appeared NOT to be a quality win** — on R5-E2's two
+   windows the COMPACT model beat it on every full-reference metric (LPIPS 0.108 vs 0.123) at 1/10 the
+   compute. **⚠ R6-E1 OVERTURNED this: R5-E2 had tested only the clip's two LOWEST-detail windows (smooth
+   face + flat title card), where x4plus's prior is pure misalignment. Across 5 windows × 3 degrade levels,
+   x4plus BEATS compact decisively on the detailed/graphics/text/photo content the quality mode targets
+   (9/15 cells, 100% of frames on every textured heavy/gritty cell, lead growing to −34% LPIPS). So the
+   "lean compact" suggestion is WITHDRAWN — KEEP quality = x4plus + region-aware + fp16 unchanged.** The
+   live GOTCHA #23 (x4plus "sharper" by var-Lap) still holds — LPIPS is the arbiter, and it now says x4plus
+   wins where it matters. x4plus also stays right for the layered static plate.
 2. **fp16 is perceptually identical** (LPIPS(fp16,fp32) 0.00002–0.00005) for a free 1.23× — re-confirms R2-E4.
 3. **Grain HURTS every full-reference metric** (it's additive noise uncorrelated with the clean GT) — it is
    an aesthetic/NR overlay (default-OFF is right for fidelity); `low` is the minimum dose if wanted, and a
    touch of `low` grain *reduces* tOF on high-motion. Also: PSNR rated SR ≈ bicubic on talking-head while
    LPIPS showed SR *halves* perceived distortion (−51%) — the perception-distortion gap the project never measured.
+
+## Research round R6 — 3 experiments: SR-quality decision + Auto mode shipped (2026-06-20)
+
+Reports in `experiments/r6_*/REPORT.md`. Notable: the loop **self-corrected** — R5-E2's "compact ≥
+x4plus" claim was refuted by R6-E1 *before* any quality-mode change shipped (I had documented but
+deliberately NOT acted on it, pending confirmation — the adversarial-verify discipline paying off).
+
+| # | experiment | verdict | status |
+|---|---|---|---|
+| **R6-E1** | Confirm/refute "compact ≥ x4plus" (5 windows × 3 degrades) | **REFUTED** — x4plus wins on detailed content | **no config change** (keep x4plus) |
+| **R6-E2** | Wire+verify "Auto" mode-selection | **PASS** | **INTEGRATED + verified** |
+| **R6-E3** | New SR-quality lever (TTA / blend) | blend beats both at moderate degrade | content-dependent — NOT a default |
+
+**R6-E1 — REFUTED R5-E2; quality mode unchanged.** R5-E2's "compact beats x4plus" was an artifact of
+testing only the two lowest-detail windows. Across 5 windows (smooth face → news graphics/text/charts/
+photos) × 3 degrade operators (moderate → gritty 2nd-order), **x4plus beats compact on TRUE LPIPS in 9/15
+cells, 100% of frames on every textured heavy/gritty cell, lead GROWING with detail + degradation (up to
+−34% LPIPS)** — a clean perception-distortion win (lower PSNR, lower LPIPS; var-Lap useless). So **keep
+`MODE_CONFIG["quality"]` = x4plus + region-aware + fp16 unchanged** (switching to compact would be a measured
+regression on exactly the content quality mode targets); the region-aware gate already routes heavy→static-
+detail, compact→moving. **Optional R7 compute optimization (flagged, unmeasured-at-integration):** the gate
+keys on MOTION but the true discriminator is TEXTURE×degrade — a local-detail term in `_build_region_gate`
+(heavy only where static AND high-texture) could cut quality compute at ~0 LPIPS cost; A/B before landing.
+
+**R6-E2 — INTEGRATED + verified ("Auto" mode-selection).** `pipeline_api.recommend_mode(input_path)` (a
+cheap ~0.1–3.4 s probe: codec-MV magnitude + occlusion-fallback% + Canny edge density + scene-cut count +
+static-camera verdict + a gated human matte) resolves `mode="auto"` at the top of `process_clip` → runs the
+chosen mode unchanged → surfaces `{auto_chosen, auto_reason, auto_signals}` in `LAST_STATS` + the UI.
+`app.py` has an "Auto (recommended)" card (default), `index.html` defaults to it. **Lead-verified:** server
+imports + auto registered; instant/quality/layered all valid through the wiring; **non-auto is byte-identical
+at the pixel level** (instant n_sr=3 baseline; the agent's double-run pixel-hash check); auto resolves to a
+real mode + valid output; the probe is ~0.3 s vs a 42.9 s render. Design carried from R4-E4: **median** MV
+magnitude (a cut frame's 207-px spike fakes high motion in the mean), **detected-vs-missed** cut, and a
+**human-matte gate** (non-human → layered never selected → a second safety net for the R4-E1 layered
+corruption). Routing honest-agreement 8/10 (2 benign misses — one is the real-time-correct instant pick at a
+tOF-1.01 boundary; one a safe over-escalation to quality); R4-E4's one historical misroute is now fixed.
+Only `pipeline_api.py` + `app.py` + `index.html` changed; the `_run_layered` matte load is now shared with
+the probe (loaded once, re-raises on failure). v1: auto uses the buffered POST path (not `/api/stream`).
+
+**R6-E3 — a real but content-dependent quality lever (NOT a default).** `compact + 0.5·(x4plus − compact)`
+(an anchor output-pass lerp) beats BOTH compact-alone (−10.6%/−12.0% LPIPS) and x4plus-alone on R6-E3's two
+**moderate-degrade** windows, with moderate var-Lap (genuine aligned detail — the freq-gated and unsharp
+variants both FAILED by inflating var-Lap while hurting LPIPS, GOTCHA #23 caught twice; TTA confirmed the
+hallucination-cancel mechanism on x4plus but costs 31×). **BUT** synthesized against R6-E1: the blend is
+halfway to compact, so on the **heavy/gritty textured** content where x4plus's full strength wins (R6-E1),
+the blend would *pull back* that HF and lose — so it is **NOT a safe quality default** (it helps moderate
+degrade, hurts gritty). Filed as a content/degrade-adaptive option, not landed.
 
 ## Diffusion anchor — NO-GO (research pass 4 `wau8fdg60` + the Q1 real-weights spike)
 

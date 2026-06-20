@@ -1,0 +1,372 @@
+diff --git a/server/pipeline_api.py b/server/pipeline_api.py
+index b279a48..d497616 100644
+--- a/server/pipeline_api.py
++++ b/server/pipeline_api.py
+@@ -35,6 +35,7 @@ import gc
+ import time
+ import threading
+ from fractions import Fraction
++from dataclasses import dataclass, asdict
+ 
+ import numpy as np
+ import av
+@@ -76,6 +77,7 @@ def _free_gpu():
+             pass
+ import layered_api as _layered  # noqa: E402  (LAYERED mode: two-pass-per-scene helpers)
+ import scene_detect              # noqa: E402  (robust scene-CUT detector -> forced fresh anchors)
++import background_plate as _bp    # noqa: E402  (AUTO mode: static-vs-moving camera verdict)
+ 
+ # Instant-mode speedup (Levers 1-4). These live in server/ and import the prototype READ-ONLY.
+ import anchor_sr                 # noqa: E402  (Lever 1: anchor-only SR cache + adaptive safeguard)
+@@ -208,7 +210,9 @@ MODE_CONFIG = {
+ # entry so the instant/quality streaming body stays byte-for-byte untouched -- process_clip
+ # branches to _run_layered() for it. ALL_MODES gates the API validation + the single-job lock.
+ LAYERED_LABEL = "Quality — Layered (talking-head, static camera)"
+-ALL_MODES = tuple(MODE_CONFIG) + ("layered",)
++# "auto" is a meta-mode: process_clip resolves it (via the cheap recommend_mode probe) to one of the
++# real modes BEFORE rendering, so it is valid at the API but never reaches the render path itself.
++ALL_MODES = tuple(MODE_CONFIG) + ("layered", "auto")
+ 
+ 
+ def is_valid_mode(mode):
+@@ -695,6 +699,27 @@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
+     return done
+ 
+ 
++# Process-wide matte model cache. The AUTO probe (recommend_mode) and the LAYERED render share ONE
++# loaded RVM/seg model (the weights are identical and stateless across calls -- the recurrent state
++# lives in the per-call `rec` list, never on the model), so an auto->layered job loads the matte
++# ONCE, not twice. A load failure (offline / missing weights) is REMEMBERED, not retried, and never
++# silently swallowed: the probe surfaces it as matte_unavailable; the layered render re-raises.
++_MATTE_MODEL = {"model": None, "tried": False, "err": None}
++
++
++def _get_matte_model():
++    """Return the shared, lazily-loaded matte model (None if it could not be loaded)."""
++    if _MATTE_MODEL["tried"]:
++        return _MATTE_MODEL["model"]
++    _MATTE_MODEL["tried"] = True
++    try:
++        _MATTE_MODEL["model"] = _layered.load_matting_model()
++    except Exception as e:                       # offline / no weights -> remember, surface, never crash here
++        _MATTE_MODEL["err"] = repr(e)
++        _MATTE_MODEL["model"] = None
++    return _MATTE_MODEL["model"]
++
++
+ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
+     """LAYERED mode entry (called by process_clip under the single-job lock)."""
+     plate_dir = out_path + ".plates"
+@@ -711,7 +736,10 @@ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
+         _set_progress(state="plate", done=0, total=n_scenes,
+                       message=f"building {n_scenes} scene plate(s)")
+         t_passA = time.perf_counter()
+-        model = _layered.load_matting_model()
++        model = _get_matte_model()              # shared with the AUTO probe (loaded once)
++        if model is None:                       # layered REQUIRES a matte -> surface, never swallow
++            raise RuntimeError(f"layered mode needs the matte model but it failed to load: "
++                               f"{_MATTE_MODEL['err']}")
+         device = getattr(model, "_rvm_device", "cpu")
+ 
+         def _plate_progress(done_s, tot_s):
+@@ -831,6 +859,240 @@ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
+         shutil.rmtree(plate_dir, ignore_errors=True)   # drop spilled HD plates
+ 
+ 
++# --------------------------------------------------------------------------- #
++# AUTO mode -- a CHEAP probe (R4-E4) that recommends instant | quality | layered from signals
++# computable in ONE light decode pass (codec MVs + a few decoded frames), WITHOUT a per-mode render.
++# It reuses the SAME shared code the product renders with (stream_gops chunking, anchor_sr occlusion
++# fallback, derisk LR flow, scene_detect cuts, background_plate static-camera verdict, the shared
++# matte model) so the cheap decision sees exactly what the render will. See experiments/r4_e4_automode.
++# --------------------------------------------------------------------------- #
++# Thresholds re-measured on R3-E2's authored clips (see r4_e4_automode/REPORT validation table).
++AUTO_FB_NOISE = 50.0       # % reactive fallback mean -> low-light/noise -> quality        (c3=94.9)
++AUTO_FB_HI = 15.0          # % reactive fallback mean -> high local occlusion -> quality    (c1,c6)
++AUTO_MOTION_HI = 10.0      # MEDIAN per-frame LR-MV magnitude (px) -> above = high motion. MEDIAN (not
++                           #   mean) so a single cut-frame MV spike (codec predicts huge MVs across a
++                           #   cut, e.g. c5b max 207) does NOT inflate the signal.
++AUTO_SMEAR_MOTION = 3.0    # a MISSED cut only smears instant when there is motion to warp across it.
++AUTO_STATIC_THRESH_PX = 0.6   # |median camera MV| below this = static (matches layered STATIC_THRESH_PX)
++AUTO_HUMAN_LO = 0.03       # matte-coverage band for a plausible talking-head (3%..85%)
++AUTO_HUMAN_HI = 0.85
++AUTO_HIDDEN_CUT_CHROMA = 18.0  # mean |dRGB| between consecutive sampled frames the luma-only cut
++                               #   detector can MISS (similar-luma + cool-tint splice) -> reject layered.
++AUTO_PLATE_RESID_MAX = 12.0    # mean |frame - median-plate| over BACKGROUND px (luma levels): small on a
++                               #   truly static bg, large on a moving/parallax/wrong (hidden-cut) plate.
++AUTO_MATTE_K = 3           # frames to matte for the human-coverage check (kept tiny -> cheap)
++# Default frames the AUTO probe scans to decide (one soft-cap GOP, ~2 s @24fps; covers the authored
++# clips' cut@28). The render itself still processes the WHOLE clip; only the DECISION is windowed.
++AUTO_PROBE_FRAMES = 48
++
++
++@dataclass
++class _AutoSignals:
++    n_frames: int = 0
++    n_chunks: int = 0
++    n_scenes: int = 1
++    mv_mag_mean: float = 0.0
++    mv_mag_median: float = 0.0      # robust motion signal (cut-spike-immune); drives the routing
++    mv_mag_max: float = 0.0
++    edge_density_mean: float = 0.0
++    fb_react_mean: float = 0.0
++    fb_react_max: float = 0.0
++    camera_verdict: str = "UNKNOWN"          # STATIC | MOVING | UNKNOWN
++    global_vec_mag_px: float = float("nan")
++    hidden_cut_suspected: bool = False
++    chroma_diff_max: float = 0.0
++    human_coverage: object = None    # None = not probed / matte unavailable
++    plate_resid: object = None       # mean bg residual to the median plate (luma levels)
++    probe_s: float = 0.0
++
++
++@dataclass
++class AutoRecommendation:
++    mode: str
++    reason: str
++    signals: dict
++    matte_unavailable: bool = False
++
++
++def _auto_scan(clip_path, n, stride):
++    """ONE light decode pass over the product's chunking: motion + edges + exact occlusion-fallback."""
++    mags, edges, fbs = [], [], []
++    decoded = []                  # flat (ptype,lr,mvs) for estimate_global_motion (reuses these MVs)
++    samples = []                  # a few RGB frames (chroma-cut check + matte)
++    n_chunks = 0
++    n_frames = 0
++    for chunk in stream_gops(clip_path, max_frames=n):
++        n_chunks += 1
++        anchors, backbone = anchor_sr.anchor_indices(chunk)
++        h_lr, w_lr = chunk[0][1].shape[:2]
++        for i, (pt, lr, mvs) in enumerate(chunk):
++            decoded.append((pt, lr, mvs))
++            if n_frames % stride == 0:                  # sample subset for the cheap signals
++                g = cv2.cvtColor(lr, cv2.COLOR_RGB2GRAY)
++                edges.append(float((cv2.Canny(g, 80, 160) > 0).mean()))
++                if mvs is not None and len(mvs):
++                    fx, fy = derisk.build_lr_flow(mvs, h_lr, w_lr, want="all")
++                    m = np.sqrt(fx * fx + fy * fy)
++                    mags.append(float(np.nanmean(m)) if np.isfinite(m).any() else 0.0)
++                else:
++                    mags.append(0.0)
++                if i in anchors:
++                    fbs.append(0.0)
++                else:
++                    fbs.append(anchor_sr._lr_fallback_fraction(chunk, i, backbone, "reactive"))
++                samples.append(lr)          # stride-spaced across the WHOLE window so the chroma
++                                            # hidden-cut check + matte span any mid-window cut
++            n_frames += 1
++    return mags, edges, fbs, decoded, samples, n_chunks, n_frames
++
++
++def _auto_chroma_hidden_cut(samples):
++    """Max mean |dRGB| between consecutive SAMPLED frames -- chroma-sensitive, so a similar-LUMA cut
++    (the luma-only detector can miss) still shows up. Returns (max_chroma_diff, suspected)."""
++    if len(samples) < 2:
++        return 0.0, False
++    diffs = []
++    for a, b in zip(samples[:-1], samples[1:]):
++        if a.shape != b.shape:
++            diffs.append(255.0)
++            continue
++        diffs.append(float(np.mean(np.abs(b.astype(np.float32) - a.astype(np.float32)))))
++    mx = max(diffs) if diffs else 0.0
++    return mx, (mx > AUTO_HIDDEN_CUT_CHROMA)
++
++
++def _auto_human_coverage(samples):
++    """Matte K sampled frames -> (coverage_fraction, plate_resid). coverage None if the matte model
++    is unavailable. plate_resid = mean |frame - temporal-median-plate| over BACKGROUND px (luma
++    levels): small on a truly static bg, large on a moving/parallax/wrong-plate bg."""
++    model = _get_matte_model()
++    if model is None:
++        return None, None
++    dev = _layered._device()
++    pick = samples[:: max(1, len(samples) // AUTO_MATTE_K)][:AUTO_MATTE_K]
++    covs, resid = [], []
++    luma = [0.299 * s[..., 0] + 0.587 * s[..., 1] + 0.114 * s[..., 2] for s in pick]
++    plate_ref = np.median(np.stack([l.astype(np.float32) for l in luma], 0), axis=0)
++    rec = [None] * 4
++    for s, l in zip(pick, luma):
++        ratio = _layered.downsample_ratio(*s.shape[:2])
++        pha, rec = _layered.matte_frame_np(model, s, rec, ratio, dev)
++        covs.append(float((pha > 0.5).mean()))
++        bg = (pha <= 0.5)                                   # background pixels only
++        if bg.any():
++            resid.append(float(np.mean(np.abs(l.astype(np.float32) - plate_ref)[bg])))
++    _free_gpu()
++    cov = float(np.median(covs)) if covs else 0.0
++    pr = float(np.mean(resid)) if resid else None
++    return cov, pr
++
++
++def recommend_mode(input_path, max_frames: int = AUTO_PROBE_FRAMES, stride: int = 1,
++                   verbose: bool = False) -> AutoRecommendation:
++    """CHEAP probe -> AutoRecommendation(mode in {instant,quality,layered}, reason, signals dict).
++    Picks per content WITHOUT a per-mode render. The matte (the only neural step) runs ONLY on a
++    static, single-scene, low-motion candidate -> it never fires on high-motion/noisy/multi-cut
++    clips, keeping the probe cheap. If the matte is unavailable (offline), layered is conservatively
++    DROPPED and we fall through to instant (real-time, corruption-free) -- never crash."""
++    t0 = time.perf_counter()
++    s = _AutoSignals()
++
++    mags, edges, fbs, decoded, samples, n_chunks, n_frames = _auto_scan(input_path, max_frames, stride)
++    s.n_frames, s.n_chunks = n_frames, n_chunks
++    s.mv_mag_mean = round(float(np.mean(mags)), 3) if mags else 0.0
++    s.mv_mag_median = round(float(np.median(mags)), 3) if mags else 0.0
++    s.mv_mag_max = round(float(np.max(mags)), 3) if mags else 0.0
++    s.edge_density_mean = round(float(np.mean(edges)), 4) if edges else 0.0
++    s.fb_react_mean = round(float(np.mean(fbs)) * 100, 2) if fbs else 0.0
++    s.fb_react_max = round(float(np.max(fbs)) * 100, 2) if fbs else 0.0
++
++    # scene-cut count (cheap luma pass) -> plate safety
++    try:
++        cuts, _total = scene_detect.find_cuts(input_path, max_frames=max_frames)
++        s.n_scenes = len(cuts) + 1
++    except Exception as e:
++        s.n_scenes = 1
++        if verbose:
++            print("  [warn] find_cuts:", repr(e))
++
++    # static-camera verdict (reuses the MVs already decoded) -> plate safety
++    try:
++        gm = _bp.estimate_global_motion(decoded, static_thresh=AUTO_STATIC_THRESH_PX)
++        s.camera_verdict = gm["verdict"]
++        s.global_vec_mag_px = round(float(gm["global_vec_mag_px"]), 3)
++    except Exception as e:
++        s.camera_verdict = "UNKNOWN"
++        if verbose:
++            print("  [warn] estimate_global_motion:", repr(e))
++
++    s.chroma_diff_max, s.hidden_cut_suspected = _auto_chroma_hidden_cut(samples)
++    s.chroma_diff_max = round(s.chroma_diff_max, 2)
++
++    matte_unavailable = False
++    # a MISSED cut = a strong chroma discontinuity the luma cut-detector did NOT split on (n_scenes
++    # stays 1). stream_gops splits at DETECTED cuts (instant re-anchors cleanly), so only a MISSED
++    # cut leaves a chunk spanning it -> instant warps the pre-cut anchor across = smear.
++    missed_cut = s.hidden_cut_suspected and s.n_scenes == 1
++
++    # ---------------- decision rule (R4-E4) ----------------
++    if s.fb_react_mean > AUTO_FB_NOISE:
++        mode = "quality"
++        reason = (f"low-light/noisy: reactive fallback {s.fb_react_mean:.0f}% > {AUTO_FB_NOISE:.0f}% "
++                  f"-> unreliable MVs collapse instant to per-frame SR (real-time breaks); "
++                  f"plate would denoise-corrupt. Safe default = quality.")
++    elif s.mv_mag_median > AUTO_MOTION_HI or s.fb_react_mean > AUTO_FB_HI:
++        mode = "quality"
++        reason = (f"high motion / occlusion: median mvMag {s.mv_mag_median:.1f} (>{AUTO_MOTION_HI:.0f}) "
++                  f"or fb {s.fb_react_mean:.0f}% (>{AUTO_FB_HI:.0f}%) -> instant softens/flickers "
++                  f"(tOF 3-8x) & breaks real-time. Escalate to quality.")
++    elif missed_cut and s.mv_mag_median > AUTO_SMEAR_MOTION:
++        mode = "quality"
++        reason = (f"MISSED cut: chroma discontinuity {s.chroma_diff_max:.0f} (>{AUTO_HIDDEN_CUT_CHROMA:.0f}) "
++                  f"not split by the luma detector (n_scenes=1) + motion (median mvMag "
++                  f"{s.mv_mag_median:.1f} > {AUTO_SMEAR_MOTION:.0f}) -> instant warps across the un-split "
++                  f"cut = smear. Escalate to quality.")
++    else:
++        # ---- layered candidate: static, single scene, low motion/fb. Confirm human + plate. ----
++        static_ok = s.camera_verdict in ("STATIC", "UNKNOWN")
++        if static_ok and not s.hidden_cut_suspected:
++            cov, pr = _auto_human_coverage(samples)
++            s.human_coverage = None if cov is None else round(cov, 3)
++            s.plate_resid = None if pr is None else round(pr, 2)
++            human = (cov is not None and AUTO_HUMAN_LO <= cov <= AUTO_HUMAN_HI)
++            if cov is None:
++                matte_unavailable = True
++                mode = "instant"
++                reason = (f"static single non-multi-cut scene but matte unavailable "
++                          f"({_MATTE_MODEL['err']}) -> can't confirm human; instant is real-time & "
++                          f"corruption-free (layered dropped for safety).")
++            elif not human:                                  # non-human (incl. coverage 0)
++                mode = "instant"
++                reason = (f"static single scene, low motion (mvMag {s.mv_mag_mean:.1f}) & fb "
++                          f"{s.fb_react_mean:.0f}%, but human coverage {cov:.2f} outside "
++                          f"[{AUTO_HUMAN_LO},{AUTO_HUMAN_HI}] (non-human) -> instant: real-time & acceptable.")
++            elif pr is not None and pr > AUTO_PLATE_RESID_MAX:   # human but bg not static enough
++                mode = "quality"
++                reason = (f"static+human (coverage {cov:.2f}) but plate residual {pr:.1f} > "
++                          f"{AUTO_PLATE_RESID_MAX} levels -> bg not truly static / hidden cut; plate "
++                          f"unsafe -> quality.")
++            else:                                            # human + safe static plate
++                mode = "layered"
++                reason = (f"static camera ({s.camera_verdict}), single scene, human coverage "
++                          f"{cov:.2f} in [{AUTO_HUMAN_LO},{AUTO_HUMAN_HI}], plate residual {pr:.1f} <= "
++                          f"{AUTO_PLATE_RESID_MAX} levels -> safe static-bg plate win.")
++        else:
++            mode = "instant"
++            why = "moving camera" if not static_ok else "suspected hidden cut (chroma)"
++            reason = (f"single scene, low motion (mvMag {s.mv_mag_mean:.1f}) & fb {s.fb_react_mean:.0f}% "
++                      f"but {why} -> layered unsafe; instant is real-time & acceptable.")
++
++    s.probe_s = round(time.perf_counter() - t0, 2)
++    if verbose:
++        print(f"  signals: {asdict(s)}")
++    return AutoRecommendation(mode=mode, reason=reason, signals=asdict(s),
++                              matte_unavailable=matte_unavailable)
++
++
+ # --------------------------------------------------------------------------- #
+ # Main entry point
+ # --------------------------------------------------------------------------- #
+@@ -896,16 +1158,36 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
+     if not try_begin_job():
+         raise BusyError("a clip is already being processed; please wait")
+ 
+-    cfg = MODE_CONFIG.get(mode)             # None for 'layered' (handled by _run_layered)
+-    if out_path is None:
+-        stem = os.path.splitext(os.path.basename(input_path))[0]
+-        out_path = os.path.join(OUTPUTS_DIR, f"{stem}_{mode}.mp4")
+-    video_tmp = out_path + ".video.tmp.mp4"
+-
+     t0 = time.perf_counter()
++    video_tmp = None                        # set once the (resolved) out path is known
++    auto_info = None                        # populated only when mode == "auto"
+     try:
++        # AUTO: resolve to a concrete mode via the CHEAP probe FIRST, then run EXACTLY as today.
++        # The probe runs under the single-job lock (it is part of this job) and inside this try, so a
++        # probe failure still releases the lock. mode/out_path/cfg are derived from the RESOLVED mode,
++        # so the rest of process_clip is byte-for-byte the existing instant/quality/layered run.
++        if mode == "auto":
++            _set_progress(state="probing", mode="auto", done=0, total=0, elapsed_s=0.0,
++                          eta_s=None, ms_per_frame=None, message="auto: analyzing content")
++            probe_n = min(AUTO_PROBE_FRAMES, max_frames) if max_frames else AUTO_PROBE_FRAMES
++            rec = recommend_mode(input_path, max_frames=probe_n)
++            mode = rec.mode
++            auto_info = {"auto_requested": True, "auto_chosen": rec.mode,
++                         "auto_reason": rec.reason, "auto_signals": rec.signals,
++                         "auto_matte_unavailable": rec.matte_unavailable,
++                         "auto_probe_frames": probe_n}
++
++        cfg = MODE_CONFIG.get(mode)             # None for 'layered' (handled by _run_layered)
++        if out_path is None:
++            stem = os.path.splitext(os.path.basename(input_path))[0]
++            out_path = os.path.join(OUTPUTS_DIR, f"{stem}_{mode}.mp4")
++        video_tmp = out_path + ".video.tmp.mp4"
++
+         if mode == "layered":
+-            return _run_layered(input_path, out_path, video_tmp, max_frames, t0)
++            out_path = _run_layered(input_path, out_path, video_tmp, max_frames, t0)
++            if auto_info:                       # surface the auto decision alongside layered stats
++                LAST_STATS.update(auto_info)
++            return out_path
+         _set_progress(state="probing", mode=mode, done=0, total=0, elapsed_s=0.0,
+                       eta_s=None, ms_per_frame=None, message="probing input")
+         fps = _probe_fps(input_path)
+@@ -1096,12 +1378,14 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
+         _set_progress(state="done", done=done, elapsed_s=round(total_s, 1),
+                       eta_s=0.0, ms_per_frame=round(total_s * 1000.0 / max(1, done), 1),
+                       message="done")
++        if auto_info:                           # surface the auto decision in LAST_STATS
++            LAST_STATS.update(auto_info)
+         return out_path
+     except Exception as e:
+         _set_progress(state="error", message=f"{type(e).__name__}: {e}")
+         raise
+     finally:
+-        if os.path.exists(video_tmp):
++        if video_tmp and os.path.exists(video_tmp):
+             try:
+                 os.remove(video_tmp)
+             except OSError:
