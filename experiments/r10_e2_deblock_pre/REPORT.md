@@ -136,3 +136,35 @@ guard did its job: it caught the over-smoothing trap (texture46k, faces) an LPIP
 
 Artifacts: run_ab.py, analyze.py, results.json (280), latency.json, deblock_pre.py,
 build_perframe_cache.patch, verify_patch.py, out/fab_*.png + out/codecpeep_*.png, models/scunet_color_real_psnr.pth.
+
+---
+
+## GRADUATION ADDENDUM (lead, post-integration) — propagation-validated, but stays default-OFF (gate-reliability blocker)
+
+To decide a default-ON flip, the lead ran the two graduation checks (`graduation_ab.py`):
+
+**1. Does the anchor win SURVIVE PROPAGATION + stay temporally stable? → YES.** Full quality
+pipeline (`process_clip`, GRAIN OFF), deblock ON vs OFF, on a real CRF35-degraded 48-frame window,
+scored over ALL frames (anchors + propagated) vs pseudo-HD GT: **LPIPS −0.7%, DISTS −0.9%, tOF −0.5%**
+— all three the right direction, consistent, no flicker added. The −13%/−17% anchor-crop win dilutes
+to a modest-but-real net gain over a MIXED clip (faces don't benefit, graphics/low-detail do); it is
+larger on heavy-low-detail-throughout content. The lever is **safe and the win is real at clip scale.**
+
+**2. Can the gate be made reliable for a silent default? → NO (without bitstream QP).**
+- **Bitstream QP is unavailable** in this PyAV build (libavcodec 62 / PyAV 17 expose no `qscale_table`
+  / qp frame attr — only MOTION_VECTORS side-data; the legacy QP export was removed from modern ffmpeg).
+  So the precise "heavy-compression-only" gate cannot be built here.
+- **The blockiness proxy OVER-FIRES on moderate content:** ordinary broadcast SD (`sample.mp4`,
+  `short.mp4`) trips `block_min=1.30` on **9/25 frames** (mean 1.23, max 1.49) — it cannot separate
+  the heavy regime (deblock helps, CRF35) from the moderate regime (deblock **loses both metrics**,
+  CRF27, measured above). A silent default-ON would therefore apply detail-stripping deblock to ~36%
+  of normal-content frames → a regression on exactly the general case.
+
+**Decision: keep `deblock_pre` default-OFF — now upgraded from "anchor-only validated" to
+"propagation-validated + tOF-safe".** The blocker to a default-flip is GATE RELIABILITY, not quality.
+Ship as a documented opt-in: enable `MODE_CONFIG["quality"]["deblock_pre"] = {"model":
+"scunet_color_real_psnr.pth", "gate":"blockiness", "block_min":<raise for your content>}` when you
+KNOW the input is heavily compressed (low-scaled / re-encoded video). **What would unblock default-ON:**
+(a) a libavcodec build exposing per-frame QP (gate precisely on QP≥~33), or (b) a calibrated
+higher block_min + the dense-texture skip-guard validated across genres. Both are external/follow-up.
+Artifact: `graduation_ab.py`.

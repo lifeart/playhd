@@ -1095,6 +1095,18 @@ tuned, anchor-only (propagation/tOF unmeasured, same caveat R8-E3 closed via an 
 adds a spandrel+72 MB-model dependency (lazy, only when ON). A real, on-target, well-guarded ceiling-raise for
 the literal use case — shipped as an opt-in pending those follow-ups before any default-flip.
 
+**GRADUATION (lead, post-R10, `graduation_ab.py`):** ran the two default-flip gates. **(1) Win survives
+propagation + tOF-safe — PASS:** full `process_clip` quality (grain off) on a real CRF35 48-frame window,
+deblock ON vs OFF vs pseudo-HD GT over ALL frames = LPIPS −0.7% / DISTS −0.9% / tOF −0.5% (the −13/−17%
+anchor win dilutes over a mixed clip but stays net-positive + stable). **(2) Reliable gate for a SILENT
+default — FAIL:** bitstream QP is unavailable in this PyAV/libavcodec build (no qscale_table; legacy QP export
+removed), and the only available signal (blockiness proxy) over-fires on ordinary SD (9/25 frames on
+sample.mp4, where the content is *moderate* — the regime deblock REGRESSES). So a default-ON would strip
+detail on ~36% of normal-content frames. **Verdict: deblock stays default-OFF, upgraded to "propagation-
+validated opt-in."** The blocker is gate reliability, not quality; default-ON needs per-frame QP (an external
+libavcodec build) or a genre-calibrated threshold. This is the right home for it: a measured, safe, real win
+that users with KNOWN heavily-compressed input enable explicitly.
+
 **R10 net:** the model-REPLACEMENT frontier is definitively closed (E1, 6 families); the model-AUGMENTATION angle
 opened a genuine win (E2) — codec-artifact removal IS the missing piece x4plus needs, but only on heavily-
 compressed non-dense anchors, so it ships QP-gated/default-OFF. The honest external frontier is now sharp: a
@@ -1109,7 +1121,7 @@ of over-caution); the rest are justified.
 
 | flag | default | reason |
 |---|---|---|
-| **`deblock_pre` (quality, R10-E2)** | **off (None)** | codec-artifact-removal preprocessor (SCUNet) before the x4plus anchor. **GATED GO** — a real ceiling-raise (LPIPS −13% / DISTS −17% / +0.5 dB) but ONLY on heavily-compressed (CRF≥~33) low/mid-detail anchors; on moderate compression it strips detail and on dense texture it over-smooths (DISTS-caught). Default-OFF: gate is a blockiness proxy (true-QP threading + per-genre tuning pending), anchor-only (propagation unmeasured), single-clip, adds a lazy spandrel+72 MB dependency. A real opt-in for heavily-compressed low-scaled video; byte-identical OFF. |
+| **`deblock_pre` (quality, R10-E2)** | **off (None)** | codec-artifact-removal preprocessor (SCUNet) before the x4plus anchor. **GATED GO, propagation-validated** — a real ceiling-raise (LPIPS −13% / DISTS −17% / +0.5 dB on heavy-low-detail crops) that **survives propagation** (full-clip CRF35: LPIPS −0.7% / DISTS −0.9% / tOF −0.5%, all safe) — but ONLY on heavily-compressed low/mid-detail; on moderate compression it strips detail (DISTS-caught). **Stays default-OFF because the gate can't be made reliable here:** bitstream QP is unavailable (this PyAV build), and the blockiness proxy over-fires on normal SD (9/25 frames on sample.mp4) → a silent default-ON would deblock moderate content where it regresses. A propagation-validated opt-in for *known* heavily-compressed input; byte-identical OFF. Unblock = per-frame QP (gate on QP≥~33) or a genre-calibrated higher threshold. |
 | **`anchor_blend_beta` (quality, R8-E3)** | **0.85 ON (flipped)** | global compact↔x4plus anchor lerp. ≤ x4plus on every measured anchor cell (LPIPS −5.7% mean on degraded content, DISTS-corroborated R8-E4), **zero extra SR**, and the integrated propagation+tOF A/B PASSED (\|ΔF\| ±0.0%, tOF −0.1…−2.4% → adds no flicker; V6: x4plus HF flickers more under warp than compact). The one reason it was OFF (unmeasured propagation) is now measured. Win scales with input degradation (the target); safely neutral on clean SD. **Quality win, on.** |
 | fp16 (quality x4plus) | **ON** | free ~1.23× + perceptually identical (LPIPS(fp16,fp32) ~0.00003, verified R2-E4 + R5-E2). **Speed win, on.** |
 | V2 motion-grain (quality) | **ON** | static-region grain flicker → ~0; **quality win, on.** |
