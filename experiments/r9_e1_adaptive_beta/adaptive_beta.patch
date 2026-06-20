@@ -1,0 +1,152 @@
+R9-E1 integration: a per-CLIP GLOBAL adaptive beta SELECTOR for the anchor blend.
+DEFAULT-OFF -> byte-identical (anchor_blend_adaptive absent/None -> the fixed cfg
+anchor_blend_beta path of R8-E3 is used unchanged; if that is also None the whole blend
+is skipped). This is the R9-E1 hypothesis realized as a NARROW, opt-in research lever --
+NOT a recommended default flip. R9-E1 VERDICT: fixed-0.85 (R8-E3) stays the robust default.
+
+WHAT IT DOES (measured, R6-E1 degrade-restore matrix + a real-libx264 OOD, TRUE AlexNet
+LPIPS arbiter + DISTS corroborator): beta = 0.85 - 0.15*s(tex_comp)*d(disag), a single
+per-clip scalar in [0.70, 0.85], pulled DOWN toward 0.70 (more compact) ONLY on SMOOTH +
+heavily-(synthetically)-degraded clips -- the ONLY cells with measured headroom below 0.85.
+  tex_comp = mean 7x7 local-luma-STD of the COMPACT HR cache (degrade-ROBUST content: real
+             texture survives heavy degrade where Canny edges collapse -- the falsifier that
+             sank the LR-edge variant: texture46k|gritty edge=0.091 < talkinghead|moderate
+             edge=0.087 yet wants opposite beta; tex_comp 17.97 vs 7.67 separates them 2x).
+  disag    = mean |heavy - compact| luma (DEGRADE drive: x4plus over-sharpens synthetic
+             noise/compression the compact net avoids -> high disagreement; a CLEAN real
+             H.264 round-trip keeps both nets in agreement -> low disagreement).
+
+MEASURED (zero-regression hand-set t=[9,14] d=[3.0,4.5], EXACT pixels): <= fixed-0.85 on all
+23 cells (15 synthetic + 8 real-H.264 OOD); strictly beats 0.85 on the SMOOTH heavily-degraded
+face (talkinghead heavy -0.0102, gritty -0.0134 LPIPS; DISTS-corroborated); TIES 0.85 on every
+textured cell (0.85 is already the per-cell optimum there) and every mild/clean real-H.264 cell.
+
+HONEST SCOPE (why DEFAULT OFF, see REPORT.md "threats"): (1) the win rides on ONE smooth-face
+content (n=8) -- no independent smooth clip confirms it; (2) the d_lo degrade-gate floor (3.0)
+must be set just ABOVE the measured real-H.264 disagreement level (~2.96) and is NOT learnable
+from the synthetic operators alone -- a held-out synthetic calibration REGRESSES on real H.264
+(+0.0006). The fixed-0.85 default is strictly more robust. (3) Anchor-only measurement; the
+propagation/tOF effect is UNMEASURED (same caveat as R8-E3).
+
+Cost: tex_comp + disag are two CPU reductions over the two caches the quality path ALREADY
+holds (perframe_cache = x4plus, region_gate["compact"] = compact) -> ZERO extra SR.
+
+SEAM (verify_patch.py): caller `derisk.select_anchor_beta(perframe_cache, region_gate["compact"],
+cfg["anchor_blend_adaptive"])` -> handler `def select_anchor_beta(heavy_cache, compact_cache,
+params)`; both caches dict[int]->HxWx3 uint8 at HD, identical keys; returns a float beta that is
+fed straight into the EXISTING `blend_anchor_cache(...)` (R8-E3, unchanged). params=None -> the
+fixed cfg beta is used (byte-identical to R8-E3); both None -> blend skipped (byte-identical to today).
+
+================================================================================
+--- a/prototype/derisk.py
++++ b/prototype/derisk.py
+@@ def blend_anchor_cache(heavy_cache, compact_cache, beta):
+     for i in list(heavy_cache.keys()):
+         h = heavy_cache[i].astype(np.float32)
+         c = compact_cache[i].astype(np.float32)
+         heavy_cache[i] = np.clip(np.round(c + b * (h - c)), 0, 255).astype(np.uint8)
+     return heavy_cache
+
+
++def select_anchor_beta(heavy_cache, compact_cache, params):
++    """R9-E1 per-CLIP GLOBAL adaptive beta for the anchor blend (DEFAULT OFF / opt-in).
++    Returns ONE scalar beta in [0.70, 0.85] from two NO-REFERENCE global signals computed on
++    the two SR caches the quality path ALREADY has (ZERO extra SR):
++      tex_comp = mean 7x7 local-luma-STD of the COMPACT HR cache  (degrade-ROBUST CONTENT
++                 texture -- high on real detail, low on smooth faces; survives heavy degrade
++                 where Canny edges collapse).
++      disag    = mean |heavy - compact| luma                       (DEGRADE drive -- x4plus
++                 over-sharpens synthetic noise/compression the compact net avoids => high
++                 disagreement; a CLEAN real codec keeps both nets in agreement => low).
++        s = clip((t_hi - tex_comp)/(t_hi - t_lo), 0, 1)  # 1 = SMOOTH content
++        d = clip((disag - d_lo)/(d_hi - d_lo), 0, 1)     # 1 = heavily (synthetically) degraded
++        beta = 0.85 - 0.15 * s * d
++    Pulls beta DOWN toward 0.70 ONLY on smooth + heavily-degraded clips (the ONLY cells with
++    measured headroom below 0.85); stays at 0.85 (the R8-E3 OOD-safe default) on textured
++    content (s~0) and clean/mild real-codec content (d~0). R9-E1: measured <= fixed-0.85 on all
++    23 cells, strictly better on the smooth heavily-degraded face (talkinghead heavy/gritty
++    -0.010/-0.013 LPIPS). NARROW + overfit-fragile (win on one content; d_lo must be hand-set
++    above the real-H.264 disagreement floor, NOT learnable from synthetic alone) -> DEFAULT OFF;
++    fixed-0.85 remains the recommended robust default. params=None -> return the fixed cfg beta.
++    `compact_cache` MUST be index-aligned with `heavy_cache` (region_gate['compact'] already is)."""
++    if params is None:
++        return params  # caller falls back to the fixed cfg beta (R8-E3) -> byte-identical
++    import cv2
++    t_lo, t_hi = float(params["t_lo"]), float(params["t_hi"])
++    d_lo, d_hi = float(params["d_lo"]), float(params["d_hi"])
++    texs, disags = [], []
++    for i in list(heavy_cache.keys()):
++        yc = cv2.cvtColor(compact_cache[i], cv2.COLOR_RGB2GRAY).astype(np.float32)
++        yh = cv2.cvtColor(heavy_cache[i], cv2.COLOR_RGB2GRAY).astype(np.float32)
++        mu = cv2.boxFilter(yc, -1, (7, 7))
++        var = np.maximum(cv2.boxFilter(yc * yc, -1, (7, 7)) - mu * mu, 0.0)
++        texs.append(float(np.sqrt(var).mean()))
++        disags.append(float(np.abs(yh - yc).mean()))
++    tex_comp = float(np.mean(texs)); disag = float(np.mean(disags))
++    s = min(max((t_hi - tex_comp) / max(t_hi - t_lo, 1e-6), 0.0), 1.0)
++    d = min(max((disag - d_lo) / max(d_hi - d_lo, 1e-6), 0.0), 1.0)
++    return float(0.85 - 0.15 * s * d)
++
++
+ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache, anchor_set,
+                 backend="numpy", collect_metrics=True, download_output=True, region_gate=None):
+
+@@ def run(frames, hd_frames, scale, use_residual, out_dir, occ_mode="full", sr_mode="bicubic",
+         reanchor="none", quality_margin=1.0, fallback_budget=1.0, adapt_metric="fallback",
+         perframe_cache=None, anchor_set=None, backend="numpy", grain="off", region_aware=False,
+-        anchor_blend_beta=None):
++        anchor_blend_beta=None, anchor_blend_adaptive=None):
+@@
+     region_gate = (_build_region_gate(frames, w_hd, h_hd, scale) if region_aware else None)
+     # R8-E3 (DEFAULT OFF): blend the HEAVY anchor cache toward COMPACT at a global beta before
+     # propagation (reuses region_gate's compact cache -> zero extra SR). None -> byte-identical.
+-    if anchor_blend_beta is not None:
++    if anchor_blend_beta is not None or anchor_blend_adaptive is not None:
+         _cc = region_gate["compact"] if region_gate is not None else \
+             build_perframe_cache(frames, w_hd, h_hd, "realesrgan")
+-        blend_anchor_cache(perframe_cache, _cc, anchor_blend_beta)
++        # R9-E1 (DEFAULT OFF): if adaptive params are present, derive a per-clip beta from the two
++        # caches (NO-ref tex_comp + disag); else use the fixed R8-E3 scalar. Both None -> skipped.
++        _beta = select_anchor_beta(perframe_cache, _cc, anchor_blend_adaptive)
++        blend_anchor_cache(perframe_cache, _cc, anchor_blend_beta if _beta is None else _beta)
+     rows, R = reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache,
+                           anchor_set, backend=backend, region_gate=region_gate)
+
+================================================================================
+--- a/server/pipeline_api.py
++++ b/server/pipeline_api.py
+@@ MODE_CONFIG = {
+     "quality": dict(sr_mode="realesrgan-x4plus",
+                     ...
+                     region_aware=True,
+                     anchor_blend_beta=None,        # R8-E3 fixed global blend (DEFAULT OFF; 0.85 when flipped)
++                    anchor_blend_adaptive=None,    # R9-E1 per-clip ADAPTIVE beta (DEFAULT OFF / opt-in research
++                                                   # lever). Set dict(t_lo=9,t_hi=14,d_lo=3.0,d_hi=4.5) to enable:
++                                                   # pulls beta to 0.70 on smooth+heavily-degraded clips, stays
++                                                   # 0.85 elsewhere. NARROW win (one content) + overfit-fragile
++                                                   # d_lo floor -> NOT a recommended default; fixed-0.85 is robust.
+                     ...),
+ }
+
+@@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
+     region_gate = derisk._build_region_gate(sub, w_hd, h_hd, SCALE)
+-    if cfg.get("anchor_blend_beta") is not None:           # R8-E3 (OFF by default) -- zero extra SR
+-        derisk.blend_anchor_cache(perframe_cache, region_gate["compact"], cfg["anchor_blend_beta"])
++    if cfg.get("anchor_blend_beta") is not None or cfg.get("anchor_blend_adaptive") is not None:
++        _b = derisk.select_anchor_beta(perframe_cache, region_gate["compact"],   # R9-E1 (OFF) -- zero extra SR
++                                       cfg.get("anchor_blend_adaptive"))
++        derisk.blend_anchor_cache(perframe_cache, region_gate["compact"],
++                                  cfg["anchor_blend_beta"] if _b is None else _b)
+
+@@ def process_clip(...):  # quality chunk loop
+                 region_gate = (derisk._build_region_gate(chunk, w_hd, h_hd, SCALE)
+                                if cfg["region_aware"] else None)
+-                if cfg.get("anchor_blend_beta") is not None and region_gate is not None:
+-                    derisk.blend_anchor_cache(perframe_cache, region_gate["compact"],
+-                                              cfg["anchor_blend_beta"])   # R8-E3 OFF by default
++                if (cfg.get("anchor_blend_beta") is not None
++                        or cfg.get("anchor_blend_adaptive") is not None) and region_gate is not None:
++                    _b = derisk.select_anchor_beta(perframe_cache, region_gate["compact"],
++                                                   cfg.get("anchor_blend_adaptive"))  # R9-E1 OFF by default
++                    derisk.blend_anchor_cache(perframe_cache, region_gate["compact"],
++                                              cfg["anchor_blend_beta"] if _b is None else _b)

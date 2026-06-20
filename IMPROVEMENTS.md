@@ -74,6 +74,20 @@
 >   flips** (x4plus>compact on textured, grain-OFF-for-fidelity, instant=compact all re-confirmed). The quality
 >   program does not rest on LPIPS alone. VMAF could not run (no libvmaf; documented).
 
+> **UPDATE — research round R9 (does the quality CEILING move? → CONVERGENCE; see `handoff.md` → "## Research
+> round R9"):** both experiments NO-GO, both CONFIRM R8's decisions.
+> - ◻ **Degradation-aware anchor (R9-E2) — NO-GO:** a capacity-equal real-world ESRGAN (4x-UltraSharp 16.7M) +
+>   wdn denoise blends LOSE to x4plus on REAL libx264 crops (LPIPS 0.136 vs 0.118, DISTS 0.181 vs 0.161; x4plus
+>   wins 90% paired) and reproduce the GOTCHA #23 fake-detail trap (var-Lap 160 vs 53 but plasticky/loses real
+>   metrics). **x4plus stays the validated ceiling.** Future headroom needs a genuinely *codec-trained* model.
+> - ◻ **Per-clip-adaptive β (R9-E1) — NO-GO for default:** a per-clip β beats fixed-0.85 on only 3/23 cells
+>   (smooth talking-head, heavily degraded), ties on all 20 textured + real-H.264 cells (0.85 is already their
+>   optimum); the no-reference degrade gate is NOT auto-calibratable from synthetic operators (regresses on
+>   held-out real H.264). **Fixed β=0.85 (R8-E3) stays the robust default**; adaptive delivered default-OFF, not landed.
+> - **Net:** zero default changes — and that IS the result. The quality program (x4plus + region-aware blend +
+>   β=0.85) is a **validated local optimum** for the tools obtainable here; remaining headroom is external
+>   (a codec-trained model; independent smooth-content clips).
+
 Performance + visual-quality "poke", 2026-06-19. Read-only analysis of existing code, the
 documented Step 6/7 profiling, and the shipped `server/outputs/*.mp4`, plus light new
 measurement (one 24-frame instant run; a few-frame visual diff on real outputs). No

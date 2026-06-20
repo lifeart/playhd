@@ -1013,6 +1013,48 @@ metric-triangulation that **de-risks the entire quality program** (DISTS agrees 
 call). Every framed hypothesis was refuted and each experiment still produced a real result — the frontier is
 now genuinely thin (default-OFF opt-ins with honest tradeoffs + a strong "the existing decisions are correct").
 
+## Research round R9 — does the quality CEILING move? (2 experiments → convergence, 2026-06-20)
+
+After R8 validated the quality *program*, R9 attacked the two levers that could actually raise the ceiling:
+a better anchor MODEL, and a smarter (per-clip) β. **Both are NO-GO — they CONFIRM R8's decisions.** This is
+the convergence signal: the quality program has reached a well-validated local optimum for the obtainable
+tools. Reports in `experiments/r9_*/REPORT.md`. (R9-E1's agent hit a transient 401 after completing all 6
+measurement steps + its patch; the lead salvaged the finished `step{1..6}_*.json` and wrote the report.)
+
+**R9-E2 — degradation-aware anchor does NOT beat x4plus → x4plus stays the ceiling.** The diffusion-anchor
+NO-GO named a successor path (a model trained on real codec degradation). Tested the strongest *obtainable,
+non-diffusion* challenger: **4x-UltraSharp** (a capacity-EQUAL 16.7M RRDB real-world ESRGAN — a fair fight,
+not a smaller net) + realesr-general **wdn** denoise DNI blends, via `spandrel` (installed cleanly; network
+works), A/B vs x4plus on **REAL libx264-degraded** `sample.mp4` crops (5 windows × 2 CRF), TRUE LPIPS + DISTS
++ PSNR. **x4plus wins decisively:** LPIPS 0.118 / DISTS 0.161 vs UltraSharp 0.136 / 0.181 (+15% / +12% worse),
+winning 90% of paired samples; no challenger beats x4plus on LPIPS AND DISTS on any detailed cell. **The
+anti-fabrication check (GOTCHA #23) fired exactly as designed:** UltraSharp's var-Lap is 160 vs x4plus's 53
+(looks 3× "sharper") but is **visually plasticky/3D-rendered** and loses every full-reference metric — the same
+fake-detail trap that killed the diffusion anchor, caught again on a different architecture. On real H.264 LR
+it instead over-denoises (softest output). Blocker: 4xNomos8kSC's 67 MB download truncated (throttled box);
+same ESRGAN family, unlikely to flip. A future attempt needs a genuinely **codec-trained** (not
+synthetic-degradation) model on an unthrottled box. **x4plus remains the validated quality ceiling.**
+
+**R9-E1 — per-clip-adaptive β does NOT robustly beat fixed-0.85 → β=0.85 stays the robust default.** A per-CLIP
+global β (one scalar, keyed on no-reference signals `tex_comp` = compact-cache local-std + `disag` =
+|x4plus−compact|), pulled toward 0.70 only on smooth + heavily-degraded clips. Measured across the R8-E3 matrix
++ real-libx264 OOD (23 cells, TRUE LPIPS + DISTS, zero extra SR): **3 WIN / 20 TIE / 0 REGRESS** — it beats
+fixed-0.85 ONLY on the smooth talking-head heavily/gritty-degraded cells (−0.010/−0.013 LPIPS, DISTS-
+corroborated) and **ties on every textured cell (0.85 is already their per-cell optimum) and every real-H.264
+cell**. **NO-GO for a default change** on three honest threats: (1) the win rides on ONE smooth content (n=8),
+no independent smooth clip confirms it; (2) the degrade-gate is **not auto-calibratable from synthetic operators**
+— a held-out synthetic calibration REGRESSES on real H.264 (+0.0006), so the "0 regress" used a gate hand-set
+with knowledge of the real-H.264 disagreement level; (3) anchor-only (same caveat R8-E3 closed for the fixed β).
+Fixed-0.85 captures the textured + real cells optimally without a fragile gate → **strictly more robust**.
+Delivered as a default-OFF `anchor_blend_adaptive` patch (byte-identical when off), **not landed**.
+
+**R9 net:** zero default changes — and that is the result. Two independent attacks on the quality ceiling
+(a capacity-equal real-world anchor; a per-clip-adaptive β) both fail to beat the R8 configuration, so
+**x4plus + region-aware blend + β=0.85 is a validated local optimum** for the tools obtainable on this box.
+The remaining genuine headroom is external: a *codec-trained* SR model (R9-E2) and independent smooth-content
+clips to confirm/extend the adaptive-β slice (R9-E1) — neither available here. The quality frontier is, for
+now, **converged**.
+
 ## Default-flag audit — why each is ON/OFF (speed × accuracy × quality)
 
 A deliberate pass over every optional flag (the goal is speed AND accuracy AND quality — flags are only
