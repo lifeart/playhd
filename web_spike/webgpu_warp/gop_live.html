@@ -75,29 +75,39 @@ async function main(){
     rp.setPipeline(pshp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();dev.queue.submit([e.finish()]);
   }
 
-  // ---- warp + hole-fallback pipeline ----
+  // ---- warp + occlusion(intra OR reactive) fallback pipeline ----
+  // occlusion = intra-hole (flow sentinel) OR reactive: mean_c|LR_cur - warp_lr(LR_prev)| > TAU codes.
   const wmod=dev.createShaderModule({code:`
-    struct U{w:u32,h:u32,scale:u32,_p:u32};
-    @group(0) @binding(0) var prevRecon:texture_2d<f32>;@group(0) @binding(1) var samp:sampler;@group(0) @binding(2) var flowTex:texture_2d<f32>;@group(0) @binding(3) var lrTex:texture_2d<f32>;@group(0) @binding(4) var<uniform> u:U;
+    struct U{w:u32,h:u32,scale:u32,lr_w:u32, lr_h:u32,tau:u32,_a:u32,_b:u32};
+    @group(0) @binding(0) var prevRecon:texture_2d<f32>;@group(0) @binding(1) var samp:sampler;@group(0) @binding(2) var flowTex:texture_2d<f32>;@group(0) @binding(3) var lrCur:texture_2d<f32>;@group(0) @binding(4) var<uniform> u:U;@group(0) @binding(5) var lrPrev:texture_2d<f32>;
     @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
     @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
       let dst=vec2i(floor(pos.xy));let lr=dst/i32(u.scale);let f=textureLoad(flowTex,lr,0).xy;
-      if(f.x< -1.0e8){return vec4f(textureSampleLevel(lrTex,samp,pos.xy/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0);}
+      var unreliable = f.x < -1.0e8;                                   // (a) intra hole
+      if(!unreliable){                                                 // (b) reactive residual
+        let predUV=(vec2f(lr)+f+vec2f(0.5))/vec2f(f32(u.lr_w),f32(u.lr_h));
+        let prevv=textureSampleLevel(lrPrev,samp,predUV,0.0).rgb;      // warp_lr(LR_prev) (bilinear)
+        let curv=textureLoad(lrCur,lr,0).rgb;
+        let react=(abs(curv.r-prevv.r)+abs(curv.g-prevv.g)+abs(curv.b-prevv.b))/3.0;
+        unreliable = react*255.0 > f32(u.tau);
+      }
+      if(unreliable){return vec4f(textureSampleLevel(lrCur,samp,pos.xy/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0);}
       let src=vec2f(dst)+f*f32(u.scale);return vec4f(textureSampleLevel(prevRecon,samp,(src+vec2f(0.5))/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0);}`});
   const wpipe=dev.createRenderPipeline({layout:"auto",vertex:{module:wmod,entryPoint:"vs"},fragment:{module:wmod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
-  const wuni=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(wuni,0,new Uint32Array([w_hd,h_hd,scale,0]));
+  const wuni=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(wuni,0,new Uint32Array([w_hd,h_hd,scale,w_lr,h_lr,16,0,0]));
 
   // ---- build the chain ----
-  const t0=performance.now();const recon=[];const bpr=Math.ceil(w_hd*4/256)*256;const mads=[];const madsI=[];let srMs=0;
+  const t0=performance.now();const recon=[];const bpr=Math.ceil(w_hd*4/256)*256;const mads=[];const madsI=[];let srMs=0;let lrTexPrev=null;
   for(const fr of frames){
     const i=fr.i;const tex=hdTex();
+    const lrCur=await lrTexOf(`../gop_live_data/lr_${i}.png`);          // every frame (anchor too -> serves as LR_prev next)
     if(fr.anchor){const s=performance.now();await runSR(`../gop_live_data/lr_${i}.png`,tex);await dev.queue.onSubmittedWorkDone();srMs=performance.now()-s;}
     else{
-      const flow=await flowTexOf(`../gop_live_data/flow_${i}.bin`);const lr=await lrTexOf(`../gop_live_data/lr_${i}.png`);
-      const bg=dev.createBindGroup({layout:wpipe.getBindGroupLayout(0),entries:[{binding:0,resource:recon[i-1].createView()},{binding:1,resource:samp},{binding:2,resource:flow.createView()},{binding:3,resource:lr.createView()},{binding:4,resource:{buffer:wuni}}]});
+      const flow=await flowTexOf(`../gop_live_data/flow_${i}.bin`);
+      const bg=dev.createBindGroup({layout:wpipe.getBindGroupLayout(0),entries:[{binding:0,resource:recon[i-1].createView()},{binding:1,resource:samp},{binding:2,resource:flow.createView()},{binding:3,resource:lrCur.createView()},{binding:4,resource:{buffer:wuni}},{binding:5,resource:lrTexPrev.createView()}]});
       const e=dev.createCommandEncoder();const p=e.beginRenderPass({colorAttachments:[{view:tex.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});p.setPipeline(wpipe);p.setBindGroup(0,bg);p.draw(3);p.end();dev.queue.submit([e.finish()]);
     }
-    recon[i]=tex;
+    recon[i]=tex;lrTexPrev=lrCur;
     const rb=dev.createBuffer({size:bpr*h_hd,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
     const e2=dev.createCommandEncoder();e2.copyTextureToBuffer({texture:tex},{buffer:rb,bytesPerRow:bpr,rowsPerImage:h_hd},[w_hd,h_hd]);dev.queue.submit([e2.finish()]);await dev.queue.onSubmittedWorkDone();
     await rb.mapAsync(GPUMapMode.READ);const g=new Uint8Array(rb.getMappedRange());const ref=await imgData(`../gop_live_data/ref_${i}.png`,w_hd,h_hd);

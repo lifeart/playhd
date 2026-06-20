@@ -43,7 +43,8 @@ def main():
         if len(seq) >= NFRAMES: break
     c.close()
     H = W = CS; w_hd, h_hd = W * SCALE, H * SCALE
-    recon_prev = None; meta_frames = []
+    TAU = 16.0                                          # reactive residual threshold (matches occlusion_mask_lr)
+    recon_prev = None; lr_prev = None; meta_frames = []
     for i, (pt, full, mvs) in enumerate(seq):
         lr = np.ascontiguousarray(full[CY:CY + H, CX:CX + W])
         savep(os.path.join(OUT, f"lr_{i}.png"), lr)
@@ -54,15 +55,20 @@ def main():
             fxf, fyf = derisk.build_lr_flow(mvs, full.shape[0], full.shape[1], want="past")
             fx = np.ascontiguousarray(fxf[CY:CY + H, CX:CX + W])  # crop the flow (offsets are crop-relative)
             fy = np.ascontiguousarray(fyf[CY:CY + H, CX:CX + W])
-            warped, hole = derisk.warp_hd(recon_prev, fx, fy, SCALE)
+            # occlusion = intra-hole (a) OR reactive (b): |LR_cur - warp_lr(LR_prev)| > TAU  (occ='reactive')
+            pred = derisk.warp_lr(lr_prev, fx, fy).astype(np.float32)
+            react = np.abs(lr.astype(np.float32) - pred).mean(axis=2)
+            base = (~np.isfinite(fx)) | (react > TAU)             # LR unreliable-pixel mask
+            warped, _ = derisk.warp_hd(recon_prev, fx, fy, SCALE)
             fallback = cv2.resize(lr, (w_hd, h_hd), interpolation=cv2.INTER_LINEAR)
-            recon = np.where(hole[..., None], fallback, warped).astype(np.uint8)
+            mask_hd = cv2.resize(base.astype(np.uint8), (w_hd, h_hd), interpolation=cv2.INTER_NEAREST).astype(bool)
+            recon = np.where(mask_hd[..., None], fallback, warped).astype(np.uint8)
             flow = np.zeros((H, W, 4), np.float32)
             flow[:, :, 0] = np.where(np.isnan(fx), SENT, fx); flow[:, :, 1] = np.nan_to_num(fy)
             flow.tofile(os.path.join(OUT, f"flow_{i}.bin"))
         savep(os.path.join(OUT, f"ref_{i}.png"), recon)
         meta_frames.append(dict(i=i, type=pt, anchor=bool(is_anchor)))
-        recon_prev = recon
+        recon_prev = recon; lr_prev = lr
     json.dump(dict(w_lr=W, h_lr=H, scale=SCALE, w_hd=w_hd, h_hd=h_hd, fps=round(fps, 3),
                    n=len(seq), frames=meta_frames), open(os.path.join(OUT, "meta.json"), "w"))
     na = sum(1 for m in meta_frames if m["anchor"])

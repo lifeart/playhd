@@ -145,7 +145,18 @@ texture needs `TEXTURE_BINDING`; (3) a `copyExternalImageToTexture` destination 
 
 **This closes P1's core in-browser:** the full instant-tier pipeline — on-GPU compact SR anchor (bit-exact) +
 chained codec-MV warp + hole fallback + playback — runs and is parity-verified against the prototype, with
-**MVs the only offline input**. Remaining for a fully-live tier: reactive occlusion (vs intra-only holes),
-the WASM MV-binding (emsdk — parked), conv perf optimization, and a full-frame (uncropped) run.
+**MVs the only offline input**.
+
+## + Reactive occlusion mask (catches bad MVs, not just intra holes) — parity-verified
+The fallback now unions **(a) intra holes** (flow sentinel) **with (b) the reactive residual**
+`mean_c|LR_cur − warp_lr(LR_prev)| > TAU(16)` — exactly the prototype's `occlusion_mask_lr` *reactive* mode
+((a)+(b); the project's key occlusion lever — "detecting ~3% extra unreliable pixels flips wins-7-frames →
+wins-all-23"). In the warp shader: per HD pixel, bilinear-sample the *previous* LR at `lr+flow`, compare to
+the current LR, fall back where the residual exceeds the threshold. Re-extracted the Python reference with the
+same reactive mask and re-verified: **full-chain parity avg 0.007 / worst-frame 0.020 codes** over 12 frames
+(per-frame mean 0.001–0.013; the occasional max ~100 is a single pixel sitting exactly on the `react>16`
+threshold flipping warp↔fallback between float and uint8 — negligible in the mean). Remaining for a
+fully-live tier: the WASM MV-binding (emsdk — parked), conv perf optimization (the ~1.3 s naive anchor),
+the adaptive fwd-bwd splat (occlusion mode (c), high-motion only), and a full-frame (uncropped) run.
 
 Reproduce: `python extract_gop_live.py` then open `webgpu_warp/gop_live.html`; results in `window.__live`.
