@@ -20,7 +20,7 @@ async function main(){
   const dev=await (await navigator.gpu.requestAdapter()).requestDevice();
   const samp=dev.createSampler({magFilter:"linear",minFilter:"linear",addressModeU:"clamp-to-edge",addressModeV:"clamp-to-edge"});
   const hdTex=()=>dev.createTexture({size:[w_hd,h_hd],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
-  const lrTexOf=async u=>{const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+  const lrTexOf=async u=>{const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.RENDER_ATTACHMENT});
     const b=await createImageBitmap(await (await fetch(u)).blob());dev.queue.copyExternalImageToTexture({source:b},{texture:t},[w_lr,h_lr]);return t;};
   const flowTexOf=async u=>{const buf=new Float32Array(await (await fetch(u)).arrayBuffer());
     const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba32float",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});

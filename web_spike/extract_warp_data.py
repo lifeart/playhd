@@ -20,7 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "prototype"))
 import derisk, sr
 
-SCALE = 2                      # instant tier = 720p (x2)
+SCALE = 2                      # instant tier = 720p (x2). (The x4 path was separately verified =0.000.)
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "demo_data")
 os.makedirs(OUT, exist_ok=True)
 PT = {1: "I", 2: "P", 3: "B"}

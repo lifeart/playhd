@@ -118,28 +118,34 @@ Reproduce: `python export_compact_weights.py` then open `webgpu_warp/sr.html`; r
 
 ---
 
-# LIVE pipeline (on-GPU SR anchor + warp chain) — RUNS, anchor bit-exact; x4-crop parity UNRESOLVED (honest status)
+# LIVE pipeline (on-GPU SR anchor + warp chain) — BROWSER-VERIFIED, parity-perfect
 
 `gop_live.html` + `extract_gop_live.py` wire the on-GPU compact SR into the GOP loop: the anchor is SR'd
 **in-browser** (no offline anchor PNG), the rest propagate by codec-MV warp + hole fallback, played to canvas.
-**MVs are the only remaining offline input.** Uses a 256×256 LR crop at the net's native x4 (→1024×1024) to
-avoid a scale mismatch.
+**MVs are the only remaining offline input.** 256×256 LR crop at the net's native x4 (→1024×1024).
 
-**What is verified:**
-- The **on-GPU SR anchor is bit-exact in the chain** — frame 0 (the I-frame, SR'd on-GPU) parity vs the
-  PyTorch reference = **mean \|Δ\| = 0.000, max 1**. The SR-wiring goal is met.
-- The combined page **runs end-to-end and plays coherently** in-browser (visually correct propagated crop).
+| metric | value |
+|---|---|
+| **on-GPU SR anchor (frame 0) parity** | **mean \|Δ\| = 0.000, max 1** (bit-exact, in-chain) |
+| **full-chain parity vs Python ref** | **avg 0.003, worst-frame 0.0098 codes** over all 12 frames → PASS |
+| hole-fallback parity | 0.02 (non-hole 0.000) |
+| playback | loops to canvas at 25 fps; visually correct propagated crop |
 
-**What is NOT verified (open item, not overstated):** the *full-chain* numerical parity vs the Python
-reference is **off** on this x4-crop harness (avg ~16–27, worst ~94 codes; grows along the chain) — and an
-interior-only check did **not** clear it, so it is **not** merely a crop-edge border-clamp artifact as first
-hypothesized. The individual components are each parity-verified (SR bit-exact above; the *identical* warp
-shader passed at **0.016** in `gop.html` at **x2 full-frame**), so the discrepancy is specific to the
-**previously-untested x4-crop path** (the warp/flow/fallback at scale 4 on a heavily-panning crop, or the
-`extract_gop_live` reference itself). **Root cause not yet found.** This is the immediate follow-up — likely
-fastest to resolve by validating the x4 warp standalone (an x4 version of the `index.html` single-warp parity
-test) to isolate whether the divergence is in the browser x4 path or the Python x4-crop reference, then a
-full-frame (uncropped) live run. **Do not treat the live pipeline as parity-verified until this closes.**
+**The bug that was here (root-caused — a real WebGPU gotcha, the 3rd texture-usage one):** the LR fallback
+texture initially rendered **black**, so hole pixels diverged by up to ~90 codes (full-chain avg ~16–27).
+Cause: **`copyExternalImageToTexture` requires the destination texture to include `RENDER_ATTACHMENT` usage**;
+`gop_live`'s `lrTexOf` had only `TEXTURE_BINDING|COPY_DST`, so the LR upload silently produced a black
+texture and the fallback sampled black. (`gop.html` already had `RENDER_ATTACHMENT` and was correct.) Isolating
+it: the warp split cleanly — **non-hole pixels were already 0.000** (warp perfect), all error was in the holes;
+an x4 standalone single-warp test (`index.html` at SCALE=4) returned **0.000**, proving the browser x4 warp;
+then a hole/non-hole pixel dump showed the fallback returning `[0,0,0]` vs real LR content → the missing usage.
+**Fix:** add `RENDER_ATTACHMENT` to `lrTexOf` → full-chain parity 0.003. **Three texture-usage rules now
+recorded:** (1) `textureSample` only in uniform control flow (use `textureSampleLevel`); (2) a *sampled*
+texture needs `TEXTURE_BINDING`; (3) a `copyExternalImageToTexture` destination needs `RENDER_ATTACHMENT`.
 
-Reproduce: `python extract_gop_live.py` then open `webgpu_warp/gop_live.html`; results in `window.__live`
-(`avgInterior`/`worstInterior` + full-frame).
+**This closes P1's core in-browser:** the full instant-tier pipeline — on-GPU compact SR anchor (bit-exact) +
+chained codec-MV warp + hole fallback + playback — runs and is parity-verified against the prototype, with
+**MVs the only offline input**. Remaining for a fully-live tier: reactive occlusion (vs intra-only holes),
+the WASM MV-binding (emsdk — parked), conv perf optimization, and a full-frame (uncropped) run.
+
+Reproduce: `python extract_gop_live.py` then open `webgpu_warp/gop_live.html`; results in `window.__live`.
