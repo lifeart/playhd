@@ -61,14 +61,16 @@ async function main(){
     for(let y=0;y<h_lr;y++)for(let x=0;x<w_lr;x++){const o=(y*w_lr+x)*4;for(let c=0;c<3;c++)lp[c*plane+y*w_lr+x]=px[o+c]/255;}
     const LRb=dev.createBuffer({size:lp.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(LRb,0,lp);
     const Ai=new Float32Array(FC*plane);Ai.set(lp.subarray(0,3*plane),0);dev.queue.writeBuffer(A,0,Ai);
-    let inb=A,outb=B;
+    let inb=A,outb=B;const bgs=[];   // all 34 conv layers in ONE encoder/submit (per-pass barriers; same math)
     for(const ly of cnet.layers){
       const u=new Uint32Array([h_lr,w_lr,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
       const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
-      const bg=dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:W_gpu}},{binding:3,resource:{buffer:ub}}]});
-      const e=dev.createCommandEncoder();const p=e.beginComputePass();p.setPipeline(cpipe);p.setBindGroup(0,bg);p.dispatchWorkgroups(Math.ceil(w_lr/8),Math.ceil(h_lr/8),ly.out_c);p.end();dev.queue.submit([e.finish()]);
+      bgs.push({bg:dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:W_gpu}},{binding:3,resource:{buffer:ub}}]}),gz:ly.out_c});
       [inb,outb]=[outb,inb];
     }
+    const ce=dev.createCommandEncoder();
+    for(const b of bgs){const p=ce.beginComputePass();p.setPipeline(cpipe);p.setBindGroup(0,b.bg);p.dispatchWorkgroups(Math.ceil(w_lr/8),Math.ceil(h_lr/8),b.gz);p.end();}
+    dev.queue.submit([ce.finish()]);
     const fu=new Uint32Array([h_lr,w_lr,scale,0]);const fub=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(fub,0,fu);
     const fbg=dev.createBindGroup({layout:pshp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:LRb}},{binding:2,resource:{buffer:fub}}]});
     const e=dev.createCommandEncoder();const rp=e.beginRenderPass({colorAttachments:[{view:dstTex.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});

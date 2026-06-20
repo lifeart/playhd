@@ -65,20 +65,24 @@ async function main(){
   const cpipe=dev.createComputePipeline({layout:"auto",compute:{module:conv,entryPoint:"main"}});
   const pe=await dev.popErrorScope(); if(pe){L("CONV PIPELINE ERR: "+pe.message,"err");R.error="conv-pipe";return;}
 
+  // pre-build per-layer uniforms + bindgroups (once), then run ALL 34 layers in ONE encoder/submit
+  // (each layer is its own compute pass -> pass boundaries give the read-after-write barrier; the
+  //  conv math + order are unchanged -> parity preserved). Removes 33 submit/sync round-trips.
   const t0=performance.now();
-  let inb=A, outb=B;
+  let inb=A, outb=B; const bgs=[];
   for(let k=0;k<layers.length;k++){
     const ly=layers[k];
     const u=new Uint32Array([H,W,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
     const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST}); dev.queue.writeBuffer(ub,0,u);
-    const bg=dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[
-      {binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:W_gpu}},{binding:3,resource:{buffer:ub}}]});
-    const e=dev.createCommandEncoder(); const p=e.beginComputePass();
-    p.setPipeline(cpipe); p.setBindGroup(0,bg);
-    p.dispatchWorkgroups(Math.ceil(W/8),Math.ceil(H/8),ly.out_c); p.end(); dev.queue.submit([e.finish()]);
-    [inb,outb]=[outb,inb];     // ping-pong; last output is in `inb`
+    bgs.push({bg:dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[
+      {binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:W_gpu}},{binding:3,resource:{buffer:ub}}]}),
+      gx:Math.ceil(W/8),gy:Math.ceil(H/8),gz:ly.out_c});
+    [inb,outb]=[outb,inb];
   }
-  const featLast=inb;  // conv_last output (48 ch)
+  const enc=dev.createCommandEncoder();
+  for(const b of bgs){const p=enc.beginComputePass();p.setPipeline(cpipe);p.setBindGroup(0,b.bg);p.dispatchWorkgroups(b.gx,b.gy,b.gz);p.end();}
+  dev.queue.submit([enc.finish()]);
+  const featLast=inb;  // conv_last output (48 ch) -- inb after 34 swaps
 
   // PixelShuffle(4) + nearest residual -> rgba8 HD texture (render pass; storage read in fragment)
   const out=dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC|GPUTextureUsage.TEXTURE_BINDING});
