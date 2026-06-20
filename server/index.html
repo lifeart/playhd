@@ -79,7 +79,13 @@
                 display:inline-flex; align-items:center; gap:6px; }
   .badge.live::before { content:""; width:6px; height:6px; border-radius:50%; background:#56d364;
                         animation:pulse 1.2s ease-in-out infinite; }
+  .videoWrap { position:relative; }
   video { width:100%; border-radius:9px; background:#000; display:block; }
+  .unmute { position:absolute; left:12px; bottom:54px; z-index:5; display:none; cursor:pointer;
+            background:#0d1117dd; color:#fff; border:1px solid #ffffff33; border-radius:8px;
+            padding:7px 13px; font-size:13px; font-weight:600; backdrop-filter:blur(4px);
+            box-shadow:0 4px 14px #0008; }
+  .unmute:hover { background:#0d1117f5; border-color:#ffffff55; }
   .stats { font-size:12px; color:var(--muted); margin-top:10px; white-space:pre-wrap;
            font-family:ui-monospace,SFMono-Regular,monospace; background:#0d1117;
            border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
@@ -139,7 +145,10 @@
 
   <div class="panel" id="playerPanel" style="display:none">
     <div class="playerHead"><span class="t">Result</span><span id="playerBadge" class="badge">—</span></div>
-    <video id="player" controls autoplay playsinline></video>
+    <div class="videoWrap">
+      <video id="player" controls autoplay playsinline muted></video>
+      <button id="unmute" class="unmute">🔊 Tap for sound</button>
+    </div>
     <div class="stats" id="stats"></div>
   </div>
   </div>
@@ -233,6 +242,22 @@ function setBadge(text, live) {
   b.textContent = text;
 }
 
+// Play WITH sound; if the browser blocks unmuted autoplay (the click's user-gesture window expired
+// during a long render), fall back to MUTED autoplay (always allowed) so the video is VISIBLE, and
+// surface a one-tap unmute button — instead of a stuck spinner / paused frame the user must hunt for.
+function playResult(v) {
+  const un = $("unmute");
+  un.style.display = "none";
+  v.muted = false;
+  v.play().then(() => { un.style.display = "none"; }).catch(() => {
+    v.muted = true;
+    v.play().then(() => {
+      un.style.display = "block";
+      un.onclick = () => { v.muted = false; un.style.display = "none"; v.play().catch(() => {}); };
+    }).catch(() => {});
+  });
+}
+
 function fmt(t) { return (t == null) ? "—" : `${t}s`; }
 
 function renderProgress(p) {
@@ -308,8 +333,7 @@ async function runStreaming(btn) {
       playViaMSE(v, url, MIME, btn, finish);
     } else {                                  // native fallback (Safari handles fMP4 over <video src>)
       v.onerror = () => { finish(); setStatus("Stream failed — server may be busy; try again.", true); };
-      v.src = url; v.load();
-      v.play().catch(() => setStatus("Ready — click ▶ to play (autoplay-with-sound blocked)."));
+      v.src = url; v.load(); playResult(v);
     }
   } catch (e) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
@@ -348,7 +372,7 @@ function playViaMSE(v, url, mime, btn, finish) {
       }
       try {
         sb.appendBuffer(queue[0]); queue.shift();
-        if (!started) { started = true; v.play().catch(() => setStatus("Ready — click ▶ (autoplay blocked).")); }
+        if (!started) { started = true; playResult(v); }
       } catch (e) {
         if (e.name === "QuotaExceededError") {                 // evict already-played buffer, retry
           const cur = v.currentTime;
@@ -427,10 +451,9 @@ $("go").onclick = async () => {
 
     $("playerPanel").style.display = "";
     const v = $("player");
-    v.muted = false;                 // play WITH sound
     v.src = data.url;
     v.load();
-    v.play().catch(() => setStatus("Done — click ▶ to play (browser blocked autoplay-with-sound)."));
+    playResult(v);                   // play with sound, or muted-with-unmute if autoplay is blocked
 
     let statsText = "";
     if (s.auto_requested) {                  // Auto → <chosen>: <why>
