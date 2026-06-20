@@ -3,58 +3,98 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>playhd — upscaler</title>
+<title>playhd — video upscaler</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232f81f7'/><path d='M12.5 9.5L23 16L12.5 22.5Z' fill='white'/></svg>" />
+<meta name="theme-color" content="#0e1117" />
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; --bg:#0e1117; --panel:#161b22; --border:#30363d;
+          --muted:#8b949e; --fg:#e6edf3; --blue:#2f81f7; --green:#3fb950; }
   * { box-sizing: border-box; }
-  body {
-    margin: 0; font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: #0e1117; color: #e6edf3; padding: 28px;
-  }
-  h1 { font-size: 20px; margin: 0 0 2px; }
-  .sub { color: #8b949e; margin: 0 0 22px; font-size: 13px; }
-  .panel {
-    background: #161b22; border: 1px solid #30363d; border-radius: 10px;
-    padding: 18px 20px; max-width: 900px; margin: 0 auto 18px;
-  }
-  label { display: block; font-weight: 600; margin: 14px 0 6px; font-size: 13px; }
-  label:first-child { margin-top: 0; }
-  select, input[type=file] {
-    width: 100%; padding: 8px 10px; background: #0d1117; color: #e6edf3;
-    border: 1px solid #30363d; border-radius: 6px; font-size: 14px;
-  }
-  .row { display: flex; gap: 16px; }
-  .row > div { flex: 1; }
-  .modes { display: flex; gap: 12px; margin-top: 6px; }
-  .mode {
-    flex: 1; border: 1px solid #30363d; border-radius: 8px; padding: 12px;
-    cursor: pointer; background: #0d1117; transition: border-color .15s, background .15s;
-  }
-  .mode.sel { border-color: #2f81f7; background: #11203a; }
-  .mode .t { font-weight: 700; }
-  .mode .d { color: #8b949e; font-size: 12px; margin-top: 4px; }
-  button#go {
-    margin-top: 20px; width: 100%; padding: 13px; font-size: 16px; font-weight: 700;
-    background: #238636; color: #fff; border: 0; border-radius: 8px; cursor: pointer;
-  }
-  button#go:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
-  #progressWrap { margin-top: 16px; display: none; }
-  .bar { height: 12px; background: #0d1117; border: 1px solid #30363d; border-radius: 7px; overflow: hidden; }
-  .bar > i { display: block; height: 100%; width: 0%; background: #2f81f7;
-             transition: width .25s ease; }
-  #progressText { margin-top: 8px; font-size: 13px; color: #8b949e;
-                  font-family: ui-monospace, SFMono-Regular, monospace; }
-  #status { margin-top: 12px; font-size: 13px; color: #8b949e; min-height: 18px; }
-  #status.err { color: #f85149; }
-  video { width: 100%; border-radius: 8px; margin-top: 4px; background: #000; }
-  .stats { font-size: 12px; color: #8b949e; margin-top: 10px; white-space: pre-wrap;
-           font-family: ui-monospace, SFMono-Regular, monospace; }
-  small.hint { color: #6e7681; font-weight: 400; }
+  body { margin:0; font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+         background: radial-gradient(1100px 520px at 50% -8%, #17213c 0%, var(--bg) 56%);
+         color:var(--fg); padding:26px 18px 56px; min-height:100vh; }
+  .wrap { max-width:900px; margin:0 auto; }
+  header { display:flex; align-items:center; gap:12px; margin:0 0 20px; }
+  .logo { width:36px; height:36px; border-radius:10px; flex:0 0 auto; display:flex;
+          align-items:center; justify-content:center; color:#fff;
+          background:linear-gradient(135deg,var(--blue),var(--green)); box-shadow:0 5px 16px #2f81f73a; }
+  .logo svg { width:19px; height:19px; }
+  h1 { font-size:19px; margin:0; letter-spacing:.2px; }
+  .sub { color:var(--muted); margin:1px 0 0; font-size:12.5px; }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:12px;
+           padding:18px 20px; margin:0 0 18px; box-shadow:0 1px 0 #ffffff08 inset, 0 10px 28px #0006; }
+  label { display:block; font-weight:600; margin:14px 0 6px; font-size:13px; }
+  label:first-child { margin-top:0; }
+  select, input[type=file] { width:100%; padding:9px 11px; background:#0d1117; color:var(--fg);
+    border:1px solid var(--border); border-radius:7px; font-size:14px; transition:border-color .15s; }
+  select:focus, input[type=file]:focus { outline:none; border-color:var(--blue); }
+  .row { display:flex; gap:16px; flex-wrap:wrap; }
+  .row > div { flex:1; min-width:220px; }
+  .modes { display:flex; gap:10px; margin-top:6px; flex-wrap:wrap; }
+  .mode { flex:1; min-width:150px; border:1px solid var(--border); border-radius:9px; padding:12px;
+          cursor:pointer; background:#0d1117; transition:border-color .15s, background .15s, transform .08s; }
+  .mode:hover { border-color:#3d4756; }
+  .mode:active { transform:translateY(1px); }
+  .mode.sel { border-color:var(--blue); background:#11203a; box-shadow:0 0 0 1px var(--blue) inset; }
+  .mode .t { font-weight:700; font-size:14px; }
+  .mode .d { color:var(--muted); font-size:12px; margin-top:4px; }
+  .opts { margin-top:12px; display:flex; flex-direction:column; gap:9px; }
+  .opt { display:flex; align-items:flex-start; gap:9px; font-weight:400; margin:0; cursor:pointer; }
+  .opt input { width:auto; margin-top:3px; accent-color:var(--blue); flex:0 0 auto; }
+  button#go { margin-top:18px; width:100%; padding:13px; font-size:16px; font-weight:700; color:#fff;
+              background:linear-gradient(180deg,#2ea043,#238636); border:0; border-radius:9px;
+              cursor:pointer; display:flex; align-items:center; justify-content:center; gap:9px;
+              transition:filter .15s; }
+  button#go:hover:not(:disabled) { filter:brightness(1.08); }
+  button#go:disabled { background:#30363d; color:var(--muted); cursor:progress; filter:none; }
+  .spin { width:15px; height:15px; border:2px solid #ffffff44; border-top-color:#fff;
+          border-radius:50%; animation:spin .7s linear infinite; display:none; }
+  button#go:disabled .spin { display:inline-block; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  #progressWrap { margin-top:16px; display:none; }
+  .bar { position:relative; height:16px; background:#0d1117; border:1px solid var(--border);
+         border-radius:9px; overflow:hidden; }
+  .bar > i { display:block; height:100%; width:0%; border-radius:9px;
+             background:linear-gradient(90deg,var(--blue),var(--green)); transition:width .3s ease; }
+  .bar.indet > i { width:32%; background:linear-gradient(90deg,transparent,var(--blue),transparent);
+                   animation:indet 1.15s ease-in-out infinite; }
+  @keyframes indet { 0%{transform:translateX(-110%)} 100%{transform:translateX(330%)} }
+  .bar .pct { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+              font:700 10px/1 ui-monospace,monospace; color:#dfe7f0; letter-spacing:.5px;
+              text-shadow:0 1px 2px #000b; }
+  #progressText { margin-top:7px; font-size:12.5px; color:var(--muted);
+                  font-family:ui-monospace,SFMono-Regular,monospace; }
+  #status { margin-top:12px; font-size:13px; color:var(--muted); min-height:18px;
+            display:flex; align-items:center; gap:8px; }
+  #status.err { color:#f85149; } #status.ok { color:var(--green); }
+  #status .dot { width:7px; height:7px; border-radius:50%; background:currentColor; flex:0 0 auto; }
+  #status .dot.live { animation:pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%{box-shadow:0 0 0 0 #3fb95066} 70%{box-shadow:0 0 0 6px #3fb95000}
+                     100%{box-shadow:0 0 0 0 #3fb95000} }
+  .playerHead { display:flex; align-items:center; gap:9px; margin-bottom:10px; flex-wrap:wrap; }
+  .playerHead .t { font-weight:700; font-size:14px; }
+  .badge { font:700 10.5px/1 ui-monospace,monospace; padding:4px 8px; border-radius:6px;
+           background:#11203a; color:#79c0ff; border:1px solid #1f6feb55; }
+  .badge.live { background:#12261a; color:#56d364; border-color:#3fb95055;
+                display:inline-flex; align-items:center; gap:6px; }
+  .badge.live::before { content:""; width:6px; height:6px; border-radius:50%; background:#56d364;
+                        animation:pulse 1.2s ease-in-out infinite; }
+  video { width:100%; border-radius:9px; background:#000; display:block; }
+  .stats { font-size:12px; color:var(--muted); margin-top:10px; white-space:pre-wrap;
+           font-family:ui-monospace,SFMono-Regular,monospace; background:#0d1117;
+           border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  small.hint { color:#6e7681; font-weight:400; }
 </style>
 </head>
 <body>
-  <h1>playhd — video upscaler</h1>
-  <p class="sub">Select a clip and click Process &amp; Play. SD → HD (x4), with sound. Whole clip, any length.</p>
+  <div class="wrap">
+  <header>
+    <div class="logo"><svg viewBox="0 0 24 24"><path d="M8 6l10 6-10 6z" fill="#fff"/></svg></div>
+    <div>
+      <h1>playhd <span style="color:var(--muted);font-weight:500">— video upscaler</span></h1>
+      <p class="sub">Pick a clip → Process &amp; Play. SD → HD (×4), with sound, any length.</p>
+    </div>
+  </header>
 
   <div class="panel">
     <div class="row">
@@ -72,31 +112,36 @@
     <div class="modes" id="modes"></div>
 
     <div id="estimate" class="hint" style="margin:8px 0 2px"></div>
-    <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin:10px 0 2px">
-      <input type="checkbox" id="stream" style="width:auto" checked />
-      <span class="hint">▶ Play while processing (instant only — streams the upscaled clip as it is
-      produced via Media Source Extensions so playback starts in ~1–2 s instead of waiting for the
-      whole clip). On by default (verified in Chrome/Safari; falls back to a normal &lt;video&gt; if MSE
-      is unavailable). Uncheck to render the whole clip first.</span>
-    </label>
-    <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin:6px 0 2px">
-      <input type="checkbox" id="smooth2x" style="width:auto" />
-      <span class="hint">✨ Smooth 2× fps (instant only — interpolates a motion-compensated frame
-      between each pair → twice the frame rate, smoother playback). ~halves throughput; uses the
-      buffered path (not the live stream).</span>
-    </label>
-    <button id="go">Process &amp; Play</button>
+    <div class="opts">
+      <label class="opt">
+        <input type="checkbox" id="stream" checked />
+        <span class="hint">▶ Play while processing (instant — streams the upscaled clip as it is
+        produced via Media Source Extensions so playback starts in ~1–2 s instead of waiting for the
+        whole clip). On by default (Chrome/Safari; falls back to a normal &lt;video&gt; if MSE is
+        unavailable). Uncheck to render the whole clip first.</span>
+      </label>
+      <label class="opt">
+        <input type="checkbox" id="smooth2x" />
+        <span class="hint">✨ Smooth 2× fps (instant — interpolates a motion-compensated frame between
+        each pair → twice the frame rate, smoother playback). ~halves throughput; uses the buffered
+        path (not the live stream).</span>
+      </label>
+    </div>
+
+    <button id="go"><span class="spin"></span><span id="goLabel">Process &amp; Play</span></button>
 
     <div id="progressWrap">
-      <div class="bar"><i id="bar"></i></div>
+      <div class="bar"><i id="bar"></i><span id="pct" class="pct"></span></div>
       <div id="progressText"></div>
     </div>
     <div id="status"></div>
   </div>
 
   <div class="panel" id="playerPanel" style="display:none">
+    <div class="playerHead"><span class="t">Result</span><span id="playerBadge" class="badge">—</span></div>
     <video id="player" controls autoplay playsinline></video>
     <div class="stats" id="stats"></div>
+  </div>
   </div>
 
 <script>
@@ -173,10 +218,19 @@ async function loadSources() {
   updateEstimate();
 }
 
-function setStatus(html, isErr) {
+// kind: undefined/false = info, true|'err' = error, 'ok' = success, 'live' = streaming (pulsing dot)
+function setStatus(html, kind) {
+  const k = (kind === true) ? "err" : (kind || "info");
   const s = $("status");
-  s.className = isErr ? "err" : "";
-  s.innerHTML = html;
+  s.className = (k === "err") ? "err" : (k === "ok" || k === "live") ? "ok" : "";
+  if (!html) { s.innerHTML = ""; return; }
+  s.innerHTML = `<span class="dot${k === "live" ? " live" : ""}"></span><span>${html}</span>`;
+}
+
+function setBadge(text, live) {
+  const b = $("playerBadge");
+  b.className = "badge" + (live ? " live" : "");
+  b.textContent = text;
 }
 
 function fmt(t) { return (t == null) ? "—" : `${t}s`; }
@@ -184,10 +238,23 @@ function fmt(t) { return (t == null) ? "—" : `${t}s`; }
 function renderProgress(p) {
   const total = p.total || 0;
   const done = p.done || 0;
-  const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
-  $("bar").style.width = pct + "%";
-  let line = `${p.state} · ${done}/${total || "?"} frames`;
-  if (p.elapsed_s != null) line += ` · elapsed ${fmt(p.elapsed_s)}`;
+  const barEl = $("bar").parentElement;                 // the .bar container
+  // Determinate only when we know the total (processing/muxing). Probing / segmenting / streaming
+  // have an unknown total -> an indeterminate sliding animation instead of a stuck 0%.
+  const determinate = total > 0 && (p.state === "processing" || p.state === "muxing" || p.state === "done");
+  if (determinate) {
+    const pct = Math.min(100, Math.round((done / total) * 100));
+    barEl.classList.remove("indet");
+    $("bar").style.width = pct + "%";
+    $("pct").textContent = pct + "%";
+  } else {
+    barEl.classList.add("indet");
+    $("pct").textContent = "";
+  }
+  const nice = { probing: "probing", segmenting: "segmenting scenes", processing: "upscaling",
+                 muxing: "muxing audio", streaming: "streaming", done: "done" };
+  let line = (nice[p.state] || p.state) + ` · ${done}${total ? "/" + total : ""} frames`;
+  if (p.elapsed_s != null) line += ` · ${fmt(p.elapsed_s)}`;
   if (p.eta_s != null && p.state === "processing") line += ` · ETA ${fmt(p.eta_s)}`;
   if (p.ms_per_frame != null) line += ` · ${p.ms_per_frame} ms/frame`;
   $("progressText").textContent = line;
@@ -214,19 +281,20 @@ async function runStreaming(btn) {
       if (!ur.ok) { setStatus("Upload failed: " + (await ur.text()), true); btn.disabled = false; return; }
       srcName = (await ur.json()).name;
     }
-    setStatus("Streaming <b>instant</b> — playing as it processes…");
+    setStatus("Connecting — streaming <b>instant</b> as it processes…", "live");
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = setInterval(pollProgress, 400);
 
     $("playerPanel").style.display = "";
+    setBadge("CONNECTING", false);
     $("stats").textContent = "mode : instant (progressive fMP4 — play-while-process)\nstreaming…";
     const v = $("player");
     v.muted = false;                          // play WITH sound
     const url = `/api/stream?source=${encodeURIComponent(srcName)}&mode=instant`;
     const finish = () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } btn.disabled = false; };
-    v.onplaying = () => { $("bar").style.width = "100%";
-                          setStatus("Playing as it processes (instant — real-time 720p, with sound)."); };
-    v.onended = finish;
+    v.onplaying = () => { setStatus("Playing as it processes — instant, real-time 720p, with sound.", "live");
+                          setBadge("LIVE · Instant 720p", true); };
+    v.onended = () => { finish(); setBadge("Instant 720p", false); };
 
     // The fragmented-MP4 stream is consumed via Media Source Extensions (MSE) — the reliable way
     // Chrome plays live fMP4. We feed the same bytes a plain <video src> would, but appended to a
@@ -302,8 +370,10 @@ $("go").onclick = async () => {
   const btn = $("go");
   btn.disabled = true;
   $("progressWrap").style.display = "";
-  $("bar").style.width = "0%";
+  $("bar").parentElement.classList.add("indet");
+  $("pct").textContent = "";
   $("progressText").textContent = "starting…";
+  setStatus("");
 
   // Progressive play-while-process. Triggers for explicit Instant, AND for Auto when the cheap
   // probe resolves to instant (so the DEFAULT "Auto" plays-while-processing too, not just Instant).
@@ -351,7 +421,8 @@ $("go").onclick = async () => {
       return;
     }
     const data = await r.json();
-    $("bar").style.width = "100%";
+    $("bar").parentElement.classList.remove("indet");
+    $("bar").style.width = "100%"; $("pct").textContent = "100%";
     const s = data.stats || {};
 
     $("playerPanel").style.display = "";
@@ -381,8 +452,11 @@ $("go").onclick = async () => {
         `server time  : ${s.t_total_s}s total (sr ${s.t_sr_s}s, recon ${s.t_recon_s}s) = ${s.ms_per_frame} ms/frame`;
     }
     $("stats").textContent = statsText;
+    const modeLabel = { instant: "Instant 720p", quality: "Quality QHD", layered: "Layered QHD" }[s.mode]
+                      || (s.label || s.mode);
+    setBadge(modeLabel + " · done", false);
     const autoPrefix = s.auto_requested ? `Auto → <b>${s.auto_chosen}</b>. ` : "";
-    setStatus(`${autoPrefix}Done — ${s.out_resolution}, ${s.n_frames} frames in ${s.t_total_s}s server-side.`);
+    setStatus(`${autoPrefix}Done — ${s.out_resolution}, ${s.n_frames} frames in ${s.t_total_s}s server-side.`, "ok");
   } catch (e) {
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
     setStatus("Request failed: " + e, true);
