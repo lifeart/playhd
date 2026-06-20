@@ -81,6 +81,11 @@ Before any port work, prove the one unproven thing:
 - **P0 — spike** (above): WASM-libav `+export_mvs` at SD + a single-GOP WebGPU warp parity check.
 - **P1 — instant tier, real-time**: WASM decode+MV → WebGPU compact-anchor SR (Anime4K/websr-class shader) +
   WGSL warp + reactive occlusion + render to canvas. Target the same ~24 fps the native instant tier hits.
+  **✅ CORE BROWSER-VERIFIED (`web_spike/webgpu_warp/P1_RESULT.md`):** the WGSL MV-backward-warp matches the
+  prototype `warp_hd` to **0.002 codes mean / 1 max** in real Chrome WebGPU, at **0.096 ms/frame ≈ ~430×
+  real-time** (1280×640). Both halves of the pipeline are now measured in-browser (WASM decode+MV ~850–1000 fps;
+  WebGPU warp ~10,400 fps). Remaining: on-GPU compact SR (websr/Anime4K precedent), reactive occlusion (per-pixel),
+  the WASM MV-binding, and the GOP frame loop.
 - **P2 — quality tier**: add the WebGPU RRDBNet/x4plus anchor (web-realesrgan proves it runs), amortized over
   anchors; region-aware blend + β=0.85 + (optional) deblock as WGSL passes. Not real-time (like native), used
   for render-and-watch with progressive output.
