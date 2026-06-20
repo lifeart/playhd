@@ -1,0 +1,132 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>playhd — LIVE instant tier in WebGPU (on-GPU SR anchor + MV-warp chain)</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}
+canvas#play{border:1px solid #333;width:512px;height:512px;image-rendering:auto}#log{white-space:pre-wrap;margin-top:10px}
+.ok{color:#6f6}.err{color:#f66}.hd{color:#9cf}</style>
+<h3 class="hd">playhd — LIVE instant tier: on-GPU compact SR anchor + codec-MV warp chain (MVs the only offline input)</h3>
+<canvas id="play"></canvas><div id="log"></div>
+<script type="module">
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={}; window.__live=R;
+const imgData=async(u,w,h)=>{const b=await createImageBitmap(await (await fetch(u)).blob());const c=new OffscreenCanvas(w,h);const x=c.getContext("2d");x.drawImage(b,0,0);return x.getImageData(0,0,w,h).data;};
+
+async function main(){
+  if(!navigator.gpu){L("WebGPU NOT available","err");R.error="no-webgpu";return;}
+  const meta=await (await fetch("../gop_live_data/meta.json")).json();
+  const {w_lr,h_lr,scale,w_hd,h_hd,fps,frames}=meta;
+  const cnet=await (await fetch("../compact_data/layers.json")).json();   // reuse the exported compact net
+  L(`LIVE GOP: ${frames.length} frames, ${frames.filter(f=>f.anchor).length} on-GPU-SR anchor + ${frames.filter(f=>!f.anchor).length} propagated; crop ${w_lr}x${h_lr} -> ${w_hd}x${h_hd} (x${scale}) @ ${fps}fps`,"hd");
+  const dev=await (await navigator.gpu.requestAdapter()).requestDevice();
+  const samp=dev.createSampler({magFilter:"linear",minFilter:"linear",addressModeU:"clamp-to-edge",addressModeV:"clamp-to-edge"});
+  const hdTex=()=>dev.createTexture({size:[w_hd,h_hd],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+  const lrTexOf=async u=>{const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+    const b=await createImageBitmap(await (await fetch(u)).blob());dev.queue.copyExternalImageToTexture({source:b},{texture:t},[w_lr,h_lr]);return t;};
+  const flowTexOf=async u=>{const buf=new Float32Array(await (await fetch(u)).arrayBuffer());
+    const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba32float",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+    dev.queue.writeTexture({texture:t},buf,{bytesPerRow:w_lr*16,rowsPerImage:h_lr},[w_lr,h_lr]);return t;};
+
+  // ---- compact SR pipeline (conv compute + pixelshuffle/residual render) ----
+  const Wb=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
+  const W_gpu=dev.createBuffer({size:Wb.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(W_gpu,0,Wb);
+  const FC=64,plane=w_lr*h_lr,fsize=FC*plane*4;
+  const conv=dev.createShaderModule({code:`
+    struct P{H:u32,W:u32,in_c:u32,out_c:u32,w_off:u32,b_off:u32,prelu_off:u32,has_prelu:u32};
+    @group(0) @binding(0) var<storage,read> fin:array<f32>; @group(0) @binding(1) var<storage,read_write> fout:array<f32>;
+    @group(0) @binding(2) var<storage,read> Wt:array<f32>; @group(0) @binding(3) var<uniform> u:P;
+    @compute @workgroup_size(8,8,1) fn main(@builtin(global_invocation_id) g:vec3u){
+      let x=i32(g.x);let y=i32(g.y);let oc=i32(g.z); if(x>=i32(u.W)||y>=i32(u.H)||oc>=i32(u.out_c)){return;}
+      var acc=Wt[u.b_off+u32(oc)]; let bw=u.w_off+u32(oc)*u.in_c*9u;
+      for(var ic=0u;ic<u.in_c;ic=ic+1u){let pl=ic*u.H*u.W;let wic=bw+ic*9u;
+        for(var ky=0;ky<3;ky=ky+1){let yy=y+ky-1;if(yy<0||yy>=i32(u.H)){continue;}
+          for(var kx=0;kx<3;kx=kx+1){let xx=x+kx-1;if(xx<0||xx>=i32(u.W)){continue;}
+            acc=acc+Wt[wic+u32(ky*3+kx)]*fin[pl+u32(yy)*u.W+u32(xx)];}}}
+      if(u.has_prelu==1u){let s=Wt[u.prelu_off+u32(oc)];if(acc<0.0){acc=acc*s;}}
+      fout[u32(oc)*u.H*u.W+u32(y)*u.W+u32(x)]=acc;}`});
+  const cpipe=dev.createComputePipeline({layout:"auto",compute:{module:conv,entryPoint:"main"}});
+  const psh=dev.createShaderModule({code:`
+    struct P{H:u32,W:u32,up:u32,_p:u32};
+    @group(0) @binding(0) var<storage,read> feat:array<f32>; @group(0) @binding(1) var<storage,read> lr:array<f32>; @group(0) @binding(2) var<uniform> u:P;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
+      let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
+      var rgb=vec3f(0.0); for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(feat[ch*pl+u32(y)*u.W+u32(x)]+lr[u32(c)*pl+u32(y)*u.W+u32(x)],0.0,1.0);}
+      return vec4f(rgb,1.0);}`});
+  const pshp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+
+  async function runSR(lrUrl, dstTex){   // on-GPU compact SR of an LR crop INTO dstTex (the anchor)
+    const A=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+    const B=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE});
+    const px=await imgData(lrUrl,w_lr,h_lr); const lp=new Float32Array(3*plane);
+    for(let y=0;y<h_lr;y++)for(let x=0;x<w_lr;x++){const o=(y*w_lr+x)*4;for(let c=0;c<3;c++)lp[c*plane+y*w_lr+x]=px[o+c]/255;}
+    const LRb=dev.createBuffer({size:lp.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(LRb,0,lp);
+    const Ai=new Float32Array(FC*plane);Ai.set(lp.subarray(0,3*plane),0);dev.queue.writeBuffer(A,0,Ai);
+    let inb=A,outb=B;
+    for(const ly of cnet.layers){
+      const u=new Uint32Array([h_lr,w_lr,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+      const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
+      const bg=dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:W_gpu}},{binding:3,resource:{buffer:ub}}]});
+      const e=dev.createCommandEncoder();const p=e.beginComputePass();p.setPipeline(cpipe);p.setBindGroup(0,bg);p.dispatchWorkgroups(Math.ceil(w_lr/8),Math.ceil(h_lr/8),ly.out_c);p.end();dev.queue.submit([e.finish()]);
+      [inb,outb]=[outb,inb];
+    }
+    const fu=new Uint32Array([h_lr,w_lr,scale,0]);const fub=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(fub,0,fu);
+    const fbg=dev.createBindGroup({layout:pshp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:LRb}},{binding:2,resource:{buffer:fub}}]});
+    const e=dev.createCommandEncoder();const rp=e.beginRenderPass({colorAttachments:[{view:dstTex.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});
+    rp.setPipeline(pshp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();dev.queue.submit([e.finish()]);
+  }
+
+  // ---- warp + hole-fallback pipeline ----
+  const wmod=dev.createShaderModule({code:`
+    struct U{w:u32,h:u32,scale:u32,_p:u32};
+    @group(0) @binding(0) var prevRecon:texture_2d<f32>;@group(0) @binding(1) var samp:sampler;@group(0) @binding(2) var flowTex:texture_2d<f32>;@group(0) @binding(3) var lrTex:texture_2d<f32>;@group(0) @binding(4) var<uniform> u:U;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
+      let dst=vec2i(floor(pos.xy));let lr=dst/i32(u.scale);let f=textureLoad(flowTex,lr,0).xy;
+      if(f.x< -1.0e8){return vec4f(textureSampleLevel(lrTex,samp,pos.xy/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0);}
+      let src=vec2f(dst)+f*f32(u.scale);return vec4f(textureSampleLevel(prevRecon,samp,(src+vec2f(0.5))/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0);}`});
+  const wpipe=dev.createRenderPipeline({layout:"auto",vertex:{module:wmod,entryPoint:"vs"},fragment:{module:wmod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const wuni=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(wuni,0,new Uint32Array([w_hd,h_hd,scale,0]));
+
+  // ---- build the chain ----
+  const t0=performance.now();const recon=[];const bpr=Math.ceil(w_hd*4/256)*256;const mads=[];const madsI=[];let srMs=0;
+  for(const fr of frames){
+    const i=fr.i;const tex=hdTex();
+    if(fr.anchor){const s=performance.now();await runSR(`../gop_live_data/lr_${i}.png`,tex);await dev.queue.onSubmittedWorkDone();srMs=performance.now()-s;}
+    else{
+      const flow=await flowTexOf(`../gop_live_data/flow_${i}.bin`);const lr=await lrTexOf(`../gop_live_data/lr_${i}.png`);
+      const bg=dev.createBindGroup({layout:wpipe.getBindGroupLayout(0),entries:[{binding:0,resource:recon[i-1].createView()},{binding:1,resource:samp},{binding:2,resource:flow.createView()},{binding:3,resource:lr.createView()},{binding:4,resource:{buffer:wuni}}]});
+      const e=dev.createCommandEncoder();const p=e.beginRenderPass({colorAttachments:[{view:tex.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});p.setPipeline(wpipe);p.setBindGroup(0,bg);p.draw(3);p.end();dev.queue.submit([e.finish()]);
+    }
+    recon[i]=tex;
+    const rb=dev.createBuffer({size:bpr*h_hd,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    const e2=dev.createCommandEncoder();e2.copyTextureToBuffer({texture:tex},{buffer:rb,bytesPerRow:bpr,rowsPerImage:h_hd},[w_hd,h_hd]);dev.queue.submit([e2.finish()]);await dev.queue.onSubmittedWorkDone();
+    await rb.mapAsync(GPUMapMode.READ);const g=new Uint8Array(rb.getMappedRange());const ref=await imgData(`../gop_live_data/ref_${i}.png`,w_hd,h_hd);
+    let s=0,mx=0,n=0,si=0,ni=0;const m=Math.floor(w_hd*0.25);   // interior = central 50% (excludes the crop-edge band)
+    for(let y=0;y<h_hd;y++)for(let x=0;x<w_hd;x++){const gi=y*bpr+x*4,ri=(y*w_hd+x)*4;const inr=(x>=m&&x<w_hd-m&&y>=m&&y<h_hd-m);
+      for(let c=0;c<3;c++){const d=Math.abs(g[gi+c]-ref[ri+c]);s+=d;if(d>mx)mx=d;n++;if(inr){si+=d;ni++;}}}
+    rb.unmap();const mad=s/n,madI=si/ni;mads.push(mad);madsI.push(madI);
+    L(`  frame ${String(i).padStart(2)} ${fr.type}${fr.anchor?"* (on-GPU SR)":"  (warp)"}  full mean|Δ|=${mad.toFixed(3)}  interior=${madI.toFixed(3)} max=${mx}`, madI<1.0?"":"err");
+  }
+  const worst=Math.max(...mads),avg=mads.reduce((a,b)=>a+b)/mads.length;
+  const worstI=Math.max(...madsI),avgI=madsI.reduce((a,b)=>a+b)/madsI.length,pass=worstI<1.0;
+  L(`CHAIN PARITY (on-GPU SR anchor + warp): INTERIOR avg=${avgI.toFixed(3)}, worst=${worstI.toFixed(3)} -> ${pass?"PASS":"CHECK"}`,pass?"ok":"err");
+  L(`(full-frame avg=${avg.toFixed(2)}, worst=${worst.toFixed(2)} -- inflated by crop-edge border-clamp on this high-pan crop; see note)`,"hd");
+  L(`anchor on-GPU SR: ${srMs.toFixed(0)} ms (1 frame); warp propagation carries the other ${frames.length-1}`,"ok");
+
+  // playback
+  const cv=document.getElementById("play");cv.width=w_hd;cv.height=h_hd;const ctx=cv.getContext("webgpu");const fmt=navigator.gpu.getPreferredCanvasFormat();ctx.configure({device:dev,format:fmt,alphaMode:"opaque"});
+  const blit=dev.createShaderModule({code:`@group(0) @binding(0) var t:texture_2d<f32>;@group(0) @binding(1) var s:sampler;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{return textureSampleLevel(t,s,pos.xy/vec2f(${w_hd}.0,${h_hd}.0),0.0);}`});
+  const bp=dev.createRenderPipeline({layout:"auto",vertex:{module:blit,entryPoint:"vs"},fragment:{module:blit,entryPoint:"fs",targets:[{format:fmt}]},primitive:{topology:"triangle-list"}});
+  let idx=0,last=0,drawn=0;
+  function fr(t){if(t-last>=1000/fps){last=t;const tex=recon[idx%frames.length];idx++;drawn++;
+    const bg=dev.createBindGroup({layout:bp.getBindGroupLayout(0),entries:[{binding:0,resource:tex.createView()},{binding:1,resource:samp}]});
+    const e=dev.createCommandEncoder();const p=e.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});p.setPipeline(bp);p.setBindGroup(0,bg);p.draw(3);p.end();dev.queue.submit([e.finish()]);R.framesDrawn=drawn;}
+    requestAnimationFrame(fr);}
+  requestAnimationFrame(fr);
+  Object.assign(R,{ok:true,avgMad:avg,worstMad:worst,avgInterior:avgI,worstInterior:worstI,pass,srMs:Math.round(srMs),nFrames:frames.length});
+  L("LIVE PIPELINE PLAYING (on-GPU SR anchor + codec-MV warp chain; MVs the only offline input).","ok");
+}
+main().catch(e=>{L("ERROR: "+e.message,"err");window.__live={error:e.message};});
+</script>

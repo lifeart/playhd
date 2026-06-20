@@ -115,3 +115,31 @@ black (parity was unaffected, since it reads via `COPY_SRC`). Any texture you la
   and wiring the on-GPU SR into the GOP loop as the anchor source.
 
 Reproduce: `python export_compact_weights.py` then open `webgpu_warp/sr.html`; result in `window.__sr`.
+
+---
+
+# LIVE pipeline (on-GPU SR anchor + warp chain) — RUNS, anchor bit-exact; x4-crop parity UNRESOLVED (honest status)
+
+`gop_live.html` + `extract_gop_live.py` wire the on-GPU compact SR into the GOP loop: the anchor is SR'd
+**in-browser** (no offline anchor PNG), the rest propagate by codec-MV warp + hole fallback, played to canvas.
+**MVs are the only remaining offline input.** Uses a 256×256 LR crop at the net's native x4 (→1024×1024) to
+avoid a scale mismatch.
+
+**What is verified:**
+- The **on-GPU SR anchor is bit-exact in the chain** — frame 0 (the I-frame, SR'd on-GPU) parity vs the
+  PyTorch reference = **mean \|Δ\| = 0.000, max 1**. The SR-wiring goal is met.
+- The combined page **runs end-to-end and plays coherently** in-browser (visually correct propagated crop).
+
+**What is NOT verified (open item, not overstated):** the *full-chain* numerical parity vs the Python
+reference is **off** on this x4-crop harness (avg ~16–27, worst ~94 codes; grows along the chain) — and an
+interior-only check did **not** clear it, so it is **not** merely a crop-edge border-clamp artifact as first
+hypothesized. The individual components are each parity-verified (SR bit-exact above; the *identical* warp
+shader passed at **0.016** in `gop.html` at **x2 full-frame**), so the discrepancy is specific to the
+**previously-untested x4-crop path** (the warp/flow/fallback at scale 4 on a heavily-panning crop, or the
+`extract_gop_live` reference itself). **Root cause not yet found.** This is the immediate follow-up — likely
+fastest to resolve by validating the x4 warp standalone (an x4 version of the `index.html` single-warp parity
+test) to isolate whether the divergence is in the browser x4 path or the Python x4-crop reference, then a
+full-frame (uncropped) live run. **Do not treat the live pipeline as parity-verified until this closes.**
+
+Reproduce: `python extract_gop_live.py` then open `webgpu_warp/gop_live.html`; results in `window.__live`
+(`avgInterior`/`worstInterior` + full-frame).
