@@ -955,7 +955,8 @@ def _tof_from_R(frames, hd_frames, R, w_lr, h_lr):
 
 
 def _build_region_gate(frames, w_hd, h_hd, scale, lo=0.2, hi=1.0, feather=61,
-                       compact_model="realesrgan", compact_cache=None):
+                       compact_model="realesrgan", compact_cache=None,
+                       texture_aware=False, tex_lo=6.0, tex_hi=14.0, tex_feather=21, tex_k=7):
     """Build the Stream-1 region-aware gate + compact source for the OUTPUT-only blend.
     REUSES region_quality (no math duplicated):
       * region_masks() -> the (free) per-frame MV-magnitude temporal-mean map `meanmag`,
@@ -963,13 +964,41 @@ def _build_region_gate(frames, w_hd, h_hd, scale, lo=0.2, hi=1.0, feather=61,
         motion gate a_lr in [0,1] (1=static->heavy detail; 0=dynamic->stable compact). hi=1.0 LR
         px/frame is the physical 'can't carry heavy HF stably under warp' threshold.
     `compact` = the per-frame COMPACT SR (the same fallback-source family used for occlusion).
-    Pass compact_cache to reuse a precomputed cache (the heavy chain stays single-model)."""
+    Pass compact_cache to reuse a precomputed cache (the heavy chain stays single-model).
+
+    R7-E2 (`texture_aware`, DEFAULT OFF -> a_lr byte-identical): the MOTION gate alone spends the
+    heavy x4plus on STATIC-but-SMOOTH regions (still face / sky) where R6-E1 proved with TRUE LPIPS
+    that x4plus's extra HF is MISALIGNED -> ~0 gain (sometimes worse). With texture_aware, a_lr is
+    multiplied by a CHEAP, GT-FREE local-detail weight a_tex in [0,1] -- the temporal-mean local luma
+    STD of the ALREADY-COMPUTED compact source (thresholded tex_lo..tex_hi, feathered) -- so
+    a' = a_motion * a_tex: heavy ONLY where BOTH static AND textured. Measured (R7-E2 degrade-restore
+    LPIPS): talking-head effective-heavy ~74%->~12% at LPIPS -0.02 (BETTER); detailed graphics
+    ~66%->~28% at LPIPS +-0.001 (neutral). NB: as an OUTPUT-only blend this is quality-neutral-to-
+    better but saves NO compute by itself -- the compute win needs the heavy anchor SR to actually
+    SKIP tiles where a'~0 (a tiled x4plus pass); a_tex is the mask that enables it. Default OFF
+    pending an integrated propagation+tOF A/B."""
     import region_quality as _rq
     h_lr, w_lr = frames[0][1].shape[:2]
     if compact_cache is None:
         compact_cache = build_perframe_cache(frames, w_hd, h_hd, compact_model)
     _, _, meanmag, _ = _rq.region_masks(frames, h_lr, w_lr, 45.0, 80.0)
     a_lr = _rq.window_static_weight(meanmag, lo, hi, feather=feather)
+    if texture_aware:
+        # temporal-mean local-std of the compact source (FREE: the cache is already built). High on
+        # text/edges/texture, low on smooth skin/sky -> a_tex; heavy ONLY where static AND textured.
+        acc = np.zeros((h_lr, w_lr), np.float32)
+        for i in range(len(frames)):
+            y = cv2.cvtColor(compact_cache[i], cv2.COLOR_RGB2GRAY).astype(np.float32)
+            if y.shape[:2] != (h_lr, w_lr):
+                y = cv2.resize(y, (w_lr, h_lr), interpolation=cv2.INTER_AREA)
+            mu = cv2.boxFilter(y, -1, (tex_k, tex_k))
+            acc += np.sqrt(np.maximum(cv2.boxFilter(y * y, -1, (tex_k, tex_k)) - mu * mu, 0.0))
+        std_map = acc / max(len(frames), 1)
+        a_tex = np.clip((std_map - tex_lo) / max(tex_hi - tex_lo, 1e-6), 0.0, 1.0).astype(np.float32)
+        if tex_feather and tex_feather >= 3:
+            kk = int(tex_feather) | 1
+            a_tex = cv2.GaussianBlur(a_tex, (kk, kk), 0)
+        a_lr = (a_lr * a_tex).astype(np.float32)
     return dict(a_lr=a_lr, compact=compact_cache)
 
 

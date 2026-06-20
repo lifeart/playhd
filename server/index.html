@@ -78,6 +78,12 @@
       produced so playback starts in ~1–2 s instead of waiting for the whole clip).
       Experimental: needs a browser that plays fragmented MP4.</span>
     </label>
+    <label style="display:flex; align-items:center; gap:8px; font-weight:400; margin:6px 0 2px">
+      <input type="checkbox" id="smooth2x" style="width:auto" />
+      <span class="hint">✨ Smooth 2× fps (instant only — interpolates a motion-compensated frame
+      between each pair → twice the frame rate, smoother playback). ~halves throughput; uses the
+      buffered path (not the live stream).</span>
+    </label>
     <button id="go">Process &amp; Play</button>
 
     <div id="progressWrap">
@@ -318,6 +324,7 @@ $("go").onclick = async () => {
   const fd = new FormData();
   fd.append("mode", selectedMode);
   fd.append("source", $("source").value);
+  fd.append("smooth", $("smooth2x").checked);   // smooth-2x interpolation (instant only)
   const f = $("file").files[0];
   if (f) fd.append("file", f);
 

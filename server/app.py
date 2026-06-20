@@ -79,6 +79,7 @@ async def api_process(
     mode: str = Form("instant"),
     source: str = Form("sample.mp4"),
     file: UploadFile | None = File(None),
+    smooth: bool = Form(False),
 ):
     if not pipe.is_valid_mode(mode):
         raise HTTPException(400, f"unknown mode {mode!r}")
@@ -103,6 +104,10 @@ async def api_process(
             raise HTTPException(400, str(e))
         src_name = os.path.basename(input_path)
 
+    # Smooth-2x interpolation (instant fast path only; ~halves throughput). Set the module flag for
+    # THIS job -- the single-job lock guarantees one render at a time, so this is race-free; reset in
+    # finally. No effect on quality/layered (process_clip gates it behind the instant fast path).
+    pipe.INSTANT_INTERP_2X = bool(smooth)
     try:
         # Run the (blocking, GPU-bound) WHOLE-CLIP streaming pipeline off the event loop.
         # /api/progress is served concurrently while this runs.
@@ -111,6 +116,8 @@ async def api_process(
         raise HTTPException(409, "a clip is already being processed; please wait")
     except Exception as e:                      # surface real failures to the UI, never swallow
         raise HTTPException(500, f"pipeline failed: {type(e).__name__}: {e}")
+    finally:
+        pipe.INSTANT_INTERP_2X = False          # reset so the default (off) is restored for next job
 
     stats = dict(pipe.LAST_STATS)
     fname = os.path.basename(out_path)
