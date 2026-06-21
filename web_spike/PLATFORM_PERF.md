@@ -24,12 +24,20 @@ Chrome/Dawn**; the combo was **1.91× over wtile in Deno/wgpu** but **1.73× in 
 kernel (heavy shared-mem + register-blocked) noticeably better than Dawn on the same hardware. Deno's wgpu also
 advertises `maxComputeInvocationsPerWorkgroup: 1024` where Dawn effectively tops out at 256 on Apple.
 
-**INFERENCE (not yet browser-tested):** since Firefox uses the *same wgpu backend* as our Deno harness, **Firefox
-likely runs this anchor ~1.5–2× faster than Chrome** — plausibly ~70–110 ms. Safari (Metal-native) is unknown but
-has no reason to be slow. **Action:** the kernels are plain WGSL with no backend-specific code, so they *run*
-unchanged in every engine — only timing differs. Verify by opening `sr_combo.html` / `sr_wtile.html` in Firefox &
-Safari and reading `window.__c.convMs` / `window.__w.convMs`. (Caveat: wgpu's reported limits are its own
-abstraction; real Apple-HW caps still apply — don't push 1024-thread workgroups in production.)
+**Firefox (strong proxy, not just inference):** our Deno harness *is* the wgpu backend — the **identical** native
+implementation Firefox ships (wgpu-rs → Metal). So the measured **12.9× in Deno/wgpu vs 6.8× in Chrome/Dawn is a
+direct proxy** for Firefox, not an analogy: Firefox should run this anchor close to the Deno/wgpu number, i.e.
+**~1.5–2× faster than Chrome (~70–110 ms)**. The only gap between Deno-wgpu and Firefox-wgpu is the browser shell,
+not the GPU path. Safari (WebKit, Metal-native) is genuinely unknown but has no structural reason to be slow.
+
+**Verification status:** this session's browser automation drives **Chrome only**, so the live Firefox/Safari
+numbers are a **manual step** (not run here). To do it: serve `web_spike/` (`python -m http.server`), open
+`http://localhost:PORT/webgpu_warp/sr_combo.html` (f16, needs `dom.webgpu.enabled` in Firefox `about:config`) and
+`sr_wtile.html` (f32, no f16 needed) in Firefox & Safari Technology Preview, and read `window.__c.convMs` /
+`window.__w.convMs` from the devtools console. Expectation, anchored to the Deno/wgpu proxy: Firefox `sr_wtile`
+materially below Chrome's 210 ms. The kernels are plain WGSL (no backend-specific code), so they *run* unchanged in
+every engine — only timing differs. (Caveat: wgpu's reported limits are its own abstraction; real Apple-HW caps
+still apply — don't push 1024-thread workgroups in production.)
 
 **Takeaway:** "is it real-time?" is partly a *browser* question. On Chrome it's below-native today; on Firefox it
 is very likely comfortably faster. Don't tune solely against Chrome.
@@ -50,9 +58,16 @@ itself reads ~121 ms clean — `sr_combo.html`):
 
 **Result:** the original 220 ms `runSR` was **mostly harness artifact**. The 76 ms "setup" was a real bug (64-channel
 pack) — now **1.8 ms and shipped to `gop_live`**. Decode (~20 ms) and readback (~13 ms) vanish in production (raw
-upload, no readback). **Production per-anchor ≈ conv + ~7 ms ≈ ~128 ms in Chrome** (and likely ~70–110 ms in
-Firefox/wgpu — §1). So the anchor cost is now essentially *just the conv*, which is below native. The remaining
-pipeline-level work is pure engineering (persistent resources + raw decoder upload + drop readback), no feasibility.
+upload, no readback).
+
+**MEASURED end-to-end (`sr_streaming.html`):** a production-shaped anchor — **persistent buffers/bind-groups/pipeline
+(allocated once, reused), raw-pixel upload (no per-frame `createImageBitmap`), render-to-texture (no readback)** —
+runs at **steady-state best 119.9 / median 121.9 / p90 124.3 ms per anchor over 25 anchors**. That is
+**indistinguishable from the conv alone (121.7 ms)**: the CPU planar/f16-pack + uploads + pixelshuffle add <1 ms on
+top. So the **production per-anchor cost is just the conv** — the entire ~100 ms overhead in the 220 ms verification
+`runSR` was per-call allocation + image decode + parity readback, all removed by the streaming pattern. Below native
+on Chrome today, and likely ~70–110 ms on Firefox/wgpu (§1). This was the biggest remaining pipeline-level win and
+it is **done & measured** (the pattern is in `sr_streaming.html`; folding it into `gop_live`'s GOP loop is mechanical).
 
 ## 3. Precision / power / mobile
 

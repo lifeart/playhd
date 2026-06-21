@@ -1,0 +1,60 @@
+<!doctype html>
+<meta charset="utf-8"><title>playhd — steady-state streaming anchor (persistent resources, raw upload, no readback)</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}#log{white-space:pre-wrap}.ok{color:#6f6}.hd{color:#9cf}.err{color:#f66}</style>
+<h3 class="hd">playhd — production-shaped anchor: persistent buffers + raw-pixel upload + render-to-texture (NO readback). Steady-state per-anchor.</h3><div id="log"></div>
+<script type="module">
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={};window.__s=R;
+const F16=self.Float16Array; const f16u16=f=>new Uint16Array(new F16(f).buffer);
+async function main(){
+  const adapter=await navigator.gpu.requestAdapter();
+  const dev=await adapter.requestDevice({requiredFeatures:["shader-f16"]});
+  const meta=await (await fetch("../compact_data/layers.json")).json();const {layers,upscale,H,W}=meta;const HD=H*upscale,WD=W*upscale,plane=H*W,FC=64;
+  // ---- PERSISTENT setup (allocate ONCE, reuse across all anchors) ----
+  const wf=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
+  const Wg=dev.createBuffer({size:f16u16(wf).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(Wg,0,f16u16(wf));
+  const A=dev.createBuffer({size:FC*plane*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const B=dev.createBuffer({size:FC*plane*2,usage:GPUBufferUsage.STORAGE});
+  const LRb=dev.createBuffer({size:3*plane*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const conv=dev.createShaderModule({code:await (await fetch("combo.wgsl")).text()});
+  const pipe=dev.createComputePipeline({layout:"auto",compute:{module:conv,entryPoint:"main"}});
+  let inb=A,outb=B;const bgs=[];
+  for(const ly of layers){const u=new Uint32Array([H,W,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+    const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
+    bgs.push({bg:dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:Wg}},{binding:3,resource:{buffer:ub}}]}),gz:Math.ceil(ly.out_c/64)});[inb,outb]=[outb,inb];}
+  const featLast=inb;
+  const out=dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING});
+  const psh=dev.createShaderModule({code:`enable f16;struct P{H:u32,W:u32,up:u32,_p:u32};@group(0)@binding(0) var<storage,read> feat:array<f16>;@group(0)@binding(1) var<storage,read> lr:array<f16>;@group(0)@binding(2) var<uniform> u:P;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
+      var rgb=vec3f(0.0);for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(f32(feat[ch*pl+u32(y)*u.W+u32(x)])+f32(lr[u32(c)*pl+u32(y)*u.W+u32(x)]),0.0,1.0);}return vec4f(rgb,1.0);}`});
+  const fp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const fub=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(fub,0,new Uint32Array([H,W,upscale,0]));
+  const fbg=dev.createBindGroup({layout:fp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:featLast}},{binding:1,resource:{buffer:LRb}},{binding:2,resource:{buffer:fub}}]});
+  // ---- pre-decode the LR ONCE into raw RGBA bytes (simulating the WASM decoder handing raw pixels) ----
+  const bm=await createImageBitmap(await (await fetch("../compact_data/lr.png")).blob());const cc=new OffscreenCanvas(W,H);const cx=cc.getContext("2d");cx.drawImage(bm,0,0);
+  const rawRGBA=cx.getImageData(0,0,W,H).data;   // <- in production this is the decoder's output buffer, NO per-anchor createImageBitmap
+  const lp=new Float32Array(3*plane);
+  // ---- one production-shaped anchor: raw->planar f16 (CPU) + upload + conv + pixelshuffle, NO readback ----
+  function anchor(){
+    for(let y=0;y<H;y++)for(let x=0;x<W;x++){const o=(y*W+x)*4;const b=y*W+x;lp[b]=rawRGBA[o]/255;lp[plane+b]=rawRGBA[o+1]/255;lp[2*plane+b]=rawRGBA[o+2]/255;}
+    const lp16=f16u16(lp);
+    dev.queue.writeBuffer(A,0,lp16);dev.queue.writeBuffer(LRb,0,lp16);   // seed 3 channels (4..63 stay 0)
+    const e=dev.createCommandEncoder();
+    for(const p of bgs){const cp=e.beginComputePass();cp.setPipeline(pipe);cp.setBindGroup(0,p.bg);cp.dispatchWorkgroups(Math.ceil(W/16),Math.ceil(H/16),p.gz);cp.end();}
+    const rp=e.beginRenderPass({colorAttachments:[{view:out.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(fp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();
+    dev.queue.submit([e.finish()]);
+  }
+  // warmup (compile + warm), then steady-state: many anchors, measure each (wall-clock incl. CPU pack + submit + GPU + sync)
+  for(let k=0;k<3;k++){anchor();await dev.queue.onSubmittedWorkDone();}
+  const N=25;const times=[];
+  for(let k=0;k<N;k++){const t=performance.now();anchor();await dev.queue.onSubmittedWorkDone();times.push(performance.now()-t);}
+  times.sort((a,b)=>a-b);const med=times[Math.floor(N/2)],best=times[0],p90=times[Math.floor(N*0.9)];
+  L(`steady-state streaming anchor (f16 combo, persistent resources, raw upload, NO readback, ${N} anchors):`,"hd");
+  L(`  per-anchor wall-clock: best ${best.toFixed(1)} ms | median ${med.toFixed(1)} ms | p90 ${p90.toFixed(1)} ms`,"ok");
+  L(`  (vs the original per-call runSR ~220 ms with per-anchor alloc + createImageBitmap + readback)`,"hd");
+  L(`  this is the realistic PRODUCTION per-anchor cost = CPU planar/f16-pack + uploads + 34-layer conv + pixelshuffle (no decode, no readback)`,"");
+  Object.assign(R,{ok:true,best,med,p90});
+}
+main().catch(e=>{L("ERR "+e.message,"err");window.__s={error:e.message};});
+</script>
