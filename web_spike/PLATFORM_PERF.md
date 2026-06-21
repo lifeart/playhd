@@ -106,11 +106,17 @@ double-buffer, Deno/wgpu) produced these portability rules:
   OCB64-at-256-threads default is predicted to spill catastrophically there → the table drops them to OCB16–32,
   smaller workgroups (8×8), f16 (mobile f16 is strong), and **double-buffer OFF** (DB is only ~3% on Apple but
   doubles shared memory — a bad mobile trade).
-- **Recommendation: hybrid — a static `adapter`-keyed table narrows to 2–3 candidates, then a first-load
-  micro-benchmark picks the winner** (time the shortlist on one small conv layer via `timestamp-query`, tens of
-  ms once, cache per `adapter.info`). Pure-static is too fragile (the knife-edge OCB×threads optimum isn't
+- **Recommendation — IMPLEMENTED & verified (`kernel_gen.js` + `kernel_select.js` + `select.html`):** a hybrid
+  selector that queries the adapter, narrows to 2–3 candidates from the per-family table, **micro-benchmarks them
+  on first load** (8 `64→64` layers at 128² via `timestamp-query`), caches the winner by `adapter.info` signature
+  (`localStorage`), and returns the kernel. Measured on this Apple GPU: it detected `family: apple`, timed
+  `f16 OCB64 (7.80 ms)` vs `f16 OCB32 (8.06 ms)`, **chose OCB64 by measurement** (the global optimum — not assumed),
+  cached it (2nd call served from cache), and the chosen kernel is **verified correct** (full SR vs PyTorch mean
+  0.016 codes). Total first-load overhead ~16 ms. On a GPU where OCB64 spills, the identical micro-bench would pick
+  OCB32 — the portability win, automatic. Pure-static is too fragile (the knife-edge OCB×threads optimum isn't
   exposed by any WebGPU limit; Dawn-vs-wgpu disagree 6.8× vs 12.9×; `adapter.info.architecture` can be
-  privacy-masked) — this matches ONNX-Runtime-Web's WebGPU tunable-op autotuning.
+  privacy-masked). Notably, **no shipping WebGPU project autotunes conv today** — this is ahead of ORT-Web/wonnx/
+  Anime4K/websr (all static kernels).
 - **Safe fallback when in doubt = the bit-exact `f32 OCB32 16×16 256-thread` wtile** (parity-guaranteed, 4.9 KB
   shared < the 16 KB spec minimum, moderate registers); step down to OCB16 / no-DB on a constrained unknown GPU.
 
@@ -146,5 +152,26 @@ is stuck on the **f32 OCB64** base — which the portability sweep shows is *alr
 threads (rel 1.21); and (2) the 144 explicit `subgroupBroadcast`s/channel add overhead the threadgroup-broadcast
 path didn't pay. **Verdict: subgroups are a dead end for this kernel on Apple** (the f16 register-relief, which
 subgroups can't access, is what actually wins). They may help on NVIDIA/AMD, but there the real lever is
-dp4a / cooperative-matrix (tensor) ops — a separate future investigation. Artifacts kept for the record:
+dp4a / cooperative-matrix (tensor) ops — see §6. Artifacts kept for the record:
 `conv_opt/candidate_subgroup.ts` (+ `_emu` correctness twin), `webgpu_warp/{sr_subgroup.html, subgroup.wgsl}`.
+
+## 6. Advanced accelerators — dp4a & cooperative-matrix (NVIDIA/AMD) → `conv_opt/ACCEL_DP4A_TENSOR.md`
+
+Investigated the two hardware levers that *would* help most on desktop NVIDIA/AMD (where the kernel isn't yet
+confirmed). Both are **not now** but for different reasons (full analysis + sources in the companion doc):
+
+- **dp4a (`dot4U8Packed`/`dot4I8Packed`) — NO-GO now / conditional-FUTURE.** The WGSL builtins are *stable* (Chrome
+  123+, Firefox/wgpu, all devices) and the 4× int8 throughput on NVIDIA/AMD/Intel desktop is real — **but the model
+  is floating-point, not int8-trained.** Post-training quantization injects an *unvalidated* noise floor against a
+  perceptual bar deliberately set at fp16 (the whole quality program fights fake detail); the win is ALU-only while
+  this conv is partly bandwidth/occupancy-bound; per-layer requant erodes it further; and it's **polyfilled to zero
+  gain on Apple**. Pursue only if an int8-SR variant proves LPIPS/DISTS-neutral.
+- **Cooperative / subgroup matrix (tensor cores) — FUTURE.** The strongest *quality-safe* path (keeps the validated
+  f16; the conv is a genuine GEMM that maps to tensor/WMMA/XMX) — **but it's flag-only, unstandardized, and absent
+  on the D3D12 backend**, so the Windows NVIDIA/AMD GPUs it would most help can't even reach it through Chrome today.
+  Revisit when it ships unflagged.
+
+**Caveat (honest):** every speedup here is *inferred* from vendor / GEMM-library sources — none was measured on real
+tensor hardware (this is an Apple-only dev machine). Both paths require a desktop prototype + perceptual
+re-validation before any GO. **Net: the shipped f16 weight-tiled kernel + the adapter-aware selector are the right
+answer today; dp4a/tensor are future work gated on quality (dp4a) or browser-standardization (cooperative-matrix).**

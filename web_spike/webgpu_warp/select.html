@@ -1,0 +1,66 @@
+<!doctype html>
+<meta charset="utf-8"><title>playhd — adapter-aware kernel selector (narrow → micro-bench → cache)</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}#log{white-space:pre-wrap}.ok{color:#6f6}.hd{color:#9cf}.err{color:#f66}.dim{color:#888}</style>
+<h3 class="hd">playhd — adapter-aware conv kernel selector: query adapter → shortlist → micro-bench → cache → verify chosen</h3><div id="log"></div>
+<script type="module">
+import { selectKernel } from "./kernel_select.js";
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={};window.__sel=R;
+const F16=self.Float16Array; const f16u16=f=>new Uint16Array(new F16(f).buffer);
+const imgData=async(u,w,h)=>{const b=await createImageBitmap(await (await fetch(u)).blob());const c=new OffscreenCanvas(w,h);const x=c.getContext("2d");x.drawImage(b,0,0);return x.getImageData(0,0,w,h).data;};
+async function main(){
+  const adapter=await navigator.gpu.requestAdapter();
+  const feats=[]; if(adapter.features.has("shader-f16"))feats.push("shader-f16"); if(adapter.features.has("timestamp-query"))feats.push("timestamp-query");
+  const dev=await adapter.requestDevice({requiredFeatures:feats});
+  const meta=await (await fetch("../compact_data/layers.json")).json();const {layers,upscale,H,W}=meta;const HD=H*upscale,WD=W*upscale,plane=H*W,FC=64;
+  const wf=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
+  L(`adapter: vendor="${adapter.info?.vendor||"?"}" arch="${adapter.info?.architecture||"?"}" | shader-f16=${adapter.features.has("shader-f16")} timestamp=${adapter.features.has("timestamp-query")} smemLimit=${adapter.limits.maxComputeWorkgroupStorageSize}`,"dim");
+  // clear cache so we exercise the micro-bench (a returning user would hit the cache)
+  try{localStorage.removeItem(`playhd.kern|${adapter.info?.vendor||"?"}|${adapter.info?.architecture||"?"}|f16=${adapter.features.has("shader-f16")}`);}catch{}
+  // ---- 1. run the selector (micro-bench at 128) ----
+  const sel=await selectKernel(adapter,dev,{weightsF32:wf,layers,H:128,W:128,iters:3,useCache:true});
+  L(`detected family: ${sel.family}`,"hd");
+  L(`shortlist micro-bench (128, 8x 64->64 layers):`,"hd");
+  for(const r of sel.results) L(`   ${r.ok?`${r.ms.toFixed(2)} ms`.padStart(9):"   FAIL  "}  ${r.label}${r.ok?"":"  ("+r.reason+")"}`, r.ok?"":"err");
+  L(`=> CHOSEN: ${sel.chosen.label}  (f16=${sel.chosen.f16}, OCB=${sel.chosen.OCB}, ${sel.chosen.threads} threads, ${sel.chosen.smemBytes}B smem)`,"ok");
+  // ---- 2. cache test: call again, must be served from cache ----
+  const sel2=await selectKernel(adapter,dev,{weightsF32:wf,layers,H:128,W:128,useCache:true});
+  L(`cache test: 2nd call cached=${sel2.cached}, same kernel=${sel2.chosen.label===sel.chosen.label} ${sel2.cached&&sel2.chosen.label===sel.chosen.label?"OK":"CHECK"}`, sel2.cached?"ok":"err");
+  // ---- 3. verify the CHOSEN kernel is CORRECT: full 34-layer SR vs PyTorch ----
+  const chosen=sel.chosen, f16=chosen.f16, eb=f16?2:4;
+  const pack=a=>f16?f16u16(a):a;
+  const Wg=dev.createBuffer({size:pack(wf).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(Wg,0,pack(wf));
+  const A=dev.createBuffer({size:FC*plane*eb,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC});
+  const B=dev.createBuffer({size:FC*plane*eb,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+  const px=await imgData("../compact_data/lr.png",W,H);const lp=new Float32Array(3*plane);
+  for(let y=0;y<H;y++)for(let x=0;x<W;x++){const o=(y*W+x)*4;for(let c=0;c<3;c++)lp[c*plane+y*W+x]=px[o+c]/255;}
+  dev.queue.writeBuffer(A,0,pack(lp));
+  const mod=dev.createShaderModule({code:chosen.code});const pipe=dev.createComputePipeline({layout:"auto",compute:{module:mod,entryPoint:"main"}});
+  let inb=A,outb=B;const passes=[];
+  for(const ly of layers){const u=new Uint32Array([H,W,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+    const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
+    const [gx,gy,gz]=chosen.dispatch(ly,H,W);
+    passes.push({bg:dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:Wg}},{binding:3,resource:{buffer:ub}}]}),gx,gy,gz});[inb,outb]=[outb,inb];}
+  const featLast=inb;
+  const out=dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+  const fT=f16?"f16":"f32";
+  const psh=dev.createShaderModule({code:`${f16?"enable f16;":""}struct P{H:u32,W:u32,up:u32,_p:u32};@group(0)@binding(0) var<storage,read> feat:array<${fT}>;@group(0)@binding(1) var<storage,read> lr:array<${fT}>;@group(0)@binding(2) var<uniform> u:P;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
+      var rgb=vec3f(0.0);for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(f32(feat[ch*pl+u32(y)*u.W+u32(x)])+f32(lr[u32(c)*pl+u32(y)*u.W+u32(x)]),0.0,1.0);}return vec4f(rgb,1.0);}`});
+  const fp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const LRb=dev.createBuffer({size:pack(lp).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(LRb,0,pack(lp));
+  const fub=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(fub,0,new Uint32Array([H,W,upscale,0]));
+  const fbg=dev.createBindGroup({layout:fp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:featLast}},{binding:1,resource:{buffer:LRb}},{binding:2,resource:{buffer:fub}}]});
+  const e=dev.createCommandEncoder();for(const p of passes){const cp=e.beginComputePass();cp.setPipeline(pipe);cp.setBindGroup(0,p.bg);cp.dispatchWorkgroups(p.gx,p.gy,p.gz);cp.end();}
+  const rp=e.beginRenderPass({colorAttachments:[{view:out.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(fp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();dev.queue.submit([e.finish()]);await dev.queue.onSubmittedWorkDone();
+  const bpr=Math.ceil(WD*4/256)*256;const rb=dev.createBuffer({size:bpr*HD,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  const e2=dev.createCommandEncoder();e2.copyTextureToBuffer({texture:out},{buffer:rb,bytesPerRow:bpr,rowsPerImage:HD},[WD,HD]);dev.queue.submit([e2.finish()]);await dev.queue.onSubmittedWorkDone();
+  const ref=await imgData("../compact_data/sr_ref.png",WD,HD);await rb.mapAsync(GPUMapMode.READ);const g=new Uint8Array(rb.getMappedRange());
+  let s=0,mx=0,n=0;for(let y=0;y<HD;y++)for(let x=0;x<WD;x++){const gi=y*bpr+x*4,ri=(y*WD+x)*4;for(let c=0;c<3;c++){const d=Math.abs(g[gi+c]-ref[ri+c]);s+=d;if(d>mx)mx=d;n++;}}
+  rb.unmap();const mad=s/n;
+  L(`chosen-kernel correctness: full SR vs PyTorch mean|Δ|=${mad.toFixed(4)} codes max=${mx} -> ${mad<3?"CORRECT":"BROKEN"}`, mad<3?"ok":"err");
+  Object.assign(R,{ok:true,family:sel.family,chosen:sel.chosen.label,results:sel.results.map(r=>({l:r.label,ms:r.ms||null,ok:r.ok})),cached2:sel2.cached,mad});
+}
+main().catch(e=>{L("ERR "+e.message+"\n"+e.stack,"err");window.__sel={error:e.message};});
+</script>
