@@ -5,3 +5,7 @@ extract_mvs_native
 *.o
 build*.log
 err.log
+mv_decode.wasm
+mv_decode.mjs
+wasm_frame0_rgb.bin
+flow_ref_frame1.bin
