@@ -17,7 +17,15 @@ async function main(){
   const {w_lr,h_lr,scale,w_hd,h_hd,fps,frames}=meta;
   const cnet=await (await fetch("../compact_data/layers.json")).json();   // reuse the exported compact net
   L(`LIVE GOP: ${frames.length} frames, ${frames.filter(f=>f.anchor).length} on-GPU-SR anchor + ${frames.filter(f=>!f.anchor).length} propagated; crop ${w_lr}x${h_lr} -> ${w_hd}x${h_hd} (x${scale}) @ ${fps}fps`,"hd");
-  const dev=await (await navigator.gpu.requestAdapter()).requestDevice();
+  // Anchor conv: fp16 COMBO (121.7ms in Chrome, below native, visually identical) by default;
+  // falls back to bit-exact f32 wtile (210ms) if the adapter lacks shader-f16. Flip F16 to force wtile.
+  const F16=true;
+  const adapter=await navigator.gpu.requestAdapter();
+  const useF16 = F16 && adapter.features.has("shader-f16");
+  const dev=await adapter.requestDevice({requiredFeatures: useF16?["shader-f16"]:[]});
+  const f16u16=(f32)=>new Uint16Array(new self.Float16Array(f32).buffer);   // pack f32 -> u16(f16)
+  const EB = useF16?2:4;   // conv feature/weight element bytes
+  const packF=(f32)=> useF16 ? f16u16(f32) : f32;   // -> the byte view to upload
   const samp=dev.createSampler({magFilter:"linear",minFilter:"linear",addressModeU:"clamp-to-edge",addressModeV:"clamp-to-edge"});
   const hdTex=()=>dev.createTexture({size:[w_hd,h_hd],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
   const lrTexOf=async u=>{const t=dev.createTexture({size:[w_lr,h_lr],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.RENDER_ATTACHMENT});
@@ -28,20 +36,22 @@ async function main(){
 
   // ---- compact SR pipeline (conv compute + pixelshuffle/residual render) ----
   const Wb=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
-  const W_gpu=dev.createBuffer({size:Wb.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(W_gpu,0,Wb);
-  const FC=64,plane=w_lr*h_lr,fsize=FC*plane*4;
-  // weight-tiled conv (the multi-agent winner): 6.8x over naive in Chrome, bit-exact. See conv_opt/.
-  // OCB=32, 16x16 workgroup -> dispatch z = ceil(out_c/32), workgroup tiles = ceil(dim/16).
-  const conv=dev.createShaderModule({code: await (await fetch("wtile.wgsl")).text()});
-  const WT_TILE=16, WT_OCB=32;
+  const Wbytes=packF(Wb);
+  const W_gpu=dev.createBuffer({size:Wbytes.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(W_gpu,0,Wbytes);
+  const FC=64,plane=w_lr*h_lr,fsize=FC*plane*EB;
+  // anchor conv: fp16 combo (11.8x, below native) or bit-exact wtile (6.8x). See conv_opt/. The combo
+  // uses OCB=64 (gz=1); wtile OCB=32. Both 16x16 workgroups -> tiles = ceil(dim/16).
+  const conv=dev.createShaderModule({code: await (await fetch(useF16?"combo.wgsl":"wtile.wgsl")).text()});
+  const WT_TILE=16, WT_OCB=useF16?64:32;
   const cpipe=dev.createComputePipeline({layout:"auto",compute:{module:conv,entryPoint:"main"}});
-  const psh=dev.createShaderModule({code:`
+  const fT=useF16?"f16":"f32";
+  const psh=dev.createShaderModule({code:`${useF16?"enable f16;":""}
     struct P{H:u32,W:u32,up:u32,_p:u32};
-    @group(0) @binding(0) var<storage,read> feat:array<f32>; @group(0) @binding(1) var<storage,read> lr:array<f32>; @group(0) @binding(2) var<uniform> u:P;
+    @group(0) @binding(0) var<storage,read> feat:array<${fT}>; @group(0) @binding(1) var<storage,read> lr:array<${fT}>; @group(0) @binding(2) var<uniform> u:P;
     @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
     @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
       let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
-      var rgb=vec3f(0.0); for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(feat[ch*pl+u32(y)*u.W+u32(x)]+lr[u32(c)*pl+u32(y)*u.W+u32(x)],0.0,1.0);}
+      var rgb=vec3f(0.0); for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(f32(feat[ch*pl+u32(y)*u.W+u32(x)])+f32(lr[u32(c)*pl+u32(y)*u.W+u32(x)]),0.0,1.0);}
       return vec4f(rgb,1.0);}`});
   const pshp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
 
@@ -50,8 +60,9 @@ async function main(){
     const B=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE});
     const px=await imgData(lrUrl,w_lr,h_lr); const lp=new Float32Array(3*plane);
     for(let y=0;y<h_lr;y++)for(let x=0;x<w_lr;x++){const o=(y*w_lr+x)*4;for(let c=0;c<3;c++)lp[c*plane+y*w_lr+x]=px[o+c]/255;}
-    const LRb=dev.createBuffer({size:lp.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(LRb,0,lp);
-    const Ai=new Float32Array(FC*plane);Ai.set(lp.subarray(0,3*plane),0);dev.queue.writeBuffer(A,0,Ai);
+    const lpB=packF(lp);
+    const LRb=dev.createBuffer({size:lpB.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(LRb,0,lpB);
+    const Af=new Float32Array(FC*plane);Af.set(lp.subarray(0,3*plane),0);dev.queue.writeBuffer(A,0,packF(Af));
     let inb=A,outb=B;const bgs=[];   // all 34 conv layers in ONE encoder/submit (per-pass barriers; same math)
     for(const ly of cnet.layers){
       const u=new Uint32Array([h_lr,w_lr,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
