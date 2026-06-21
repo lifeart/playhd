@@ -40,10 +40,21 @@ node test_mv_wasm.mjs            # seam check vs mv_reference.json  (exit 0 = id
 - `mv_reference.json` — per-frame MV counts from the native PyAV pipeline (the validation target).
 - `extract_mvs.c` — the upstream example, kept for reference.
 
-## What this unblocks / what's next
-The throughput spike already showed SD software-decode is real-time-capable in WASM (~850–1000 fps). This proves the
-**MV side-data** comes through too. Remaining engineering (not feasibility): (1) a clean JS API returning a packed
-MV buffer + the decoded frame per `decode()` call (instead of CSV-over-stdout), so the browser pipeline gets
-`{frame, mvs}` live; (2) wire it into `gop_live` to replace the offline `flow_*.bin`; (3) `SharedArrayBuffer` +
-cross-origin isolation if threaded decode is ever needed (single-thread SD is likely enough). With this seam closed,
-**every input the pipeline needs is now reachable in-browser** — the architecture is end-to-end web-only feasible.
+## Clean API + JS flow + LIVE browser pipeline (all built & verified)
+Beyond the CSV proof, the module now exposes a real pipeline, all parity-checked against the native PyAV path:
+- **`mv_decode.c` + `mv_decode.mjs`** — clean JS-callable API: `mvdec_open` then loop `mvdec_next()`, reading
+  `mvdec_rgb()` (RGB24 via libswscale) + `mvdec_mvs()` (packed motion vectors) from the heap per frame.
+  `test_mv_decode.mjs`: 30/30 MV counts identical, **RGB bit-exact vs PyAV's `rgb24`** (mean|Δ|=0.000, max=0).
+- **`flow.js`** — JS port of `derisk.build_lr_flow` (codec MVs → dense per-pixel LR fetch-flow). **Bit-exact** to
+  the Python `build_lr_flow` (28160/28160 hole positions, value max|Δ|=0).
+- **`mv_pipeline.html`** — the LIVE end-to-end browser demo, **zero offline data**: `sd600.mp4` → WASM decode
+  (frame + MVs, ~66 ms) → JS flow → WebGPU MV-warp. Warping frame 0 by the codec MVs reconstructs frame 1 at
+  **mean|Δ|=0.49 codes** over covered pixels (visually exact). Open it in a WebGPU browser to watch it run.
+
+## What's left (engineering, not feasibility)
+With the decode→MV→flow→warp chain proven live and bit-exact, the remaining work is product integration: wire
+`mv_decode` + `flow.js` into `gop_live`'s GOP loop (replace the offline `lr_*.png`/`flow_*.bin` with live WASM
+output) driven by a frame clock; add the SR anchor + occlusion stages already verified elsewhere; and
+`SharedArrayBuffer`/cross-origin isolation only if threaded decode is ever needed (single-thread SD is likely
+enough — the spike showed ~850–1000 fps). **Every input the pipeline needs is now reachable and verified
+in-browser — the architecture is end-to-end web-only, proven not argued.**
