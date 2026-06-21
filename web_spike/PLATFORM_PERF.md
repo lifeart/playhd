@@ -69,15 +69,67 @@ pipeline-level work is pure engineering (persistent resources + raw decoder uplo
   (the amortized anchor), and the per-frame cost is a cheap MV warp — the browser's worst energy cost (per-frame
   CNN) is structurally avoided.
 
-## 4. Cross-GPU portability (Apple-tuned today) → `conv_opt/PORTABILITY.md`
+## 4. Cross-GPU portability (Apple-tuned today) → full analysis in `conv_opt/PORTABILITY.md`
 
-The wtile/combo params (256-thread 16×16 workgroup, OCB=32/64, fully-unrolled vec4 accumulators) were tuned ONLY
-on this Apple GPU. NVIDIA (warp 32, large register file), AMD (wave 64), Intel (SIMD 8/16/32) and mobile differ in
-SIMD width, register file size, and shared-memory budget — so the optimal OCB/tile/precision differ, and an
-Apple-optimal config can spill or collapse occupancy elsewhere. The adapter-aware selection table (query
-`adapter.limits`/`info` → pick params per family, with a conservative fallback) is in `PORTABILITY.md`.
+The wtile/combo params were tuned ONLY on this Apple GPU. A broad parameter sweep (OCB × tile × precision ×
+double-buffer, Deno/wgpu) produced these portability rules:
 
-## 5. Subgroups (cross-lane ops without shared memory) → (investigation in progress)
+- **f16 is the most transferable parameter** — a clean **1.6–1.9× win at *every* OCB/tile**, because it helps on
+  three axes at once (ALU throughput, halved bandwidth, **halved accumulator register pressure**) — i.e. it helps
+  *most* exactly where a GPU is constrained. On any GPU with `shader-f16`, f16 is the right base. (Already the
+  live default, with f32 fallback.)
+- **256 threads/workgroup is the only universally safe ceiling.** >256 **hard-fails** (`workgroup size exceeds…`)
+  even when the adapter advertises `maxComputeInvocationsPerWorkgroup: 1024` — on Apple/wgpu, 512 fails even after
+  explicitly requesting the higher limit. **Never trust that limit above 256 for compute.**
+- **The central portability hazard = OCB × thread-count register interaction.** OCB sets accumulator registers
+  per thread; thread-count multiplies total demand. The *same* OCB flips from best to worst: `f32 OCB64` is the
+  **fastest f32 config at 64 threads (8×8)** but **+37% slower at 256 threads (16×16)** — occupancy collapse from
+  register pressure. So the shipped "OCB=32 sweet spot" was conditioned on 256-thread Apple workgroups; it is
+  **not a portable constant**. f16 *dodges* this (half the accumulator footprint lets big-OCB + high occupancy
+  coexist) — which is why it matters more on small-register GPUs, not less.
+- **Mobile (Mali/Adreno) is the danger zone** — small per-thread register files + tile memory. The Apple
+  OCB64-at-256-threads default is predicted to spill catastrophically there → the table drops them to OCB16–32,
+  smaller workgroups (8×8), f16 (mobile f16 is strong), and **double-buffer OFF** (DB is only ~3% on Apple but
+  doubles shared memory — a bad mobile trade).
+- **Recommendation: hybrid — a static `adapter`-keyed table narrows to 2–3 candidates, then a first-load
+  micro-benchmark picks the winner** (time the shortlist on one small conv layer via `timestamp-query`, tens of
+  ms once, cache per `adapter.info`). Pure-static is too fragile (the knife-edge OCB×threads optimum isn't
+  exposed by any WebGPU limit; Dawn-vs-wgpu disagree 6.8× vs 12.9×; `adapter.info.architecture` can be
+  privacy-masked) — this matches ONNX-Runtime-Web's WebGPU tunable-op autotuning.
+- **Safe fallback when in doubt = the bit-exact `f32 OCB32 16×16 256-thread` wtile** (parity-guaranteed, 4.9 KB
+  shared < the 16 KB spec minimum, moderate registers); step down to OCB16 / no-DB on a constrained unknown GPU.
 
-Apple SIMD = 32 lanes; `subgroups` is exposed (added to the harness). Whether `subgroupBroadcast`/`subgroupShuffle`
-can beat the shared-memory weight/halo cache (lower latency, no barrier) is under test — results appended here.
+Full sweep table + per-family decision table (Apple measured; NVIDIA/AMD/Intel/Mali/Adreno architecture-inferred)
++ the query/validation logic are in `conv_opt/PORTABILITY.md`.
+
+## 5. Subgroups (cross-lane ops without shared memory) → NULL on Apple (and a tooling trap)
+
+Apple SIMD = 32 lanes. Investigated whether `subgroupBroadcast`/`subgroupShuffle` can beat the shared-memory
+weight/halo cache (lower latency, no barrier).
+
+**Tooling trap (decisive for the headless harness):** `subgroups` is a **phantom feature** in Deno's wgpu — the
+adapter *advertises* it but naga rejects `enable subgroups;` ("not yet implemented", wgpu #5555). So the Deno
+timestamp arbiter **cannot time any subgroup kernel** (a naive probe silently reads zeros — same class of bug as
+the earlier vacuous-parity trap). Chrome's Tint *does* implement subgroups, so it's the only place to measure them.
+
+**Design analysis (Apple):** three strategies were designed; only **weight-broadcast** is viable (a 32-lane subgroup
+loads the per-channel weights once and `subgroupBroadcast`s them, freeing the ~4.6 KB shared weight tile).
+Horizontal input-shuffle fails (32 lanes = a 2-row strip, but the 3×3 stencil's *vertical* reuse crosses subgroup
+boundaries) and `subgroupAdd` channel-reduction fails (destroys the register-blocking that feeds 64 outputs per
+input load). **Expectation: no win on Apple** — the combo is **register-bound** (OCB=64 = 16 vec4 accumulators), so
+freeing shared memory doesn't lift occupancy; Apple weight reads are already free uniform threadgroup-broadcasts;
+and the explicit broadcasts *add* ~144 ops/channel. The lane-indexing was verified correct via an emulation twin
+(`candidate_subgroup_emu.ts`, parity 3e-7 = bit-identical to wtile), so `candidate_subgroup.ts` is correct — just
+unmeasured in Deno. **Plausibly useful on NVIDIA/AMD** (cheaper cross-lane shuffle, costlier shared-mem bank
+conflicts) — but there the bigger lever is **dp4a / cooperative-matrix (tensor) ops**, not subgroups.
+
+**Chrome confirmation (MEASURED, `sr_subgroup.html`):** the weight-broadcast subgroup conv runs in Chrome at
+**556.9 ms, bit-exact** (parity 5e-6, max 1 — confirms the lane-indexing is correct) — i.e. **4.6× SLOWER than the
+combo (121.7 ms)** and 2.6× slower than wtile (210 ms). The null is now empirical, not just predicted. Two
+compounding reasons: (1) subgroups can't be combined with f16 here (`subgroups-f16` isn't exposed), so the kernel
+is stuck on the **f32 OCB64** base — which the portability sweep shows is *already* register-throttled at 256
+threads (rel 1.21); and (2) the 144 explicit `subgroupBroadcast`s/channel add overhead the threadgroup-broadcast
+path didn't pay. **Verdict: subgroups are a dead end for this kernel on Apple** (the f16 register-relief, which
+subgroups can't access, is what actually wins). They may help on NVIDIA/AMD, but there the real lever is
+dp4a / cooperative-matrix (tensor) ops — a separate future investigation. Artifacts kept for the record:
+`conv_opt/candidate_subgroup.ts` (+ `_emu` correctness twin), `webgpu_warp/{sr_subgroup.html, subgroup.wgsl}`.
