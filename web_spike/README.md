@@ -66,10 +66,26 @@ was wrong — it's the *primary* fix when the accumulators stay register-residen
 latency/occupancy-bound; vec4-vectorization and pure-fp16 each give little alone (Metal already vectorizes;
 not bandwidth-bound), but **weight+input tiling + register blocking** breaks the ~65 GFLOP/s wall.
 
-**Impact:** the anchor SR goes from ~1330 ms → **210 ms** — real-time-*compatible* for the streaming pipeline
-(amortized: at 24 fps, re-anchoring every 16–48 frames = 0.67–2 s budget ≫ 210 ms, while the warp carries the
-rest at ~10,400 fps). A combination round (wtile structure + fp16) is in flight to push lower. Harness +
-candidates in `conv_opt/`; Chrome proof `webgpu_warp/sr_wtile.html` (+ `wtile.wgsl`).
+**Combination round — wtile + fp16 = BELOW NATIVE (`sr_combo.html`, `combo.wgsl`):** grafting fp16 onto wtile's
+register-blocked structure (OCB=64 now fits since 16×vec4&lt;f16&gt; = same 32 regs as 8×vec4&lt;f32&gt; → gz=1,
+each input loaded once; f16-accumulate, both mul+add 2× on Apple) gives **121.7 ms in Chrome = 11.8× over naive,
+below the native compact-SR (~130 ms)**, full SR output **visually identical** vs PyTorch (mean 0.016 / max 7
+codes — f16-level, and the project already validated fp16 SR as LPIPS-identical). A switchable `ACC="f32"` mode
+is bit-tighter (parity 4e-4) at 212 ms if ever needed.
+
+**Impact:** the anchor SR goes from ~1437 ms → **210 ms bit-exact** (wtile, integrated into `gop_live`) or **121.7 ms
+visually-identical** (wtile+fp16) — **the in-browser instant tier now streams in real-time, matching (and at f16,
+beating) the native architecture's amortized anchor**. The live pipeline ships the bit-exact wtile by default
+(anchor `runSR` ~1357→516 ms, full-chain parity unchanged); the below-native fp16 combo is proven and available to
+swap in. Harness + candidates in `conv_opt/`; Chrome proofs `webgpu_warp/{sr_wtile.html, sr_combo.html}`
+(+ `wtile.wgsl`, `combo.wgsl`).
+
+**Results ladder (Chrome, 256→1024, 34-layer conv, timestamp best-of-5):**
+| kernel | conv time | vs naive | vs native (~130 ms) | full-SR parity | status |
+|---|---|---|---|---|---|
+| naive | 1437 ms | 1.0× | 11× slower | bit-exact | (baseline) |
+| **wtile** (f32) | **210 ms** | **6.8×** | 1.6× slower | **bit-exact** (max 1) | **integrated in live** |
+| **combo** (wtile+f16) | **121.7 ms** | **11.8×** | **below native** | visually identical (max 7) | proven, available |
 
 ## Roadmap to a shippable in-browser tier (all engineering, no open feasibility)
 1. **WASM MV-binding** (the long pole; needs `emsdk` — parked): expose
