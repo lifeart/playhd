@@ -1,0 +1,71 @@
+<!doctype html>
+<meta charset="utf-8"><title>playhd — anchor runSR stage breakdown (where the non-conv ms go)</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}#log{white-space:pre-wrap}.ok{color:#6f6}.hd{color:#9cf}.err{color:#f66}</style>
+<h3 class="hd">playhd — anchor runSR stage breakdown (f16 combo): decode vs upload vs conv vs pixelshuffle vs readback</h3><div id="log"></div>
+<script type="module">
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={};window.__b=R;
+const F16=self.Float16Array; const f16u16=f=>new Uint16Array(new F16(f).buffer);
+async function main(){
+  const adapter=await navigator.gpu.requestAdapter();
+  const dev=await adapter.requestDevice({requiredFeatures:["shader-f16"]});
+  const meta=await (await fetch("../compact_data/layers.json")).json();const {layers,upscale,H,W}=meta;const HD=H*upscale,WD=W*upscale,plane=H*W,FC=64;
+  const wf=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
+  const Wg=dev.createBuffer({size:f16u16(wf).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(Wg,0,f16u16(wf));
+  const conv=dev.createShaderModule({code:await (await fetch("combo.wgsl")).text()});
+  const pipe=dev.createComputePipeline({layout:"auto",compute:{module:conv,entryPoint:"main"}});
+  const psh=dev.createShaderModule({code:`enable f16;struct P{H:u32,W:u32,up:u32,_p:u32};@group(0)@binding(0) var<storage,read> feat:array<f16>;@group(0)@binding(1) var<storage,read> lr:array<f16>;@group(0)@binding(2) var<uniform> u:P;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
+      var rgb=vec3f(0.0);for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(f32(feat[ch*pl+u32(y)*u.W+u32(x)])+f32(lr[u32(c)*pl+u32(y)*u.W+u32(x)]),0.0,1.0);}return vec4f(rgb,1.0);}`});
+  const fp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const out=dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC});
+  const sync=async()=>{await dev.queue.onSubmittedWorkDone();};   // Chrome's onSubmittedWorkDone barriers correctly (Deno's didn't)
+  async function anchor(persist){
+    const T={};let t=performance.now();const mk=k=>{T[k]=performance.now()-t;t=performance.now();};
+    // 1. LR decode (createImageBitmap + getImageData)
+    const b=await createImageBitmap(await (await fetch("../compact_data/lr.png")).blob());const cc=new OffscreenCanvas(W,H);const cx=cc.getContext("2d");cx.drawImage(b,0,0);const px=cx.getImageData(0,0,W,H).data;
+    const lp=new Float32Array(3*plane);for(let y=0;y<H;y++)for(let x=0;x<W;x++){const o=(y*W+x)*4;for(let c=0;c<3;c++)lp[c*plane+y*W+x]=px[o+c]/255;}
+    mk("decode");
+    // 2. setup: f16 pack + buffers + bind groups (persist=reuse across anchors)
+    if(!persist.done){
+      persist.A=dev.createBuffer({size:FC*plane*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST|GPUBufferUsage.COPY_SRC});
+      persist.B=dev.createBuffer({size:FC*plane*2,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST});
+      persist.LRb=dev.createBuffer({size:f16u16(new Float32Array(3*plane)).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+      let inb=persist.A,outb=persist.B;persist.bgs=[];
+      for(const ly of layers){const u=new Uint32Array([H,W,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+        const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
+        persist.bgs.push({bg:dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:Wg}},{binding:3,resource:{buffer:ub}}]}),gz:Math.ceil(ly.out_c/64)});[inb,outb]=[outb,inb];}
+      persist.featLast=inb;
+      const fu=new Uint32Array([H,W,upscale,0]);const fub=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(fub,0,fu);
+      persist.fbg=dev.createBindGroup({layout:fp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:persist.featLast}},{binding:1,resource:{buffer:persist.LRb}},{binding:2,resource:{buffer:fub}}]});
+      persist.done=true;
+    }
+    const lp16=f16u16(lp);   // pack ONLY the 3 input channels (layer 0 has in_c=3; channels 3..63 of A are unread)
+    dev.queue.writeBuffer(persist.A,0,lp16);dev.queue.writeBuffer(persist.LRb,0,lp16);
+    mk("setup");
+    // 3. conv (submit + sync)
+    {const e=dev.createCommandEncoder();for(const p of persist.bgs){const cp=e.beginComputePass();cp.setPipeline(pipe);cp.setBindGroup(0,p.bg);cp.dispatchWorkgroups(Math.ceil(W/16),Math.ceil(H/16),p.gz);cp.end();}dev.queue.submit([e.finish()]);}
+    await sync();mk("conv");
+    // 4. pixelshuffle (submit + sync)
+    {const e=dev.createCommandEncoder();const rp=e.beginRenderPass({colorAttachments:[{view:out.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(fp);rp.setBindGroup(0,persist.fbg);rp.draw(3);rp.end();dev.queue.submit([e.finish()]);}
+    await sync();mk("pixelshuffle");
+    // 5. readback (test-only; copyTextureToBuffer + map)
+    {const bpr=Math.ceil(WD*4/256)*256;const rb=dev.createBuffer({size:bpr*HD,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});const e=dev.createCommandEncoder();e.copyTextureToBuffer({texture:out},{buffer:rb,bytesPerRow:bpr,rowsPerImage:HD},[WD,HD]);dev.queue.submit([e.finish()]);await rb.mapAsync(GPUMapMode.READ);rb.unmap();}
+    mk("readback");
+    return T;
+  }
+  const persist={done:false};
+  await anchor(persist);await anchor(persist); // warmup + build persistent
+  let best=null;for(let k=0;k<5;k++){const T=await anchor(persist);if(!best||T.conv<best.conv)best=T;}
+  const tot=Object.values(best).reduce((a,b)=>a+b,0);
+  L(`anchor runSR stage breakdown (f16 combo, ${W}x${H}->${WD}x${HD}, persistent buffers, best-of-5):`,"hd");
+  for(const k of ["decode","setup","conv","pixelshuffle","readback"]) L(`  ${k.padEnd(13)}: ${best[k].toFixed(1)} ms`, k==="conv"?"ok":"");
+  L(`  TOTAL: ${tot.toFixed(1)} ms`,"hd");
+  const prod=best.conv+best.setup+best.pixelshuffle; // production = no createImageBitmap decode (raw from WASM), no readback
+  L(`  => PRODUCTION estimate (raw LR upload, no readback): ~${prod.toFixed(1)} ms = conv ${best.conv.toFixed(0)} + setup ${best.setup.toFixed(0)} + pixelshuffle ${best.pixelshuffle.toFixed(0)}`,"ok");
+  L(`     (decode ${best.decode.toFixed(0)}ms is createImageBitmap PNG decode -> in prod the WASM decoder hands raw pixels; readback ${best.readback.toFixed(0)}ms is test-only)`,"hd");
+  Object.assign(R,{ok:true,best,tot,prod});
+}
+main().catch(e=>{L("ERR "+e.message,"err");window.__b={error:e.message};});
+</script>

@@ -26,6 +26,7 @@ const adapter = await navigator.gpu.requestAdapter();
 const hasF16 = adapter.features.has("shader-f16");
 const feats: GPUFeatureName[] = ["timestamp-query"];
 if (hasF16) feats.push("shader-f16");
+if (adapter.features.has("subgroups")) feats.push("subgroups" as GPUFeatureName);   // enable cross-lane ops for candidates
 const dev = await adapter.requestDevice({
   requiredFeatures: feats,
   requiredLimits: { maxComputeWorkgroupStorageSize: Math.min(32768, adapter.limits.maxComputeWorkgroupStorageSize) },

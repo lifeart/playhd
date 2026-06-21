@@ -60,9 +60,9 @@ async function main(){
     const B=dev.createBuffer({size:fsize,usage:GPUBufferUsage.STORAGE});
     const px=await imgData(lrUrl,w_lr,h_lr); const lp=new Float32Array(3*plane);
     for(let y=0;y<h_lr;y++)for(let x=0;x<w_lr;x++){const o=(y*w_lr+x)*4;for(let c=0;c<3;c++)lp[c*plane+y*w_lr+x]=px[o+c]/255;}
-    const lpB=packF(lp);
+    const lpB=packF(lp);   // pack the 3 LR channels once; reused for both the residual buffer and the conv seed
     const LRb=dev.createBuffer({size:lpB.byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(LRb,0,lpB);
-    const Af=new Float32Array(FC*plane);Af.set(lp.subarray(0,3*plane),0);dev.queue.writeBuffer(A,0,packF(Af));
+    dev.queue.writeBuffer(A,0,lpB);   // seed only channels 0..2 (layer 0 has in_c=3; A is zero-init so 3..63 stay 0) — avoids a wasteful 64-channel pack
     let inb=A,outb=B;const bgs=[];   // all 34 conv layers in ONE encoder/submit (per-pass barriers; same math)
     for(const ly of cnet.layers){
       const u=new Uint32Array([h_lr,w_lr,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
