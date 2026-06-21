@@ -1,0 +1,81 @@
+<!doctype html>
+<meta charset="utf-8"><title>playhd — LIVE in-browser: video file → WASM decode → MV flow → WebGPU warp (no server, no offline data)</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}canvas{border:1px solid #333;image-rendering:pixelated;max-width:31%}#log{white-space:pre-wrap;margin-top:8px}.ok{color:#6f6}.err{color:#f66}.hd{color:#9cf}.row{display:flex;gap:10px}</style>
+<h3 class="hd">playhd — END-TO-END in the browser: sd600.mp4 → WASM libav decode (frame+MVs) → JS flow → WebGPU MV-warp</h3>
+<div class="row">
+  <div><div>frame 0 (decoded, reference)</div><canvas id="ref"></canvas></div>
+  <div><div>frame 1 WARPED from frame 0 via codec MVs</div><canvas id="warp"></canvas></div>
+  <div><div>frame 1 (decoded, actual)</div><canvas id="act"></canvas></div>
+</div>
+<div id="log"></div>
+<script type="module">
+import createModule from "./mv_decode.mjs";
+import { buildLrFlow } from "./flow.js";
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={};window.__mvp=R;
+function rgb24toRGBA(rgb,w,h){const o=new Uint8Array(w*h*4);for(let i=0,j=0;i<w*h;i++){o[j++]=rgb[i*3];o[j++]=rgb[i*3+1];o[j++]=rgb[i*3+2];o[j++]=255;}return o;}
+async function main(){
+  if(!navigator.gpu){L("WebGPU not available","err");return;}
+  // ---- 1. decode IN THE BROWSER via WASM libav (frame pixels + motion vectors) ----
+  const t0=performance.now();
+  const clip=new Uint8Array(await (await fetch("../sd600.mp4")).arrayBuffer());
+  const M=await createModule({printErr:()=>{}});
+  M.FS.writeFile("/in.mp4",clip);
+  const open=M.cwrap("mvdec_open","number",["string"]),next=M.cwrap("mvdec_next","number",[]);
+  const Wf=M.cwrap("mvdec_width","number",[]),Hf=M.cwrap("mvdec_height","number",[]);
+  const rgbPtr=M.cwrap("mvdec_rgb","number",[]),nmvF=M.cwrap("mvdec_nmv","number",[]),mvsPtr=M.cwrap("mvdec_mvs","number",[]);
+  if(open("/in.mp4")!==0){L("decode open failed","err");return;}
+  next(); const w=Wf(),h=Hf(); const f0=M.HEAPU8.slice(rgbPtr(),rgbPtr()+w*h*3);   // frame 0 (I, reference)
+  next(); const f1=M.HEAPU8.slice(rgbPtr(),rgbPtr()+w*h*3); const n=nmvF();          // frame 1 (P, target)
+  const mvs=M.HEAP32.slice(mvsPtr()>>2,(mvsPtr()>>2)+n*10);
+  const tDec=performance.now()-t0;
+  L(`WASM decode (in-browser): ${w}x${h}, frame1 carries ${n} codec MVs  [${tDec.toFixed(0)} ms incl. wasm init]`,"hd");
+  // ---- 2. MV -> dense LR flow in JS (bit-exact to derisk.build_lr_flow) ----
+  const {fx,fy}=buildLrFlow(mvs,h,w,"all");
+  let holes=0; const flowTex=new Float32Array(w*h*4);
+  for(let i=0;i<w*h;i++){const hole=Number.isNaN(fx[i]);if(hole)holes++;flowTex[i*4]=hole?-1e9:fx[i];flowTex[i*4+1]=hole?0:fy[i];flowTex[i*4+2]=hole?0:1;flowTex[i*4+3]=0;}
+  L(`MV -> flow (JS): ${w*h-holes} px covered, ${holes} holes (intra)`,"");
+  // ---- 3. WebGPU warp: warped(x,y) = frame0( x+fx, y+fy ); hole -> frame1 pixel (the gop_live fallback) ----
+  const dev=await (await navigator.gpu.requestAdapter()).requestDevice();
+  dev.onuncapturederror=(e)=>{L("GPU UNCAPTURED: "+e.error.message,"err");R.gpuerr=e.error.message;};
+  dev.pushErrorScope("validation");
+  // sampled textures only: NO RENDER_ATTACHMENT (rgba32float isn't renderable -> forcing it makes the flow
+  // texture invalid -> invalid bind group -> the render is silently dropped -> all-black output).
+  const mkTex=(data,fmt,bpp)=>{const t=dev.createTexture({size:[w,h],format:fmt,usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});dev.queue.writeTexture({texture:t},data,{bytesPerRow:w*bpp,rowsPerImage:h},[w,h]);return t;};
+  const ref=mkTex(rgb24toRGBA(f0,w,h),"rgba8unorm",4);
+  const cur=mkTex(rgb24toRGBA(f1,w,h),"rgba8unorm",4);
+  const flow=mkTex(flowTex,"rgba32float",16);
+  const samp=dev.createSampler({magFilter:"linear",minFilter:"linear",addressModeU:"clamp-to-edge",addressModeV:"clamp-to-edge"});
+  const out=dev.createTexture({size:[w,h],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.COPY_SRC|GPUTextureUsage.TEXTURE_BINDING});
+  const mod=dev.createShaderModule({code:`
+    @group(0) @binding(0) var refT:texture_2d<f32>; @group(0) @binding(1) var curT:texture_2d<f32>;
+    @group(0) @binding(2) var flowT:texture_2d<f32>; @group(0) @binding(3) var s:sampler;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
+      let d=vec2i(floor(pos.xy)); let f=textureLoad(flowT,d,0);
+      if(f.x < -1.0e8){ return vec4f(textureLoad(curT,d,0).rgb,1.0); }   // hole -> current frame (fallback)
+      let src=(pos.xy+vec2f(f.x,f.y))/vec2f(${w}.0,${h}.0);
+      return vec4f(textureSampleLevel(refT,s,src,0.0).rgb,1.0); }`});
+  const pipe=dev.createRenderPipeline({layout:"auto",vertex:{module:mod,entryPoint:"vs"},fragment:{module:mod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const bg=dev.createBindGroup({layout:pipe.getBindGroupLayout(0),entries:[{binding:0,resource:ref.createView()},{binding:1,resource:cur.createView()},{binding:2,resource:flow.createView()},{binding:3,resource:samp}]});
+  const e=dev.createCommandEncoder();const rp=e.beginRenderPass({colorAttachments:[{view:out.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(pipe);rp.setBindGroup(0,bg);rp.draw(3);rp.end();
+  // readback warped for the metric + display all three
+  const bpr=Math.ceil(w*4/256)*256;const rb=dev.createBuffer({size:bpr*h,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+  e.copyTextureToBuffer({texture:out},{buffer:rb,bytesPerRow:bpr,rowsPerImage:h},[w,h]);dev.queue.submit([e.finish()]);await dev.queue.onSubmittedWorkDone();
+  const gpuErr=await dev.popErrorScope(); if(gpuErr){L("GPU VALIDATION ERROR: "+gpuErr.message,"err");R.gpuerr=gpuErr.message;}
+  await rb.mapAsync(GPUMapMode.READ);const g=new Uint8Array(rb.getMappedRange());
+  // metric: warped vs actual frame1 over COVERED (non-hole) pixels
+  let s=0,nc=0,mx=0;for(let y=0;y<h;y++)for(let x=0;x<w;x++){if(Number.isNaN(fx[y*w+x]))continue;const gi=y*bpr+x*4,ai=(y*w+x)*3;for(let c=0;c<3;c++){const dd=Math.abs(g[gi+c]-f1[ai+c]);s+=dd;if(dd>mx)mx=dd;nc++;}}
+  const mad=s/nc;
+  const wimg=new Uint8ClampedArray(w*h*4);for(let y=0;y<h;y++)for(let x=0;x<w;x++){const gi=y*bpr+x*4,o=(y*w+x)*4;wimg[o]=g[gi];wimg[o+1]=g[gi+1];wimg[o+2]=g[gi+2];wimg[o+3]=255;}  // build BEFORE unmap (g detaches on unmap)
+  rb.unmap();
+  const paintRGB=(id,rgb)=>{const cv=document.getElementById(id);cv.width=w;cv.height=h;cv.getContext("2d").putImageData(new ImageData(new Uint8ClampedArray(rgb24toRGBA(rgb,w,h)),w,h),0,0);};
+  paintRGB("ref",f0); paintRGB("act",f1);
+  const cw=document.getElementById("warp");cw.width=w;cw.height=h;cw.getContext("2d").putImageData(new ImageData(wimg,w,h),0,0);
+  L(`WebGPU MV-warp: frame0 warped to frame1 via codec MVs.`,"hd");
+  L(`  propagation residual (warped vs actual frame1, covered px): mean|Δ|=${mad.toFixed(2)} codes, max=${mx}  -> ${mad<12?"GOOD (MV propagation reconstructs the frame)":"high"}`,mad<12?"ok":"err");
+  L(`\n✅ FULLY IN-BROWSER, NO SERVER, NO OFFLINE DATA: video bytes -> WASM libav decode (pixels + motion vectors) -> JS flow -> WebGPU warp.`,"ok");
+  Object.assign(R,{ok:true,w,h,nmv:n,holes,mad,max:mx,decodeMs:Math.round(tDec)});
+}
+main().catch(e=>{L("ERR "+e.message+"\n"+(e.stack||""),"err");window.__mvp={error:e.message};});
+</script>
