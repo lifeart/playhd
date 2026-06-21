@@ -1,0 +1,7 @@
+# build outputs (regenerate via build_ffmpeg_wasm.sh) + native debug binary + logs
+mv_wasm.wasm
+mv_wasm.mjs
+extract_mvs_native
+*.o
+build*.log
+err.log
