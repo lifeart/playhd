@@ -88,10 +88,15 @@ swap in. Harness + candidates in `conv_opt/`; Chrome proofs `webgpu_warp/{sr_wti
 | **combo** (wtile+f16) | **121.7 ms** | **11.8×** | **below native** | visually identical (max 7) | proven, available |
 
 ## Roadmap to a shippable in-browser tier (all engineering, no open feasibility)
-1. **WASM MV-binding** (the long pole; needs `emsdk` — parked): expose
-   `av_frame_get_side_data(MOTION_VECTORS)` from a WASM libav build so the flow comes live from in-browser
-   decode instead of the offline `.bin`. The spike proved the throughput; this is marshalling.
-2. **Conv perf**: fp16 / tiled conv (or reuse a tuned WGSL CNN) → real-time anchor.
+1. **WASM MV-binding** — ✅ **DONE & VERIFIED** (`wasm_mv/`): a minimal Emscripten FFmpeg build surfaces
+   `av_frame_get_side_data(MOTION_VECTORS)` and emits motion vectors **byte-identical to the native PyAV
+   pipeline** (sd600.mp4: 30/30 frames exact, 22,429 MVs; whole clip 802,611 MVs over 689 frames). The build
+   trap was `--disable-everything` zeroing `CONFIG_MPEGVIDEODEC`, which `#if`-compiles out the h264 MV-export
+   call — fixed with `--enable-decoder=mpeg2video`. Remaining is marshalling only: a clean `{frame, mvs}` JS
+   API + wiring into `gop_live` to replace the offline `flow_*.bin`. **With this seam closed, every pipeline
+   input is reachable in-browser — the architecture is end-to-end web-only feasible.**
+2. **Conv perf** — ✅ **DONE**: weight-tiled f16 conv = 121.7 ms in Chrome (11.8×, below native), adapter-aware
+   self-tuning selector, streaming overhead removed (per-anchor = just the conv). See `PLATFORM_PERF.md`.
 3. **Adaptive fwd-bwd occlusion** (mode (c)): the softmax-splat consistency check, high-motion only.
 4. **Full-frame (uncropped) run** at production resolution; the GOP frame loop driven by `requestVideoFrameCallback`.
 
