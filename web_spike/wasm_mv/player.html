@@ -124,7 +124,7 @@ async function Player(fileBytes){
   // HD textures (ping-pong) + LR textures (cur/prev) + flow
   const hdTex=()=>dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_SRC});
   let hdA=hdTex(), hdB=hdTex();
-  const lrTex=()=>dev.createTexture({size:[w,h],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+  const lrTex=()=>dev.createTexture({size:[w,h],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.COPY_SRC});
   let lrCur=lrTex(), lrPrev=lrTex();
   const flowTex=dev.createTexture({size:[w,h],format:"rgba32float",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
   const samp=dev.createSampler({magFilter:"linear",minFilter:"linear",addressModeU:"clamp-to-edge",addressModeV:"clamp-to-edge"});
@@ -185,15 +185,17 @@ async function Player(fileBytes){
 
   // --- playback state ---
   let prevHD=hdA, freeHD=hdB, fi=0, anchors=0, warps=0, playing=true, rafid=0, lastT=0, divider=0.5, srMsAvg=0;
+  const REANCHOR=12; let sinceAnchor=1e9;   // re-SR at least every REANCHOR frames to bound warp drift (NEMO cadence)
   function rebuildDecoder(){ dclose(); dopen("/in.mp4"); }
   function step(){
     const r=dnext();
     if(r!==0){ rebuildDecoder(); fi=0; const r2=dnext(); if(r2!==0) throw new Error("decode loop failed"); }
     [lrPrev,lrCur]=[lrCur,lrPrev]; uploadLR();
-    const isAnchor = dNmv()===0;   // I-frames carry no MVs -> must be SR anchors; warp everything else
+    // anchor when the frame has no MVs (I-frame) OR drift cadence reached; otherwise propagate by MV-warp
+    const isAnchor = dNmv()===0 || sinceAnchor>=REANCHOR;
     const t=performance.now();
-    if(isAnchor){ srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
-    else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; }
+    if(isAnchor){ srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; sinceAnchor=0; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
+    else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; sinceAnchor++; }
     present(prevHD);
     $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?"anchor · GPU super-res":"propagated · codec MV-warp";
     $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · ${fps.toFixed(0)} fps<br>frame ${fi} · ${anchors} SR anchors (${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}%) · anchor ${srMsAvg.toFixed(0)} ms · ${f16?"fp16":"fp32"}`;
@@ -209,6 +211,12 @@ async function Player(fileBytes){
   $("#pp").onclick=()=>{playing=!playing;$("#pp").textContent=playing?"⏸ Pause":"▶ Play";$("#pp").classList.toggle("play",!playing);if(playing){lastT=0;rafid=requestAnimationFrame(loop);}};
   $("#restart").onclick=()=>{rebuildDecoder();fi=0;anchors=warps=0;};
 
+  // headless test hooks (rAF pauses in background tabs; these let us exercise the chain directly)
+  window.__stepN=(n)=>{ for(let i=0;i<n;i++) step(); return {fi,anchors,warps}; };
+  const meanTex=async(tex,W2,H2)=>{ const bpr=Math.ceil(W2*4/256)*256; const rb=dev.createBuffer({size:bpr*H2,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    const e=dev.createCommandEncoder(); e.copyTextureToBuffer({texture:tex},{buffer:rb,bytesPerRow:bpr,rowsPerImage:H2},[W2,H2]); dev.queue.submit([e.finish()]); await dev.queue.onSubmittedWorkDone();
+    await rb.mapAsync(GPUMapMode.READ); const g=new Uint8Array(rb.getMappedRange()); let s=0,c=0; for(let y=0;y<H2;y+=8)for(let x=0;x<W2;x+=8){const o=y*bpr+x*4;s+=g[o]+g[o+1]+g[o+2];c+=3;} const m=s/c; rb.unmap(); return +m.toFixed(1); };
+  window.__diag=async()=>({ frame:fi, playhdMean:await meanTex(prevHD,WD,HD), sourceMean:await meanTex(lrCur,w,h), anchors, warps, sinceAnchor });
   status(`decoded header: ${w}×${h} @ ${fps.toFixed(0)} fps · upscaling 4× to ${WD}×${HD} · drag the divider to compare`);
   return { start(){ playing=true; lastT=0; rafid=requestAnimationFrame(loop); }, stop(){ playing=false; cancelAnimationFrame(rafid); try{dclose();}catch{} } };
 }
