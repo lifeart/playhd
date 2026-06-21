@@ -46,6 +46,9 @@
     <div class="bar">
       <button class="play" id="pp">⏸ Pause</button>
       <button id="restart">⟲ Restart</button>
+      <label style="display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px;white-space:nowrap">SR every
+        <input id="cad" type="range" min="1" max="16" value="1" style="width:120px;accent-color:var(--acc)">
+        <span id="cadv" style="font:600 12px/1 ui-monospace,monospace;color:var(--fg);min-width:96px">frame · pure SR</span></label>
       <span id="ftag" class="tag a">anchor</span>
       <div class="meta" id="meta"></div>
     </div>
@@ -89,7 +92,8 @@ async function Player(fileBytes){
   const dRgb=Dec.cwrap("mvdec_rgb","number",[]), dNmv=Dec.cwrap("mvdec_nmv","number",[]), dMvs=Dec.cwrap("mvdec_mvs","number",[]);
   const dclose=Dec.cwrap("mvdec_close",null,[]);
   if(dopen("/in.mp4")!==0) throw new Error("could not decode this file (need H.264).");
-  const w=dW(), h=dH(), fps=dFps()||25, scale=4, WD=w*scale, HD=h*scale, plane=w*h, FC=64;
+  const MS=4;                              // the compact SR model is a fixed 4× net
+  const w=dW(), h=dH(), fps=dFps()||25, scale=2, WD=w*scale, HD=h*scale, plane=w*h, FC=64;  // output 2× (SR 4× -> downscale)
   if(!w||!h) throw new Error("no video stream.");
 
   // GPU
@@ -119,7 +123,13 @@ async function Player(fileBytes){
     @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
       var rgb=vec3f(0.0);for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(f32(feat[ch*pl+u32(y)*u.W+u32(x)])+f32(lr[u32(c)*pl+u32(y)*u.W+u32(x)]),0.0,1.0);}return vec4f(rgb,1.0);}`});
   const pshp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
-  const pshU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(pshU,0,new Uint32Array([h,w,scale,0]));
+  const pshU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(pshU,0,new Uint32Array([h,w,MS,0]));   // pixelshuffle is the model's 4×
+  // SR temp (model 4×) + a downscale-blit to the 2× output (linear = antialiased 2:1 box-ish)
+  const srTmp=dev.createTexture({size:[w*MS,h*MS],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING});
+  const dsmod=dev.createShaderModule({code:`@group(0)@binding(0) var t:texture_2d<f32>;@group(0)@binding(1) var s:sampler;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{return textureSampleLevel(t,s,pos.xy/vec2f(${WD}.0,${HD}.0),0.0);}`});
+  const dspipe=dev.createRenderPipeline({layout:"auto",vertex:{module:dsmod,entryPoint:"vs"},fragment:{module:dsmod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
 
   // HD textures (ping-pong) + LR textures (cur/prev) + flow
   const hdTex=()=>dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_SRC});
@@ -168,7 +178,9 @@ async function Player(fileBytes){
     const e=dev.createCommandEncoder();
     for(const b of convBg){const cp=e.beginComputePass();cp.setPipeline(cpipe);cp.setBindGroup(0,b.bg);cp.dispatchWorkgroups(Math.ceil(w/TILE),Math.ceil(h/TILE),b.gz);cp.end();}
     const fbg=dev.createBindGroup({layout:pshp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:featLast}},{binding:1,resource:{buffer:LRb}},{binding:2,resource:{buffer:pshU}}]});
-    const rp=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(pshp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();
+    const rp=e.beginRenderPass({colorAttachments:[{view:srTmp.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(pshp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();   // SR 4× -> srTmp
+    const dbg=dev.createBindGroup({layout:dspipe.getBindGroupLayout(0),entries:[{binding:0,resource:srTmp.createView()},{binding:1,resource:samp}]});
+    const rp2=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp2.setPipeline(dspipe);rp2.setBindGroup(0,dbg);rp2.draw(3);rp2.end();   // downscale -> 2× output
     dev.queue.submit([e.finish()]);
   }
   function warp(prev,dst){ const n=dNmv(); const mp=dMvs()>>2; const mvs=Dec.HEAP32.subarray(mp,mp+n*10);
@@ -185,17 +197,17 @@ async function Player(fileBytes){
 
   // --- playback state ---
   let prevHD=hdA, freeHD=hdB, fi=0, anchors=0, warps=0, playing=true, rafid=0, lastT=0, divider=0.5, srMsAvg=0;
-  const REANCHOR=12; let sinceAnchor=1e9;   // re-SR at least every REANCHOR frames to bound warp drift (NEMO cadence)
+  let REANCHOR=1;   // SR every Nth frame; 1 = pure per-frame SR (no propagation), higher = more MV-warp propagation (faster, but drifts on real motion)
   function rebuildDecoder(){ dclose(); dopen("/in.mp4"); }
   function step(){
     const r=dnext();
     if(r!==0){ rebuildDecoder(); fi=0; const r2=dnext(); if(r2!==0) throw new Error("decode loop failed"); }
     [lrPrev,lrCur]=[lrCur,lrPrev]; uploadLR();
-    // anchor when the frame has no MVs (I-frame) OR drift cadence reached; otherwise propagate by MV-warp
-    const isAnchor = dNmv()===0 || sinceAnchor>=REANCHOR;
+    // anchor (GPU super-res) on I-frames (no MVs) and every REANCHOR-th frame; propagate the rest by MV-warp
+    const isAnchor = dNmv()===0 || (fi % REANCHOR === 0);
     const t=performance.now();
-    if(isAnchor){ srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; sinceAnchor=0; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
-    else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; sinceAnchor++; }
+    if(isAnchor){ srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
+    else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; }
     present(prevHD);
     $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?"anchor · GPU super-res":"propagated · codec MV-warp";
     $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · ${fps.toFixed(0)} fps<br>frame ${fi} · ${anchors} SR anchors (${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}%) · anchor ${srMsAvg.toFixed(0)} ms · ${f16?"fp16":"fp32"}`;
@@ -210,14 +222,16 @@ async function Player(fileBytes){
   // controls
   $("#pp").onclick=()=>{playing=!playing;$("#pp").textContent=playing?"⏸ Pause":"▶ Play";$("#pp").classList.toggle("play",!playing);if(playing){lastT=0;rafid=requestAnimationFrame(loop);}};
   $("#restart").onclick=()=>{rebuildDecoder();fi=0;anchors=warps=0;};
+  const cadLabel=()=>$("#cadv").textContent = REANCHOR===1 ? "frame · pure SR" : REANCHOR+" frames";
+  $("#cad").oninput=e=>{REANCHOR=+e.target.value;cadLabel();}; cadLabel();
 
   // headless test hooks (rAF pauses in background tabs; these let us exercise the chain directly)
   window.__stepN=(n)=>{ for(let i=0;i<n;i++) step(); return {fi,anchors,warps}; };
   const meanTex=async(tex,W2,H2)=>{ const bpr=Math.ceil(W2*4/256)*256; const rb=dev.createBuffer({size:bpr*H2,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
     const e=dev.createCommandEncoder(); e.copyTextureToBuffer({texture:tex},{buffer:rb,bytesPerRow:bpr,rowsPerImage:H2},[W2,H2]); dev.queue.submit([e.finish()]); await dev.queue.onSubmittedWorkDone();
     await rb.mapAsync(GPUMapMode.READ); const g=new Uint8Array(rb.getMappedRange()); let s=0,c=0; for(let y=0;y<H2;y+=8)for(let x=0;x<W2;x+=8){const o=y*bpr+x*4;s+=g[o]+g[o+1]+g[o+2];c+=3;} const m=s/c; rb.unmap(); return +m.toFixed(1); };
-  window.__diag=async()=>({ frame:fi, playhdMean:await meanTex(prevHD,WD,HD), sourceMean:await meanTex(lrCur,w,h), anchors, warps, sinceAnchor });
-  status(`decoded header: ${w}×${h} @ ${fps.toFixed(0)} fps · upscaling 4× to ${WD}×${HD} · drag the divider to compare`);
+  window.__diag=async()=>({ frame:fi, playhdMean:await meanTex(prevHD,WD,HD), sourceMean:await meanTex(lrCur,w,h), anchors, warps, reanchor:REANCHOR });
+  status(`decoded ${w}×${h} @ ${fps.toFixed(0)} fps · upscaling ${scale}× → ${WD}×${HD} · “SR every 1 frame” = pure super-res; raise it to trade quality for speed (MV-propagation) · drag the divider to compare`);
   return { start(){ playing=true; lastT=0; rafid=requestAnimationFrame(loop); }, stop(){ playing=false; cancelAnimationFrame(rafid); try{dclose();}catch{} } };
 }
 </script>
