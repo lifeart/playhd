@@ -93,7 +93,11 @@ async function Player(fileBytes){
   const dclose=Dec.cwrap("mvdec_close",null,[]);
   if(dopen("/in.mp4")!==0) throw new Error("could not decode this file (need H.264).");
   const MS=4;                              // the compact SR model is a fixed 4× net
-  const w=dW(), h=dH(), fps=dFps()||25, scale=2, WD=w*scale, HD=h*scale, plane=w*h, FC=64;  // output 2× (SR 4× -> downscale)
+  const w=dW(), h=dH(), fps=dFps()||25, scale=2;
+  // SR INPUT resolution = output/MS. For 2× output that's source/2 -> the conv runs on 1/4 the pixels
+  // (4× faster) instead of the wasteful "SR full 4× then downscale". srW*MS == the 2× output, exactly.
+  const srW=Math.max(8,Math.round(w*scale/MS)), srH=Math.max(8,Math.round(h*scale/MS));
+  const WD=srW*MS, HD=srH*MS, plane=w*h, plane_sr=srW*srH, FC=64;
   if(!w||!h) throw new Error("no video stream.");
 
   // GPU
@@ -108,11 +112,11 @@ async function Player(fileBytes){
   const convCode=await (await fetch(`../webgpu_warp/${f16?"combo":"wtile"}.wgsl`)).text();
   const OCB=f16?64:32, TILE=16;
   const cpipe=dev.createComputePipeline({layout:"auto",compute:{module:dev.createShaderModule({code:convCode}),entryPoint:"main"}});
-  const A=dev.createBuffer({size:FC*plane*EB,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
-  const B=dev.createBuffer({size:FC*plane*EB,usage:GPUBufferUsage.STORAGE});
-  const LRb=dev.createBuffer({size:3*plane*EB,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const A=dev.createBuffer({size:FC*plane_sr*EB,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const B=dev.createBuffer({size:FC*plane_sr*EB,usage:GPUBufferUsage.STORAGE});
+  const LRb=dev.createBuffer({size:3*plane_sr*EB,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
   let inb=A,outb=B; const convBg=[];
-  for(const ly of layers){const u=new Uint32Array([h,w,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+  for(const ly of layers){const u=new Uint32Array([srH,srW,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
     const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
     convBg.push({bg:dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:Wg}},{binding:3,resource:{buffer:ub}}]}),gz:Math.ceil(ly.out_c/OCB)});[inb,outb]=[outb,inb];}
   const featLast=inb;
@@ -123,13 +127,7 @@ async function Player(fileBytes){
     @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
       var rgb=vec3f(0.0);for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(f32(feat[ch*pl+u32(y)*u.W+u32(x)])+f32(lr[u32(c)*pl+u32(y)*u.W+u32(x)]),0.0,1.0);}return vec4f(rgb,1.0);}`});
   const pshp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
-  const pshU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(pshU,0,new Uint32Array([h,w,MS,0]));   // pixelshuffle is the model's 4×
-  // SR temp (model 4×) + a downscale-blit to the 2× output (linear = antialiased 2:1 box-ish)
-  const srTmp=dev.createTexture({size:[w*MS,h*MS],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING});
-  const dsmod=dev.createShaderModule({code:`@group(0)@binding(0) var t:texture_2d<f32>;@group(0)@binding(1) var s:sampler;
-    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
-    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{return textureSampleLevel(t,s,pos.xy/vec2f(${WD}.0,${HD}.0),0.0);}`});
-  const dspipe=dev.createRenderPipeline({layout:"auto",vertex:{module:dsmod,entryPoint:"vs"},fragment:{module:dsmod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const pshU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(pshU,0,new Uint32Array([srH,srW,MS,0]));   // pixelshuffle: srIn × 4 = the 2× output, directly
 
   // HD textures (ping-pong) + LR textures (cur/prev) + flow
   const hdTex=()=>dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_SRC});
@@ -171,16 +169,17 @@ async function Player(fileBytes){
   // --- per-frame ops ---
   function uploadLR(){ const n=w*h; const rgba=new Uint8Array(n*4); const src=Dec.HEAPU8; const p=dRgb(); for(let i=0,j=0,k=p;i<n;i++){rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=255;}
     dev.queue.writeTexture({texture:lrCur},rgba,{bytesPerRow:w*4,rowsPerImage:h},[w,h]); return rgba; }
-  function srAnchor(dst){ // SR the current LR (in lrCur's source rgb) -> dst HD
-    const n=w*h; const lp=new Float32Array(3*n); const src=Dec.HEAPU8; const p=dRgb();
-    for(let y=0;y<h;y++)for(let x=0;x<w;x++){const o=p+(y*w+x)*3,b=y*w+x;lp[b]=src[o]/255;lp[n+b]=src[o+1]/255;lp[2*n+b]=src[o+2]/255;}
+  const FAC=Math.max(1,Math.round(w/srW));   // source -> SR-input box-downscale factor (2 for 2× output, 1 for 4×)
+  function srAnchor(dst){ // box-downscale source -> srIn, conv at srIn, pixelshuffle 4× straight to the output
+    const lp=new Float32Array(3*plane_sr); const src=Dec.HEAPU8; const p=dRgb(); const inv=1/(FAC*FAC*255);
+    for(let sy=0;sy<srH;sy++)for(let sx=0;sx<srW;sx++){ let r=0,g=0,b=0;
+      for(let dy=0;dy<FAC;dy++){const yy=Math.min(sy*FAC+dy,h-1);for(let dx=0;dx<FAC;dx++){const xx=Math.min(sx*FAC+dx,w-1);const o=p+(yy*w+xx)*3;r+=src[o];g+=src[o+1];b+=src[o+2];}}
+      const bi=sy*srW+sx; lp[bi]=r*inv; lp[plane_sr+bi]=g*inv; lp[2*plane_sr+bi]=b*inv; }
     const lpb=packW(lp); dev.queue.writeBuffer(A,0,lpb); dev.queue.writeBuffer(LRb,0,lpb);
     const e=dev.createCommandEncoder();
-    for(const b of convBg){const cp=e.beginComputePass();cp.setPipeline(cpipe);cp.setBindGroup(0,b.bg);cp.dispatchWorkgroups(Math.ceil(w/TILE),Math.ceil(h/TILE),b.gz);cp.end();}
+    for(const b of convBg){const cp=e.beginComputePass();cp.setPipeline(cpipe);cp.setBindGroup(0,b.bg);cp.dispatchWorkgroups(Math.ceil(srW/TILE),Math.ceil(srH/TILE),b.gz);cp.end();}
     const fbg=dev.createBindGroup({layout:pshp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:featLast}},{binding:1,resource:{buffer:LRb}},{binding:2,resource:{buffer:pshU}}]});
-    const rp=e.beginRenderPass({colorAttachments:[{view:srTmp.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(pshp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();   // SR 4× -> srTmp
-    const dbg=dev.createBindGroup({layout:dspipe.getBindGroupLayout(0),entries:[{binding:0,resource:srTmp.createView()},{binding:1,resource:samp}]});
-    const rp2=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp2.setPipeline(dspipe);rp2.setBindGroup(0,dbg);rp2.draw(3);rp2.end();   // downscale -> 2× output
+    const rp=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(pshp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();
     dev.queue.submit([e.finish()]);
   }
   function warp(prev,dst){ const n=dNmv(); const mp=dMvs()>>2; const mvs=Dec.HEAP32.subarray(mp,mp+n*10);
@@ -196,7 +195,7 @@ async function Player(fileBytes){
   }
 
   // --- playback state ---
-  let prevHD=hdA, freeHD=hdB, fi=0, anchors=0, warps=0, playing=true, rafid=0, lastT=0, divider=0.5, srMsAvg=0;
+  let prevHD=hdA, freeHD=hdB, fi=0, anchors=0, warps=0, playing=true, rafid=0, lastT=0, divider=0.5, srMsAvg=0, realFps=0, lastDrawn=0;
   let REANCHOR=1;   // SR every Nth frame; 1 = pure per-frame SR (no propagation), higher = more MV-warp propagation (faster, but drifts on real motion)
   function rebuildDecoder(){ dclose(); dopen("/in.mp4"); }
   function step(){
@@ -210,10 +209,10 @@ async function Player(fileBytes){
     else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; }
     present(prevHD);
     $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?"anchor · GPU super-res":"propagated · codec MV-warp";
-    $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · ${fps.toFixed(0)} fps<br>frame ${fi} · ${anchors} SR anchors (${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}%) · anchor ${srMsAvg.toFixed(0)} ms · ${f16?"fp16":"fp32"}`;
+    $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · source ${fps.toFixed(0)} fps<br>frame ${fi} · ${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}% SR anchors · playing ~${realFps.toFixed(0)} fps · ${f16?"fp16":"fp32"}`;
     fi++;
   }
-  function loop(now){ if(!playing) return; if(now-lastT >= 1000/fps){ lastT=now; try{step();}catch(e){status("⚠ "+e.message);playing=false;return;} } rafid=requestAnimationFrame(loop); }
+  function loop(now){ if(!playing) return; if(now-lastT >= 1000/fps){ if(lastDrawn){const dt=now-lastDrawn; if(dt>0&&dt<2000) realFps=realFps?realFps*0.8+(1000/dt)*0.2:1000/dt;} lastDrawn=now; lastT=now; try{step();}catch(e){status("⚠ "+e.message);playing=false;return;} } rafid=requestAnimationFrame(loop); }
 
   // slider drag
   const sl=$("#slider"); const setDiv=(clientX)=>{const r=cv.getBoundingClientRect();divider=Math.max(0,Math.min(1,(clientX-r.left)/r.width));sl.style.left=(divider*100)+"%";if(!playing)present(prevHD);};
