@@ -1,0 +1,216 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>playhd — in-browser SD→HD upscaler (codec-MV propagation)</title>
+<style>
+  :root{--bg:#0c0e12;--fg:#e6e8ec;--mut:#8a93a0;--acc:#5bd6a0;--acc2:#5b9cd6;--card:#151922;--line:#262c38}
+  *{box-sizing:border-box}body{font:14px/1.5 -apple-system,system-ui,Segoe UI,sans-serif;background:var(--bg);color:var(--fg);margin:0;padding:24px;display:flex;flex-direction:column;align-items:center}
+  h1{font-size:18px;font-weight:650;margin:0 0 2px}.sub{color:var(--mut);font-size:13px;margin-bottom:18px}
+  .wrap{width:100%;max-width:980px}
+  #drop{border:2px dashed var(--line);border-radius:14px;padding:54px 24px;text-align:center;cursor:pointer;background:var(--card);transition:.15s}
+  #drop.hot{border-color:var(--acc);background:#16201b}#drop b{color:var(--acc)}#drop .hint{color:var(--mut);font-size:12.5px;margin-top:8px}
+  #stage{display:none}
+  .frame{position:relative;border-radius:12px;overflow:hidden;background:#000;border:1px solid var(--line);line-height:0}
+  canvas{width:100%;display:block;image-rendering:auto}
+  .divlabel{position:absolute;top:10px;font:600 11px/1 ui-monospace,monospace;color:#fff;background:#0008;padding:5px 8px;border-radius:6px;backdrop-filter:blur(3px);pointer-events:none}
+  #lblL{left:10px}#lblR{right:10px;color:#cfe}
+  #slider{position:absolute;top:0;bottom:0;width:2px;background:#fff8;cursor:ew-resize;transform:translateX(-1px)}
+  #slider::after{content:"";position:absolute;top:50%;left:50%;width:34px;height:34px;transform:translate(-50%,-50%);border-radius:50%;background:#fff;box-shadow:0 1px 6px #0007}
+  #slider::before{content:"⇄";position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);z-index:1;color:#222;font:700 14px/1 monospace}
+  .bar{display:flex;align-items:center;gap:14px;margin-top:14px;flex-wrap:wrap}
+  button{font:600 13px/1 inherit;color:var(--fg);background:#1d2531;border:1px solid var(--line);border-radius:9px;padding:9px 16px;cursor:pointer}
+  button:hover{border-color:var(--acc2)}button.play{background:var(--acc);color:#06210f;border-color:var(--acc)}
+  .meta{color:var(--mut);font:12px/1.4 ui-monospace,monospace;margin-left:auto;text-align:right}
+  .tag{display:inline-block;padding:2px 7px;border-radius:5px;font:600 11px/1.4 ui-monospace,monospace}
+  .tag.a{background:#16322a;color:var(--acc)}.tag.w{background:#16243a;color:var(--acc2)}
+  #status{color:var(--mut);font:12px/1.4 ui-monospace,monospace;margin-top:8px;min-height:16px}
+  a{color:var(--acc2)}
+</style></head>
+<body>
+<div class="wrap">
+  <h1>playhd — in-browser SD→HD upscaler</h1>
+  <div class="sub">Software-decode the video in WASM, super-resolve only the anchor frames on the GPU, and propagate the rest with the codec's own motion vectors. Everything runs locally in your browser — nothing is uploaded.</div>
+
+  <div id="drop">
+    <div style="font-size:34px;margin-bottom:6px">⬆</div>
+    <div>Drop a video here, or <b>click to choose</b></div>
+    <div class="hint">H.264 / .mp4 — SD clips work best (it's an SD→HD upscaler). Processed on-device.</div>
+    <input id="file" type="file" accept="video/mp4,video/*,.mp4,.h264" hidden>
+  </div>
+
+  <div id="stage">
+    <div class="frame">
+      <canvas id="cv"></canvas>
+      <div class="divlabel" id="lblL">playhd ✦ SR + MV-propagation</div>
+      <div class="divlabel" id="lblR">bicubic (source)</div>
+      <div id="slider"></div>
+    </div>
+    <div class="bar">
+      <button class="play" id="pp">⏸ Pause</button>
+      <button id="restart">⟲ Restart</button>
+      <span id="ftag" class="tag a">anchor</span>
+      <div class="meta" id="meta"></div>
+    </div>
+    <div id="status"></div>
+  </div>
+</div>
+
+<script type="module">
+import createDecoder from "./mv_decode.mjs";
+import { buildLrFlow } from "./flow.js";
+const $=s=>document.querySelector(s);
+const status=(m)=>{$("#status").textContent=m;};
+
+// ---------- file pick / drag-drop ----------
+const drop=$("#drop"), file=$("#file");
+drop.onclick=()=>file.click();
+drop.ondragover=e=>{e.preventDefault();drop.classList.add("hot");};
+drop.ondragleave=()=>drop.classList.remove("hot");
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove("hot");if(e.dataTransfer.files[0])load(e.dataTransfer.files[0]);};
+file.onchange=()=>{if(file.files[0])load(file.files[0]);};
+
+let app=null;   // the running player
+// convenience: ?demo auto-loads the bundled sample clip (also lets the page be smoke-tested headless)
+if(new URLSearchParams(location.search).has("demo")){ (async()=>{ try{ status("loading sample clip…"); const b=await (await fetch("../sd600.mp4")).blob(); load(new File([b],"sd600.mp4")); }catch(e){ status("demo load failed: "+e.message); } })(); }
+async function load(f){
+  status(`reading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
+  const buf=new Uint8Array(await f.arrayBuffer());
+  if(app) app.stop();
+  try{ app=await Player(buf); $("#drop").style.display="none"; $("#stage").style.display="block"; app.start(); }
+  catch(err){ status("⚠ "+err.message); console.error(err); }
+}
+
+// ---------- the player: WASM decode -> SR anchor / MV-warp -> split display ----------
+async function Player(fileBytes){
+  if(!navigator.gpu) throw new Error("WebGPU not available in this browser.");
+  // decoder
+  const Dec=await createDecoder({printErr:()=>{}});
+  Dec.FS.writeFile("/in.mp4", fileBytes);
+  const dopen=Dec.cwrap("mvdec_open","number",["string"]), dnext=Dec.cwrap("mvdec_next","number",[]);
+  const dW=Dec.cwrap("mvdec_width","number",[]), dH=Dec.cwrap("mvdec_height","number",[]), dFps=Dec.cwrap("mvdec_fps","number",[]);
+  const dRgb=Dec.cwrap("mvdec_rgb","number",[]), dNmv=Dec.cwrap("mvdec_nmv","number",[]), dMvs=Dec.cwrap("mvdec_mvs","number",[]);
+  const dclose=Dec.cwrap("mvdec_close",null,[]);
+  if(dopen("/in.mp4")!==0) throw new Error("could not decode this file (need H.264).");
+  const w=dW(), h=dH(), fps=dFps()||25, scale=4, WD=w*scale, HD=h*scale, plane=w*h, FC=64;
+  if(!w||!h) throw new Error("no video stream.");
+
+  // GPU
+  const adapter=await navigator.gpu.requestAdapter();
+  const f16 = adapter.features.has("shader-f16");
+  const dev=await adapter.requestDevice({requiredFeatures: f16?["shader-f16"]:[]});
+  const F16=self.Float16Array; const packW=(f32)=> f16 ? new Uint16Array(new F16(f32).buffer) : f32; const EB=f16?2:4;
+  // SR weights + kernel (combo f16 / wtile f32)
+  const wf=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
+  const layers=(await (await fetch("../compact_data/layers.json")).json()).layers;
+  const Wg=dev.createBuffer({size:packW(wf).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}); dev.queue.writeBuffer(Wg,0,packW(wf));
+  const convCode=await (await fetch(`../webgpu_warp/${f16?"combo":"wtile"}.wgsl`)).text();
+  const OCB=f16?64:32, TILE=16;
+  const cpipe=dev.createComputePipeline({layout:"auto",compute:{module:dev.createShaderModule({code:convCode}),entryPoint:"main"}});
+  const A=dev.createBuffer({size:FC*plane*EB,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  const B=dev.createBuffer({size:FC*plane*EB,usage:GPUBufferUsage.STORAGE});
+  const LRb=dev.createBuffer({size:3*plane*EB,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST});
+  let inb=A,outb=B; const convBg=[];
+  for(const ly of layers){const u=new Uint32Array([h,w,ly.in_c,ly.out_c,ly.w_off,ly.b_off,ly.prelu_off<0?0:ly.prelu_off,ly.prelu_off<0?0:1]);
+    const ub=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(ub,0,u);
+    convBg.push({bg:dev.createBindGroup({layout:cpipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:inb}},{binding:1,resource:{buffer:outb}},{binding:2,resource:{buffer:Wg}},{binding:3,resource:{buffer:ub}}]}),gz:Math.ceil(ly.out_c/OCB)});[inb,outb]=[outb,inb];}
+  const featLast=inb;
+  // pixelshuffle: feat(f16/f32) + LR residual -> HD rgba8
+  const fT=f16?"f16":"f32";
+  const psh=dev.createShaderModule({code:`${f16?"enable f16;":""}struct P{H:u32,W:u32,up:u32,_p:u32};@group(0)@binding(0) var<storage,read> feat:array<${fT}>;@group(0)@binding(1) var<storage,read> lr:array<${fT}>;@group(0)@binding(2) var<uniform> u:P;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let X=i32(floor(pos.x));let Y=i32(floor(pos.y));let up=i32(u.up);let x=X/up;let y=Y/up;let i=Y%up;let j=X%up;let pl=u.H*u.W;
+      var rgb=vec3f(0.0);for(var c=0;c<3;c=c+1){let ch=u32(c*up*up+i*up+j);rgb[c]=clamp(f32(feat[ch*pl+u32(y)*u.W+u32(x)])+f32(lr[u32(c)*pl+u32(y)*u.W+u32(x)]),0.0,1.0);}return vec4f(rgb,1.0);}`});
+  const pshp=dev.createRenderPipeline({layout:"auto",vertex:{module:psh,entryPoint:"vs"},fragment:{module:psh,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const pshU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(pshU,0,new Uint32Array([h,w,scale,0]));
+
+  // HD textures (ping-pong) + LR textures (cur/prev) + flow
+  const hdTex=()=>dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_SRC});
+  let hdA=hdTex(), hdB=hdTex();
+  const lrTex=()=>dev.createTexture({size:[w,h],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+  let lrCur=lrTex(), lrPrev=lrTex();
+  const flowTex=dev.createTexture({size:[w,h],format:"rgba32float",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST});
+  const samp=dev.createSampler({magFilter:"linear",minFilter:"linear",addressModeU:"clamp-to-edge",addressModeV:"clamp-to-edge"});
+  // warp + reactive occlusion (ported from gop_live)
+  const wmod=dev.createShaderModule({code:`
+    struct U{w:u32,h:u32,scale:u32,lr_w:u32,lr_h:u32,tau:u32,_a:u32,_b:u32};
+    @group(0)@binding(0) var prevRecon:texture_2d<f32>;@group(0)@binding(1) var s:sampler;@group(0)@binding(2) var flowT:texture_2d<f32>;@group(0)@binding(3) var lrCur:texture_2d<f32>;@group(0)@binding(4) var<uniform> u:U;@group(0)@binding(5) var lrPrev:texture_2d<f32>;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{
+      let dst=vec2i(floor(pos.xy));let lr=dst/i32(u.scale);let f=textureLoad(flowT,lr,0).xy;
+      var bad = f.x < -1.0e8;
+      if(!bad){ let predUV=(vec2f(lr)+f+vec2f(0.5))/vec2f(f32(u.lr_w),f32(u.lr_h));
+        let pv=textureSampleLevel(lrPrev,s,predUV,0.0).rgb; let cv=textureLoad(lrCur,lr,0).rgb;
+        bad = (abs(cv.r-pv.r)+abs(cv.g-pv.g)+abs(cv.b-pv.b))/3.0*255.0 > f32(u.tau); }
+      if(bad){ return vec4f(textureSampleLevel(lrCur,s,pos.xy/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0); }
+      let src=vec2f(dst)+f*f32(u.scale); return vec4f(textureSampleLevel(prevRecon,s,(src+vec2f(0.5))/vec2f(f32(u.w),f32(u.h)),0.0).rgb,1.0); }`});
+  const wpipe=dev.createRenderPipeline({layout:"auto",vertex:{module:wmod,entryPoint:"vs"},fragment:{module:wmod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+  const wU=dev.createBuffer({size:32,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(wU,0,new Uint32Array([WD,HD,scale,w,h,16,0,0]));
+
+  // compose to canvas: left of divider = playhd HD, right = bicubic(lrCur)
+  const cv=$("#cv"); cv.width=WD; cv.height=HD; const ctx=cv.getContext("webgpu"); const fmt=navigator.gpu.getPreferredCanvasFormat();
+  ctx.configure({device:dev,format:fmt,alphaMode:"opaque"});
+  const cmod=dev.createShaderModule({code:`struct C{div:f32,wd:f32,_a:f32,_b:f32};
+    @group(0)@binding(0) var hd:texture_2d<f32>;@group(0)@binding(1) var lr:texture_2d<f32>;@group(0)@binding(2) var s:sampler;@group(0)@binding(3) var<uniform> c:C;
+    @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+    @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let uv=pos.xy/vec2f(c.wd, c.wd*${HD/WD});
+      let dx=pos.x - c.div*c.wd;
+      if(abs(dx)<1.5){return vec4f(1.0,1.0,1.0,1.0);}
+      if(dx<0.0){return vec4f(textureSampleLevel(hd,s,uv,0.0).rgb,1.0);}
+      return vec4f(textureSampleLevel(lr,s,uv,0.0).rgb,1.0); }`});   // lr sampled linear = bicubic-ish upscale
+  const cpipeR=dev.createRenderPipeline({layout:"auto",vertex:{module:cmod,entryPoint:"vs"},fragment:{module:cmod,entryPoint:"fs",targets:[{format:fmt}]},primitive:{topology:"triangle-list"}});
+  const cU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});
+
+  // --- per-frame ops ---
+  function uploadLR(){ const n=w*h; const rgba=new Uint8Array(n*4); const src=Dec.HEAPU8; const p=dRgb(); for(let i=0,j=0,k=p;i<n;i++){rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=255;}
+    dev.queue.writeTexture({texture:lrCur},rgba,{bytesPerRow:w*4,rowsPerImage:h},[w,h]); return rgba; }
+  function srAnchor(dst){ // SR the current LR (in lrCur's source rgb) -> dst HD
+    const n=w*h; const lp=new Float32Array(3*n); const src=Dec.HEAPU8; const p=dRgb();
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){const o=p+(y*w+x)*3,b=y*w+x;lp[b]=src[o]/255;lp[n+b]=src[o+1]/255;lp[2*n+b]=src[o+2]/255;}
+    const lpb=packW(lp); dev.queue.writeBuffer(A,0,lpb); dev.queue.writeBuffer(LRb,0,lpb);
+    const e=dev.createCommandEncoder();
+    for(const b of convBg){const cp=e.beginComputePass();cp.setPipeline(cpipe);cp.setBindGroup(0,b.bg);cp.dispatchWorkgroups(Math.ceil(w/TILE),Math.ceil(h/TILE),b.gz);cp.end();}
+    const fbg=dev.createBindGroup({layout:pshp.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:featLast}},{binding:1,resource:{buffer:LRb}},{binding:2,resource:{buffer:pshU}}]});
+    const rp=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(pshp);rp.setBindGroup(0,fbg);rp.draw(3);rp.end();
+    dev.queue.submit([e.finish()]);
+  }
+  function warp(prev,dst){ const n=dNmv(); const mp=dMvs()>>2; const mvs=Dec.HEAP32.subarray(mp,mp+n*10);
+    const {fx,fy}=buildLrFlow(mvs,h,w,"all"); const ft=new Float32Array(w*h*4);
+    for(let i=0;i<w*h;i++){const hole=Number.isNaN(fx[i]);ft[i*4]=hole?-1e9:fx[i];ft[i*4+1]=hole?0:fy[i];}
+    dev.queue.writeTexture({texture:flowTex},ft,{bytesPerRow:w*16,rowsPerImage:h},[w,h]);
+    const bg=dev.createBindGroup({layout:wpipe.getBindGroupLayout(0),entries:[{binding:0,resource:prev.createView()},{binding:1,resource:samp},{binding:2,resource:flowTex.createView()},{binding:3,resource:lrCur.createView()},{binding:4,resource:{buffer:wU}},{binding:5,resource:lrPrev.createView()}]});
+    const e=dev.createCommandEncoder();const rp=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(wpipe);rp.setBindGroup(0,bg);rp.draw(3);rp.end();dev.queue.submit([e.finish()]);
+  }
+  function present(hd){ dev.queue.writeBuffer(cU,0,new Float32Array([divider,WD,0,0]));
+    const bg=dev.createBindGroup({layout:cpipeR.getBindGroupLayout(0),entries:[{binding:0,resource:hd.createView()},{binding:1,resource:lrCur.createView()},{binding:2,resource:samp},{binding:3,resource:{buffer:cU}}]});
+    const e=dev.createCommandEncoder();const rp=e.beginRenderPass({colorAttachments:[{view:ctx.getCurrentTexture().createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(cpipeR);rp.setBindGroup(0,bg);rp.draw(3);rp.end();dev.queue.submit([e.finish()]);
+  }
+
+  // --- playback state ---
+  let prevHD=hdA, freeHD=hdB, fi=0, anchors=0, warps=0, playing=true, rafid=0, lastT=0, divider=0.5, srMsAvg=0;
+  function rebuildDecoder(){ dclose(); dopen("/in.mp4"); }
+  function step(){
+    const r=dnext();
+    if(r!==0){ rebuildDecoder(); fi=0; const r2=dnext(); if(r2!==0) throw new Error("decode loop failed"); }
+    [lrPrev,lrCur]=[lrCur,lrPrev]; uploadLR();
+    const isAnchor = dNmv()===0;   // I-frames carry no MVs -> must be SR anchors; warp everything else
+    const t=performance.now();
+    if(isAnchor){ srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
+    else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; }
+    present(prevHD);
+    $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?"anchor · GPU super-res":"propagated · codec MV-warp";
+    $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · ${fps.toFixed(0)} fps<br>frame ${fi} · ${anchors} SR anchors (${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}%) · anchor ${srMsAvg.toFixed(0)} ms · ${f16?"fp16":"fp32"}`;
+    fi++;
+  }
+  function loop(now){ if(!playing) return; if(now-lastT >= 1000/fps){ lastT=now; try{step();}catch(e){status("⚠ "+e.message);playing=false;return;} } rafid=requestAnimationFrame(loop); }
+
+  // slider drag
+  const sl=$("#slider"); const setDiv=(clientX)=>{const r=cv.getBoundingClientRect();divider=Math.max(0,Math.min(1,(clientX-r.left)/r.width));sl.style.left=(divider*100)+"%";if(!playing)present(prevHD);};
+  sl.style.left="50%"; let drag=false; sl.onpointerdown=e=>{drag=true;sl.setPointerCapture(e.pointerId);}; sl.onpointermove=e=>{if(drag)setDiv(e.clientX);}; sl.onpointerup=()=>drag=false;
+  cv.onpointerdown=e=>setDiv(e.clientX);
+  // controls
+  $("#pp").onclick=()=>{playing=!playing;$("#pp").textContent=playing?"⏸ Pause":"▶ Play";$("#pp").classList.toggle("play",!playing);if(playing){lastT=0;rafid=requestAnimationFrame(loop);}};
+  $("#restart").onclick=()=>{rebuildDecoder();fi=0;anchors=warps=0;};
+
+  status(`decoded header: ${w}×${h} @ ${fps.toFixed(0)} fps · upscaling 4× to ${WD}×${HD} · drag the divider to compare`);
+  return { start(){ playing=true; lastT=0; rafid=requestAnimationFrame(loop); }, stop(){ playing=false; cancelAnimationFrame(rafid); try{dclose();}catch{} } };
+}
+</script>
+</body></html>

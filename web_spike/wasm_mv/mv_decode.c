@@ -86,6 +86,12 @@ EMSCRIPTEN_KEEPALIVE int mvdec_next(void) {
 
 EMSCRIPTEN_KEEPALIVE int mvdec_width(void)  { return rgb_w; }
 EMSCRIPTEN_KEEPALIVE int mvdec_height(void) { return rgb_h; }
+EMSCRIPTEN_KEEPALIVE double mvdec_fps(void) {
+  if (vstream < 0) return 25.0;
+  AVRational r = fmt->streams[vstream]->avg_frame_rate;
+  if (r.num == 0 || r.den == 0) r = fmt->streams[vstream]->r_frame_rate;
+  return (r.den && r.num) ? (double)r.num / r.den : 25.0;
+}
 EMSCRIPTEN_KEEPALIVE uint8_t *mvdec_rgb(void) { return rgb; }     // rgb_w*rgb_h*3 bytes
 EMSCRIPTEN_KEEPALIVE int mvdec_nmv(void)    { return nmv; }
 EMSCRIPTEN_KEEPALIVE int *mvdec_mvs(void)   { return mvbuf; }     // nmv*10 ints
