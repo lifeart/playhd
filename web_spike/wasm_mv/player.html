@@ -247,7 +247,12 @@ async function Player(fileBytes){
     $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · source ${fps.toFixed(0)} fps<br>frame ${fi} · ${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}% SR anchors · playing ~${realFps.toFixed(0)} fps · ${f16?"fp16":"fp32"}`;
     fi++;
     // keep audio on the DISPLAYED frame (the loop runs at the upscaler's pace, not necessarily real-time)
-    const aud=$("#aud"); if(aud.src && !aud.paused && isFinite(aud.duration)){ const want=fi/fps; if(Math.abs(aud.currentTime-want)>0.25) aud.currentTime=want; }
+    // A/V sync: rate-MATCH the audio to the video's actual pace (the loop runs at the upscaler's speed, not
+    // wall-clock) so they stay aligned WITHOUT per-frame seeking — the old seek-every-frame replayed ~0.25s
+    // segments at slow SR, which sounded like an echo / double track. Hard-correct only on big drift.
+    const aud=$("#aud"); if(aud.src && !aud.paused){ const want=fi/fps;
+      const pr=Math.max(0.25,Math.min(4,(realFps||fps)/fps)); if(Math.abs(aud.playbackRate-pr)>0.04) aud.playbackRate=pr;
+      if(isFinite(aud.duration) && Math.abs(aud.currentTime-want)>1.0) aud.currentTime=want; }
   }
   async function loop(now){ if(!playing) return; if(now-lastT >= 1000/fps){ if(lastDrawn){const dt=now-lastDrawn; if(dt>0&&dt<2000) realFps=realFps?realFps*0.8+(1000/dt)*0.2:1000/dt;} lastDrawn=now; lastT=now; try{await step();}catch(e){status("⚠ "+e.message);playing=false;return;} } if(playing) rafid=requestAnimationFrame(loop); }
 
