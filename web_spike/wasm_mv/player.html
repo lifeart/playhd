@@ -83,7 +83,7 @@ let app=null;   // the running player
 { const qp=new URLSearchParams(location.search); if(qp.has("demo")||qp.has("clip")){ const nm=qp.get("clip")||"sd600.mp4"; (async()=>{ try{ status("loading "+nm+"…"); const b=await (await fetch("../"+nm)).blob(); load(new File([b],nm)); }catch(e){ status("demo load failed: "+e.message); } })(); } }
 async function load(f){
   status(`reading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
-  try{ const a=$("#aud"); a.src=URL.createObjectURL(f); a.load(); }catch{}   // audio track for playback (synced to the displayed frame)
+  try{ const a=$("#aud"); a.src=URL.createObjectURL(f); a.load(); }catch(e){ console.debug("audio track unavailable (non-fatal):", e); }   // audio playback, synced to the displayed frame
   const buf=new Uint8Array(await f.arrayBuffer());
   if(app) app.stop();
   try{ app=await Player(buf); $("#drop").style.display="none"; $("#stage").style.display="block"; app.start(); }
@@ -106,7 +106,7 @@ async function Player(fileBytes){
   // SR INPUT resolution = output/MS. For 2× output that's source/2 -> the conv runs on 1/4 the pixels
   // (4× faster) instead of the wasteful "SR full 4× then downscale". srW*MS == the 2× output, exactly.
   const srW=Math.max(8,Math.round(w*scale/MS)), srH=Math.max(8,Math.round(h*scale/MS));
-  const WD=srW*MS, HD=srH*MS, plane=w*h, plane_sr=srW*srH, FC=64;
+  const WD=srW*MS, HD=srH*MS, plane=w*h, plane_sr=srW*srH, FC=64;   // WD==2w, HD==2h (== SPAN's OW/OH) for even w/h — guaranteed by H.264 4:2:0
   if(!w||!h) throw new Error("no video stream.");
 
   // GPU
@@ -270,7 +270,7 @@ async function Player(fileBytes){
     await rb.mapAsync(GPUMapMode.READ); const g=new Uint8Array(rb.getMappedRange()); let s=0,c=0; for(let y=0;y<H2;y+=8)for(let x=0;x<W2;x+=8){const o=y*bpr+x*4;s+=g[o]+g[o+1]+g[o+2];c+=3;} const m=s/c; rb.unmap(); return +m.toFixed(1); };
   window.__diag=async()=>({ frame:fi, playhdMean:await meanTex(prevHD,WD,HD), sourceMean:await meanTex(lrCur,w,h), anchors, warps, reanchor:REANCHOR });
   status(`decoded ${w}×${h} @ ${fps.toFixed(0)} fps · upscaling ${scale}× → ${WD}×${HD} · “SR every 1 frame” = pure super-res; raise it to trade quality for speed (MV-propagation) · drag the divider to compare`);
-  return { start(){ playing=true; lastT=0; aud.currentTime=fi/fps; aud.play().catch(()=>{}); rafid=requestAnimationFrame(loop); }, stop(){ playing=false; cancelAnimationFrame(rafid); try{aud.pause();}catch{} try{dclose();}catch{} } };
+  return { start(){ playing=true; lastT=0; aud.currentTime=fi/fps; aud.play().catch(()=>{}); rafid=requestAnimationFrame(loop); }, stop(){ playing=false; cancelAnimationFrame(rafid); try{aud.pause();}catch(e){ console.debug("aud.pause:",e); } try{dclose();}catch(e){ console.debug("decoder close:",e); } } };
 }
 </script>
 </body></html>
