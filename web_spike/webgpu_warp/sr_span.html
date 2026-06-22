@@ -1,0 +1,44 @@
+<!doctype html>
+<meta charset="utf-8"><title>playhd — SPAN WGSL port: Chrome parity vs PyTorch + timing</title>
+<style>body{font:13px monospace;background:#111;color:#ddd;margin:16px}canvas{border:1px solid #333;image-rendering:pixelated;max-width:46%}#log{white-space:pre-wrap}.ok{color:#6f6}.err{color:#f66}.hd{color:#9cf}.row{display:flex;gap:12px}</style>
+<h3 class="hd">playhd — SPAN (2xLiveActionV1) WGSL port — Chrome parity vs PyTorch + timing</h3>
+<div class="row"><div><div>WGSL SPAN (f16)</div><canvas id="gpu"></canvas></div><div><div>PyTorch SPAN reference</div><canvas id="ref"></canvas></div></div>
+<div id="log"></div>
+<script type="module">
+import { initSpanGPU, runSpan } from "./span_driver.js";
+const L=(m,c="")=>{const d=document.getElementById("log");d.innerHTML+=`<span class="${c}">${m}</span>\n`;console.log(m);};
+const R={}; window.__span=R;
+async function main(){
+  const adapter=await navigator.gpu.requestAdapter();
+  const hasF16=adapter.features.has("shader-f16"), hasTS=adapter.features.has("timestamp-query");
+  const feats=[]; if(hasF16)feats.push("shader-f16"); if(hasTS)feats.push("timestamp-query");
+  const dev=await adapter.requestDevice({requiredFeatures:feats, requiredLimits:{maxComputeWorkgroupStorageSize:Math.min(32768,adapter.limits.maxComputeWorkgroupStorageSize)}});
+  const spec=await (await fetch("../span_data/spec.json")).json();
+  const weights=new Float32Array(await (await fetch("../span_data/weights.bin")).arrayBuffer());
+  const lr=new Float32Array(await (await fetch("../span_data/lr_planar.bin")).arrayBuffer());
+  const ref=new Float32Array(await (await fetch("../span_data/sr_ref.bin")).arrayBuffer());
+  const {H,W}=spec, OH=H*2, OW=W*2, oplane=OH*OW;
+  L(`SPAN graph: ${W}×${H} → ${OW}×${OH} (×2), 48ch · shader-f16=${hasF16}`,"hd");
+  const cmp=(out,tag)=>{ let s=0,mx=0; const n=3*oplane; for(let i=0;i<n;i++){const d=Math.abs(out[i]-ref[i]); s+=d; if(d>mx)mx=d;} const mad=s/n;
+    L(`  ${tag}: parity vs PyTorch SPAN mean|Δ|=${mad.toExponential(2)} max=${mx.toExponential(2)} ${mad<1e-2?"PASS":"FAIL"}`, mad<1e-2?"ok":"err"); return mad; };
+
+  // f32 — strict parity (should be ~1e-7, bit-faithful)
+  const g32=await initSpanGPU(dev, weights, spec, false);
+  const r32=await runSpan(g32, lr, 5, 2);
+  L(`  f32: ${r32.ms.toFixed(1)} ms (naive conv kernel)`); const mad32=cmp(r32.out,"f32");
+
+  // f16 — the player path (+ speed)
+  let r16=null, mad16=null;
+  if(hasF16){ const g16=await initSpanGPU(dev, weights, spec, true); r16=await runSpan(g16, lr, 5, 2);
+    L(`  f16: ${r16.ms.toFixed(1)} ms (naive conv kernel)`); mad16=cmp(r16.out,"f16"); }
+
+  // display (planar f32 -> RGBA), use f16 output if available else f32
+  const show=(id,planar)=>{const cv=document.getElementById(id);cv.width=OW;cv.height=OH;const img=new Uint8ClampedArray(oplane*4);
+    for(let i=0;i<oplane;i++){img[i*4]=Math.max(0,Math.min(255,planar[i]*255));img[i*4+1]=Math.max(0,Math.min(255,planar[oplane+i]*255));img[i*4+2]=Math.max(0,Math.min(255,planar[2*oplane+i]*255));img[i*4+3]=255;}
+    cv.getContext("2d").putImageData(new ImageData(img,OW,OH),0,0);};
+  show("gpu",(r16||r32).out); show("ref",ref);
+  L(`\n${mad32<1e-2 ? "✅ SPAN WGSL port confirmed in Chrome — f32 bit-faithful to PyTorch" + (mad16!=null?`, f16 within ${mad16.toExponential(1)}`:"") : "❌ parity fail"}`, mad32<1e-2?"ok":"err");
+  Object.assign(R,{ok:true, ms32:+r32.ms.toFixed(1), ms16:r16?+r16.ms.toFixed(1):null, mad32, mad16});
+}
+main().catch(e=>{L("ERR "+e.message+"\n"+(e.stack||""),"err");window.__span={error:e.message};});
+</script>

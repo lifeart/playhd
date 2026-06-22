@@ -1,0 +1,166 @@
+{
+ "H": 160,
+ "W": 320,
+ "scale": 2,
+ "feat": 48,
+ "n_floats": 410700,
+ "out_h": 320,
+ "out_w": 640,
+ "weights": {
+  "conv_1": {
+   "in_c": 3,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 0,
+   "b_off": 1296
+  },
+  "block_1.c1_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 1344,
+   "b_off": 22080
+  },
+  "block_1.c2_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 22128,
+   "b_off": 42864
+  },
+  "block_1.c3_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 42912,
+   "b_off": 63648
+  },
+  "block_2.c1_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 63696,
+   "b_off": 84432
+  },
+  "block_2.c2_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 84480,
+   "b_off": 105216
+  },
+  "block_2.c3_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 105264,
+   "b_off": 126000
+  },
+  "block_3.c1_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 126048,
+   "b_off": 146784
+  },
+  "block_3.c2_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 146832,
+   "b_off": 167568
+  },
+  "block_3.c3_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 167616,
+   "b_off": 188352
+  },
+  "block_4.c1_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 188400,
+   "b_off": 209136
+  },
+  "block_4.c2_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 209184,
+   "b_off": 229920
+  },
+  "block_4.c3_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 229968,
+   "b_off": 250704
+  },
+  "block_5.c1_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 250752,
+   "b_off": 271488
+  },
+  "block_5.c2_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 271536,
+   "b_off": 292272
+  },
+  "block_5.c3_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 292320,
+   "b_off": 313056
+  },
+  "block_6.c1_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 313104,
+   "b_off": 333840
+  },
+  "block_6.c2_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 333888,
+   "b_off": 354624
+  },
+  "block_6.c3_r": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 354672,
+   "b_off": 375408
+  },
+  "conv_2": {
+   "in_c": 48,
+   "out_c": 48,
+   "k": 3,
+   "w_off": 375456,
+   "b_off": 396192
+  },
+  "conv_cat": {
+   "in_c": 192,
+   "out_c": 48,
+   "k": 1,
+   "w_off": 396240,
+   "b_off": 405456
+  },
+  "upsampler": {
+   "in_c": 48,
+   "out_c": 12,
+   "k": 3,
+   "w_off": 405504,
+   "b_off": 410688
+  }
+ },
+ "graph": "conv_1->[6x SPAB]->conv_2->conv_cat(F,B6,B1,B5_2)->upsampler(conv+PS2); act1=SiLU, no_norm, has_relu=False, no LR residual"
+}
