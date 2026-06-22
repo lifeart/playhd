@@ -80,7 +80,8 @@ file.onchange=()=>{if(file.files[0])load(file.files[0]);};
 
 let app=null;   // the running player
 // convenience: ?demo auto-loads the bundled sample clip (also lets the page be smoke-tested headless)
-{ const qp=new URLSearchParams(location.search); if(qp.has("demo")||qp.has("clip")){ const nm=qp.get("clip")||"sd600.mp4"; (async()=>{ try{ status("loading "+nm+"…"); const b=await (await fetch("../"+nm)).blob(); load(new File([b],nm)); }catch(e){ status("demo load failed: "+e.message); } })(); } }
+{ const qp=new URLSearchParams(location.search); if(qp.has("demo")||qp.has("clip")){ const arg=qp.get("clip")||"sd600.mp4"; const url=/^https?:\/\//.test(arg)?arg:("../"+arg); const nm=arg.split("/").pop();   // ?clip=<name|URL> ; full URLs need CORS (e.g. an open Big Buck Bunny clip)
+  (async()=>{ try{ status("loading "+nm+"…"); const b=await (await fetch(url)).blob(); load(new File([b],nm)); }catch(e){ status("no sample clip is bundled (licensing) — drag in any H.264 SD .mp4, or use ?clip=<open-clip-URL>. See the README for openly-licensed test clips."); } })(); } }
 async function load(f){
   status(`reading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
   try{ const a=$("#aud"); a.src=URL.createObjectURL(f); a.load(); }catch(e){ console.debug("audio track unavailable (non-fatal):", e); }   // audio playback, synced to the displayed frame
