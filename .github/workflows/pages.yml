@@ -34,7 +34,7 @@ jobs:
           cp web_spike/webgpu_warp/span_driver_fast.js \
              web_spike/webgpu_warp/combo.wgsl \
              web_spike/webgpu_warp/wtile.wgsl _site/webgpu_warp/
-          printf '%s' '<!doctype html><meta charset="utf-8"><title>playhd — in-browser SD→HD upscaler</title><meta http-equiv="refresh" content="0; url=wasm_mv/player.html?demo"><body style="font:14px system-ui;background:#0c0c0c;color:#ddd;padding:24px">Loading the <a href="wasm_mv/player.html?demo" style="color:#7ce0b0">playhd demo</a>… (needs a WebGPU browser)</body>' > _site/index.html
+          printf '%s' '<!doctype html><meta charset="utf-8"><title>playhd — in-browser SD→HD upscaler</title><link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg%20xmlns=%27http://www.w3.org/2000/svg%27%20viewBox=%270%200%2032%2032%27%3E%3Crect%20width=%2732%27%20height=%2732%27%20rx=%277%27%20fill=%27%230c0e12%27/%3E%3Cpath%20d=%27M12%209l11%207-11%207z%27%20fill=%27%235bd6a0%27/%3E%3C/svg%3E"><meta http-equiv="refresh" content="0; url=wasm_mv/player.html?demo"><body style="font:14px system-ui;background:#0c0c0c;color:#ddd;padding:24px">Loading the <a href="wasm_mv/player.html?demo" style="color:#7ce0b0">playhd demo</a>… (needs a WebGPU browser)</body>' > _site/index.html
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
