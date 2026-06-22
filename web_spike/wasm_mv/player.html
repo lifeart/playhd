@@ -188,17 +188,15 @@ async function Player(fileBytes){
     dev.queue.writeTexture({texture:lrCur},rgba,{bytesPerRow:w*4,rowsPerImage:h},[w,h]); return rgba; }
   const FAC=Math.max(1,Math.round(w/srW));   // source -> SR-input box-downscale factor (2 for 2× output, 1 for 4×)
   // SPAN anchor: run the SPAN graph on the FULL source -> 2× RGB -> write into the HD texture (dims match).
-  const spanLP=new Float32Array(3*plane), spanOpx=WD*HD, spanRGBA=new Uint8Array(spanOpx*4); let spanRB=null;
-  async function srAnchorSpan(dst){   // SPAN on the full source -> OUT(planar) -> readback -> dst HD texture (persistent buffers, no leak)
+  const spanLP=new Float32Array(3*plane);
+  function srAnchorSpan(dst){   // SPAN on the full source -> OUT(planar) -> dst HD texture, ALL GPU (no readback/sync/CPU-convert)
     const src=Dec.HEAPU8, p=dRgb();
     for(let y=0;y<h;y++)for(let x=0;x<w;x++){const o=p+(y*w+x)*3,b=y*w+x;spanLP[b]=src[o]/255;spanLP[plane+b]=src[o+1]/255;spanLP[2*plane+b]=src[o+2]/255;}
     dev.queue.writeBuffer(spanRun.IN,0,packW(spanLP));
-    if(!spanRB) spanRB=dev.createBuffer({size:3*spanOpx*EB,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
-    const e=dev.createCommandEncoder(); spanRun.recordInto(e); e.copyBufferToBuffer(spanRun.OUT,0,spanRB,0,3*spanOpx*EB); dev.queue.submit([e.finish()]);
-    await spanRB.mapAsync(GPUMapMode.READ);
-    const out=f16?new Float32Array(new F16(spanRB.getMappedRange().slice(0))):new Float32Array(spanRB.getMappedRange().slice(0)); spanRB.unmap();
-    for(let i=0;i<spanOpx;i++){spanRGBA[i*4]=Math.max(0,Math.min(255,out[i]*255+0.5));spanRGBA[i*4+1]=Math.max(0,Math.min(255,out[spanOpx+i]*255+0.5));spanRGBA[i*4+2]=Math.max(0,Math.min(255,out[2*spanOpx+i]*255+0.5));spanRGBA[i*4+3]=255;}
-    dev.queue.writeTexture({texture:dst},spanRGBA,{bytesPerRow:WD*4,rowsPerImage:HD},[WD,HD]);
+    const e=dev.createCommandEncoder();
+    spanRun.recordInto(e);   // SPAN graph -> spanRun.OUT (planar)
+    const rp=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(p2tPipe);rp.setBindGroup(0,p2tBg);rp.draw(3);rp.end();
+    dev.queue.submit([e.finish()]);
   }
   function srAnchor(dst){ // box-downscale source -> srIn, conv at srIn, pixelshuffle 4× straight to the output
     const lp=new Float32Array(3*plane_sr); const src=Dec.HEAPU8; const p=dRgb(); const inv=1/(FAC*FAC*255);
