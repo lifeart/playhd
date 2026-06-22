@@ -46,6 +46,7 @@
     <div class="bar">
       <button class="play" id="pp">⏸ Pause</button>
       <button id="restart">⟲ Restart</button>
+      <button id="open">📁 Open clip…</button>
       <label style="display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px;white-space:nowrap">SR every
         <input id="cad" type="range" min="1" max="16" value="1" style="width:120px;accent-color:var(--acc)">
         <span id="cadv" style="font:600 12px/1 ui-monospace,monospace;color:var(--fg);min-width:96px">frame · pure SR</span></label>
@@ -90,8 +91,12 @@ const drop=$("#drop"), file=$("#file");
 drop.onclick=()=>file.click();
 drop.ondragover=e=>{e.preventDefault();drop.classList.add("hot");};
 drop.ondragleave=()=>drop.classList.remove("hot");
-drop.ondrop=e=>{e.preventDefault();drop.classList.remove("hot");if(e.dataTransfer.files[0])load(e.dataTransfer.files[0]);};
+// drag a clip ANYWHERE — including over the playing demo (the drop zone hides once a clip loads)
+window.addEventListener("dragover",e=>e.preventDefault());
+window.addEventListener("drop",e=>{e.preventDefault();drop.classList.remove("hot");if(e.dataTransfer.files[0])load(e.dataTransfer.files[0]);});
 file.onchange=()=>{if(file.files[0])load(file.files[0]);};
+// "Open clip…" button stays visible in the controls so you can swap in your own clip mid-demo
+$("#open").onclick=()=>file.click();
 
 let app=null;   // the running player
 // convenience: ?demo auto-loads the bundled sample clip (also lets the page be smoke-tested headless)
