@@ -49,10 +49,16 @@
       <label style="display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px;white-space:nowrap">SR every
         <input id="cad" type="range" min="1" max="16" value="1" style="width:120px;accent-color:var(--acc)">
         <span id="cadv" style="font:600 12px/1 ui-monospace,monospace;color:var(--fg);min-width:96px">frame · pure SR</span></label>
+      <label style="display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12px;white-space:nowrap">model
+        <select id="model" style="background:#1a1a1a;color:var(--fg);border:1px solid #333;border-radius:6px;padding:3px 6px;font:12px ui-monospace,monospace">
+          <option value="span">SPAN · live-action / faces</option>
+          <option value="compact">compact · general / texture</option>
+        </select></label>
       <span id="ftag" class="tag a">anchor</span>
       <div class="meta" id="meta"></div>
     </div>
     <div id="status"></div>
+    <audio id="aud" hidden></audio>
   </div>
 </div>
 
@@ -60,7 +66,7 @@
 import createDecoder from "./mv_decode.mjs";
 import { buildLrFlow } from "./flow.js";
 import { initSpanGPUFast, makeSpanRunner } from "../webgpu_warp/span_driver_fast.js";   // SPAN anchor SR (codec-trained, beats compact on LPIPS+DISTS)
-const USE_SPAN = true;   // SPAN model for the anchor (native 2×); false = compact realesr-general
+let curModel = "span";   // anchor model: "span" (native 2×, live-action) | "compact" (realesr-general 4×). Runtime selector.
 const $=s=>document.querySelector(s);
 const status=(m)=>{$("#status").textContent=m;};
 
@@ -74,9 +80,10 @@ file.onchange=()=>{if(file.files[0])load(file.files[0]);};
 
 let app=null;   // the running player
 // convenience: ?demo auto-loads the bundled sample clip (also lets the page be smoke-tested headless)
-if(new URLSearchParams(location.search).has("demo")){ (async()=>{ try{ status("loading sample clip…"); const b=await (await fetch("../sd600.mp4")).blob(); load(new File([b],"sd600.mp4")); }catch(e){ status("demo load failed: "+e.message); } })(); }
+{ const qp=new URLSearchParams(location.search); if(qp.has("demo")||qp.has("clip")){ const nm=qp.get("clip")||"sd600.mp4"; (async()=>{ try{ status("loading "+nm+"…"); const b=await (await fetch("../"+nm)).blob(); load(new File([b],nm)); }catch(e){ status("demo load failed: "+e.message); } })(); } }
 async function load(f){
   status(`reading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
+  try{ const a=$("#aud"); a.src=URL.createObjectURL(f); a.load(); }catch{}   // audio track for playback (synced to the displayed frame)
   const buf=new Uint8Array(await f.arrayBuffer());
   if(app) app.stop();
   try{ app=await Player(buf); $("#drop").style.display="none"; $("#stage").style.display="block"; app.start(); }
@@ -109,7 +116,7 @@ async function Player(fileBytes){
   const F16=self.Float16Array; const packW=(f32)=> f16 ? new Uint16Array(new F16(f32).buffer) : f32; const EB=f16?2:4;
   // SPAN anchor (native 2× -> runs on the FULL source; output (2w×2h) == the player's HD texture)
   let spanRun=null, p2tPipe=null, p2tBg=null;
-  if(USE_SPAN){ const spanSpec=await (await fetch("../span_data/spec.json")).json();
+  { const spanSpec=await (await fetch("../span_data/spec.json")).json();   // always init SPAN + compact; selector picks at runtime
     const spanW=new Float32Array(await (await fetch("../span_data/weights.bin")).arrayBuffer());
     const spanG=await initSpanGPUFast(dev, spanW, {...spanSpec, H:h, W:w}, f16, {OCB:48});
     spanRun=makeSpanRunner(spanG);   // PERSISTENT (buffers+ops once) — no per-frame alloc/leak
@@ -233,12 +240,14 @@ async function Player(fileBytes){
     // anchor (GPU super-res) on I-frames (no MVs) and every REANCHOR-th frame; propagate the rest by MV-warp
     const isAnchor = dNmv()===0 || (fi % REANCHOR === 0);
     const t=performance.now();
-    if(isAnchor){ if(USE_SPAN) await srAnchorSpan(freeHD); else srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
+    if(isAnchor){ if(curModel==="span") await srAnchorSpan(freeHD); else srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
     else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; }
     present(prevHD);
-    $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?"anchor · GPU super-res":"propagated · codec MV-warp";
+    $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?("anchor · "+(curModel==="span"?"SPAN":"compact")+" SR"):"propagated · codec MV-warp";
     $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · source ${fps.toFixed(0)} fps<br>frame ${fi} · ${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}% SR anchors · playing ~${realFps.toFixed(0)} fps · ${f16?"fp16":"fp32"}`;
     fi++;
+    // keep audio on the DISPLAYED frame (the loop runs at the upscaler's pace, not necessarily real-time)
+    const aud=$("#aud"); if(aud.src && !aud.paused && isFinite(aud.duration)){ const want=fi/fps; if(Math.abs(aud.currentTime-want)>0.25) aud.currentTime=want; }
   }
   async function loop(now){ if(!playing) return; if(now-lastT >= 1000/fps){ if(lastDrawn){const dt=now-lastDrawn; if(dt>0&&dt<2000) realFps=realFps?realFps*0.8+(1000/dt)*0.2:1000/dt;} lastDrawn=now; lastT=now; try{await step();}catch(e){status("⚠ "+e.message);playing=false;return;} } if(playing) rafid=requestAnimationFrame(loop); }
 
@@ -247,10 +256,12 @@ async function Player(fileBytes){
   sl.style.left="50%"; let drag=false; sl.onpointerdown=e=>{drag=true;sl.setPointerCapture(e.pointerId);}; sl.onpointermove=e=>{if(drag)setDiv(e.clientX);}; sl.onpointerup=()=>drag=false;
   cv.onpointerdown=e=>setDiv(e.clientX);
   // controls
-  $("#pp").onclick=()=>{playing=!playing;$("#pp").textContent=playing?"⏸ Pause":"▶ Play";$("#pp").classList.toggle("play",!playing);if(playing){lastT=0;rafid=requestAnimationFrame(loop);}};
-  $("#restart").onclick=()=>{rebuildDecoder();fi=0;anchors=warps=0;};
+  const aud=$("#aud");
+  $("#pp").onclick=()=>{playing=!playing;$("#pp").textContent=playing?"⏸ Pause":"▶ Play";$("#pp").classList.toggle("play",!playing);if(playing){aud.currentTime=fi/fps;aud.play().catch(()=>{});lastT=0;rafid=requestAnimationFrame(loop);}else aud.pause();};
+  $("#restart").onclick=()=>{rebuildDecoder();fi=0;anchors=warps=0;aud.currentTime=0;};
   const cadLabel=()=>$("#cadv").textContent = REANCHOR===1 ? "frame · pure SR" : REANCHOR+" frames";
   $("#cad").oninput=e=>{REANCHOR=+e.target.value;cadLabel();}; cadLabel();
+  $("#model").value=curModel; $("#model").onchange=e=>{curModel=e.target.value;};   // SPAN ↔ compact at runtime (R11: SPAN wins faces, compact wins texture)
 
   // headless test hooks (rAF pauses in background tabs; these let us exercise the chain directly)
   window.__stepN=async(n)=>{ for(let i=0;i<n;i++) await step(); return {fi,anchors,warps}; };
@@ -259,7 +270,7 @@ async function Player(fileBytes){
     await rb.mapAsync(GPUMapMode.READ); const g=new Uint8Array(rb.getMappedRange()); let s=0,c=0; for(let y=0;y<H2;y+=8)for(let x=0;x<W2;x+=8){const o=y*bpr+x*4;s+=g[o]+g[o+1]+g[o+2];c+=3;} const m=s/c; rb.unmap(); return +m.toFixed(1); };
   window.__diag=async()=>({ frame:fi, playhdMean:await meanTex(prevHD,WD,HD), sourceMean:await meanTex(lrCur,w,h), anchors, warps, reanchor:REANCHOR });
   status(`decoded ${w}×${h} @ ${fps.toFixed(0)} fps · upscaling ${scale}× → ${WD}×${HD} · “SR every 1 frame” = pure super-res; raise it to trade quality for speed (MV-propagation) · drag the divider to compare`);
-  return { start(){ playing=true; lastT=0; rafid=requestAnimationFrame(loop); }, stop(){ playing=false; cancelAnimationFrame(rafid); try{dclose();}catch{} } };
+  return { start(){ playing=true; lastT=0; aud.currentTime=fi/fps; aud.play().catch(()=>{}); rafid=requestAnimationFrame(loop); }, stop(){ playing=false; cancelAnimationFrame(rafid); try{aud.pause();}catch{} try{dclose();}catch{} } };
 }
 </script>
 </body></html>
