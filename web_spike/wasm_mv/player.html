@@ -59,6 +59,8 @@
 <script type="module">
 import createDecoder from "./mv_decode.mjs";
 import { buildLrFlow } from "./flow.js";
+import { initSpanGPUFast, makeSpanRunner } from "../webgpu_warp/span_driver_fast.js";   // SPAN anchor SR (codec-trained, beats compact on LPIPS+DISTS)
+const USE_SPAN = true;   // SPAN model for the anchor (native 2×); false = compact realesr-general
 const $=s=>document.querySelector(s);
 const status=(m)=>{$("#status").textContent=m;};
 
@@ -105,6 +107,21 @@ async function Player(fileBytes){
   const f16 = adapter.features.has("shader-f16");
   const dev=await adapter.requestDevice({requiredFeatures: f16?["shader-f16"]:[]});
   const F16=self.Float16Array; const packW=(f32)=> f16 ? new Uint16Array(new F16(f32).buffer) : f32; const EB=f16?2:4;
+  // SPAN anchor (native 2× -> runs on the FULL source; output (2w×2h) == the player's HD texture)
+  let spanRun=null, p2tPipe=null, p2tBg=null;
+  if(USE_SPAN){ const spanSpec=await (await fetch("../span_data/spec.json")).json();
+    const spanW=new Float32Array(await (await fetch("../span_data/weights.bin")).arrayBuffer());
+    const spanG=await initSpanGPUFast(dev, spanW, {...spanSpec, H:h, W:w}, f16, {OCB:48});
+    spanRun=makeSpanRunner(spanG);   // PERSISTENT (buffers+ops once) — no per-frame alloc/leak
+    // SPAN OUT (planar 3×OH×OW) -> rgba8 HD texture (GPU, no readback)
+    const fT2=f16?"f16":"f32";
+    const p2tMod=dev.createShaderModule({code:`${f16?"enable f16;":""}@group(0)@binding(0) var<storage,read> buf:array<${fT2}>;@group(0)@binding(1) var<uniform> d:vec4u;
+      @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
+      @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let x=u32(pos.x);let y=u32(pos.y);let i=y*d.x+x;let pl=d.x*d.y;
+        return vec4f(f32(buf[i]),f32(buf[pl+i]),f32(buf[2u*pl+i]),1.0);}`});
+    p2tPipe=dev.createRenderPipeline({layout:"auto",vertex:{module:p2tMod,entryPoint:"vs"},fragment:{module:p2tMod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
+    const p2tU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(p2tU,0,new Uint32Array([spanRun.OW,spanRun.OH,0,0]));
+    p2tBg=dev.createBindGroup({layout:p2tPipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:spanRun.OUT}},{binding:1,resource:{buffer:p2tU}}]}); }
   // SR weights + kernel (combo f16 / wtile f32)
   const wf=new Float32Array(await (await fetch("../compact_data/weights.bin")).arrayBuffer());
   const layers=(await (await fetch("../compact_data/layers.json")).json()).layers;
@@ -130,7 +147,7 @@ async function Player(fileBytes){
   const pshU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(pshU,0,new Uint32Array([srH,srW,MS,0]));   // pixelshuffle: srIn × 4 = the 2× output, directly
 
   // HD textures (ping-pong) + LR textures (cur/prev) + flow
-  const hdTex=()=>dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_SRC});
+  const hdTex=()=>dev.createTexture({size:[WD,HD],format:"rgba8unorm",usage:GPUTextureUsage.RENDER_ATTACHMENT|GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_SRC|GPUTextureUsage.COPY_DST});
   let hdA=hdTex(), hdB=hdTex();
   const lrTex=()=>dev.createTexture({size:[w,h],format:"rgba8unorm",usage:GPUTextureUsage.TEXTURE_BINDING|GPUTextureUsage.COPY_DST|GPUTextureUsage.COPY_SRC});
   let lrCur=lrTex(), lrPrev=lrTex();
@@ -170,6 +187,19 @@ async function Player(fileBytes){
   function uploadLR(){ const n=w*h; const rgba=new Uint8Array(n*4); const src=Dec.HEAPU8; const p=dRgb(); for(let i=0,j=0,k=p;i<n;i++){rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=255;}
     dev.queue.writeTexture({texture:lrCur},rgba,{bytesPerRow:w*4,rowsPerImage:h},[w,h]); return rgba; }
   const FAC=Math.max(1,Math.round(w/srW));   // source -> SR-input box-downscale factor (2 for 2× output, 1 for 4×)
+  // SPAN anchor: run the SPAN graph on the FULL source -> 2× RGB -> write into the HD texture (dims match).
+  const spanLP=new Float32Array(3*plane), spanOpx=WD*HD, spanRGBA=new Uint8Array(spanOpx*4); let spanRB=null;
+  async function srAnchorSpan(dst){   // SPAN on the full source -> OUT(planar) -> readback -> dst HD texture (persistent buffers, no leak)
+    const src=Dec.HEAPU8, p=dRgb();
+    for(let y=0;y<h;y++)for(let x=0;x<w;x++){const o=p+(y*w+x)*3,b=y*w+x;spanLP[b]=src[o]/255;spanLP[plane+b]=src[o+1]/255;spanLP[2*plane+b]=src[o+2]/255;}
+    dev.queue.writeBuffer(spanRun.IN,0,packW(spanLP));
+    if(!spanRB) spanRB=dev.createBuffer({size:3*spanOpx*EB,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+    const e=dev.createCommandEncoder(); spanRun.recordInto(e); e.copyBufferToBuffer(spanRun.OUT,0,spanRB,0,3*spanOpx*EB); dev.queue.submit([e.finish()]);
+    await spanRB.mapAsync(GPUMapMode.READ);
+    const out=f16?new Float32Array(new F16(spanRB.getMappedRange().slice(0))):new Float32Array(spanRB.getMappedRange().slice(0)); spanRB.unmap();
+    for(let i=0;i<spanOpx;i++){spanRGBA[i*4]=Math.max(0,Math.min(255,out[i]*255+0.5));spanRGBA[i*4+1]=Math.max(0,Math.min(255,out[spanOpx+i]*255+0.5));spanRGBA[i*4+2]=Math.max(0,Math.min(255,out[2*spanOpx+i]*255+0.5));spanRGBA[i*4+3]=255;}
+    dev.queue.writeTexture({texture:dst},spanRGBA,{bytesPerRow:WD*4,rowsPerImage:HD},[WD,HD]);
+  }
   function srAnchor(dst){ // box-downscale source -> srIn, conv at srIn, pixelshuffle 4× straight to the output
     const lp=new Float32Array(3*plane_sr); const src=Dec.HEAPU8; const p=dRgb(); const inv=1/(FAC*FAC*255);
     for(let sy=0;sy<srH;sy++)for(let sx=0;sx<srW;sx++){ let r=0,g=0,b=0;
@@ -198,21 +228,21 @@ async function Player(fileBytes){
   let prevHD=hdA, freeHD=hdB, fi=0, anchors=0, warps=0, playing=true, rafid=0, lastT=0, divider=0.5, srMsAvg=0, realFps=0, lastDrawn=0;
   let REANCHOR=1;   // SR every Nth frame; 1 = pure per-frame SR (no propagation), higher = more MV-warp propagation (faster, but drifts on real motion)
   function rebuildDecoder(){ dclose(); dopen("/in.mp4"); }
-  function step(){
+  async function step(){
     const r=dnext();
     if(r!==0){ rebuildDecoder(); fi=0; const r2=dnext(); if(r2!==0) throw new Error("decode loop failed"); }
     [lrPrev,lrCur]=[lrCur,lrPrev]; uploadLR();
     // anchor (GPU super-res) on I-frames (no MVs) and every REANCHOR-th frame; propagate the rest by MV-warp
     const isAnchor = dNmv()===0 || (fi % REANCHOR === 0);
     const t=performance.now();
-    if(isAnchor){ srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
+    if(isAnchor){ if(USE_SPAN) await srAnchorSpan(freeHD); else srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
     else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; }
     present(prevHD);
     $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?"anchor · GPU super-res":"propagated · codec MV-warp";
     $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · source ${fps.toFixed(0)} fps<br>frame ${fi} · ${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}% SR anchors · playing ~${realFps.toFixed(0)} fps · ${f16?"fp16":"fp32"}`;
     fi++;
   }
-  function loop(now){ if(!playing) return; if(now-lastT >= 1000/fps){ if(lastDrawn){const dt=now-lastDrawn; if(dt>0&&dt<2000) realFps=realFps?realFps*0.8+(1000/dt)*0.2:1000/dt;} lastDrawn=now; lastT=now; try{step();}catch(e){status("⚠ "+e.message);playing=false;return;} } rafid=requestAnimationFrame(loop); }
+  async function loop(now){ if(!playing) return; if(now-lastT >= 1000/fps){ if(lastDrawn){const dt=now-lastDrawn; if(dt>0&&dt<2000) realFps=realFps?realFps*0.8+(1000/dt)*0.2:1000/dt;} lastDrawn=now; lastT=now; try{await step();}catch(e){status("⚠ "+e.message);playing=false;return;} } if(playing) rafid=requestAnimationFrame(loop); }
 
   // slider drag
   const sl=$("#slider"); const setDiv=(clientX)=>{const r=cv.getBoundingClientRect();divider=Math.max(0,Math.min(1,(clientX-r.left)/r.width));sl.style.left=(divider*100)+"%";if(!playing)present(prevHD);};
@@ -225,7 +255,7 @@ async function Player(fileBytes){
   $("#cad").oninput=e=>{REANCHOR=+e.target.value;cadLabel();}; cadLabel();
 
   // headless test hooks (rAF pauses in background tabs; these let us exercise the chain directly)
-  window.__stepN=(n)=>{ for(let i=0;i<n;i++) step(); return {fi,anchors,warps}; };
+  window.__stepN=async(n)=>{ for(let i=0;i<n;i++) await step(); return {fi,anchors,warps}; };
   const meanTex=async(tex,W2,H2)=>{ const bpr=Math.ceil(W2*4/256)*256; const rb=dev.createBuffer({size:bpr*H2,usage:GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
     const e=dev.createCommandEncoder(); e.copyTextureToBuffer({texture:tex},{buffer:rb,bytesPerRow:bpr,rowsPerImage:H2},[W2,H2]); dev.queue.submit([e.finish()]); await dev.queue.onSubmittedWorkDone();
     await rb.mapAsync(GPUMapMode.READ); const g=new Uint8Array(rb.getMappedRange()); let s=0,c=0; for(let y=0;y<H2;y+=8)for(let x=0;x<W2;x+=8){const o=y*bpr+x*4;s+=g[o]+g[o+1]+g[o+2];c+=3;} const m=s/c; rb.unmap(); return +m.toFixed(1); };

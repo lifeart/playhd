@@ -134,11 +134,11 @@ export async function runSpanFast(
   };
   const SiLU = (fin: GPUBuffer, fout: GPUBuffer, ch = feat) => {
     const ub = mkU(H, W, ch, ch, 0, 0); const n = ch * plane;
-    ops.push({ pipe: elemPipes.silu, bg: bgElem(elemPipes.silu, fin, fout, Wbuf, ub), gx: Math.ceil(n / 64), gy: 1, gz: 1 });
+    ops.push({ pipe: elemPipes.silu, bg: bgElem(elemPipes.silu, fin, fout, Wbuf, ub), gx: Math.ceil(W / 8), gy: Math.ceil(H / 8), gz: feat });
   };
   const Gate = (o3: GPUBuffer, x: GPUBuffer, fout: GPUBuffer, ch = feat) => {
     const ub = mkU(H, W, ch, ch, 0, 0); const n = ch * plane;
-    ops.push({ pipe: elemPipes.gate, bg: bgElem(elemPipes.gate, o3, fout, x, ub), gx: Math.ceil(n / 64), gy: 1, gz: 1 });
+    ops.push({ pipe: elemPipes.gate, bg: bgElem(elemPipes.gate, o3, fout, x, ub), gx: Math.ceil(W / 8), gy: Math.ceil(H / 8), gz: feat });
   };
   const PShuf = (fin: GPUBuffer, fout: GPUBuffer) => {
     const ub = mkU(H, W, 12, 3, 0, 0);
@@ -205,4 +205,40 @@ export async function runSpanFast(
   const out = g.f16 ? new Float32Array(new F16C(rb.getMappedRange().slice(0))) : new Float32Array(rb.getMappedRange().slice(0));
   rb.unmap();
   return { out, ms: best };
+}
+
+// PERSISTENT runner for per-frame use: allocates buffers + builds the op list ONCE; per frame only the
+// IN contents change. recordInto(encoder) replays the SPAN graph (result left in OUT, planar 3×2H×2W).
+// No per-call allocation -> no leak (runSpanFast was a one-shot benchmark fn and leaked over many calls).
+export function makeSpanRunner(g: any) {
+  const { device, eb, elemPipes, convPipe, convBgl, elemBgl, Wbuf, spec, convTW, convTH, convOCB } = g;
+  const { H, W } = spec, plane = H * W, feat = 48;
+  const mk = (ch: number) => device.createBuffer({ size: ch * plane * eb, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST });
+  const IN = mk(3), F = mk(feat), B1 = mk(feat), B5_2 = mk(feat), B6 = mk(feat), Pb = mk(feat), Qb = mk(feat), sA = mk(feat), sB = mk(feat), sC = mk(feat), CAT = mk(192), COUT = mk(feat), U12 = mk(12);
+  const OUT = device.createBuffer({ size: 3 * (2 * H) * (2 * W) * eb, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC });
+  const mkU = (Hh: number, Ww: number, in_c: number, out_c: number, w_off: number, b_off: number) => {
+    const ub = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(ub, 0, new Uint32Array([Hh, Ww, in_c, out_c, w_off >>> 0, b_off >>> 0, 0, 0])); return ub;
+  };
+  const bgC = (fin: any, fout: any, ub: any) => device.createBindGroup({ layout: convBgl, entries: [{ binding: 0, resource: { buffer: fin } }, { binding: 1, resource: { buffer: fout } }, { binding: 2, resource: { buffer: Wbuf } }, { binding: 3, resource: { buffer: ub } }] });
+  const bgE = (fin: any, fout: any, fx: any, ub: any) => device.createBindGroup({ layout: elemBgl, entries: [{ binding: 0, resource: { buffer: fin } }, { binding: 1, resource: { buffer: fout } }, { binding: 2, resource: { buffer: Wbuf } }, { binding: 3, resource: { buffer: ub } }, { binding: 4, resource: { buffer: fx } }] });
+  const ops: any[] = [];
+  const W3 = (name: string, fin: any, fout: any) => { const w = spec.weights[name]; ops.push({ pipe: convPipe, bg: bgC(fin, fout, mkU(H, W, w.in_c, w.out_c, w.w_off, w.b_off)), gx: Math.ceil(W / convTW), gy: Math.ceil(H / convTH), gz: Math.ceil(w.out_c / convOCB) }); };
+  const W1 = (name: string, fin: any, fout: any) => { const w = spec.weights[name]; ops.push({ pipe: elemPipes.conv1x1, bg: bgE(fin, fout, Wbuf, mkU(H, W, w.in_c, w.out_c, w.w_off, w.b_off)), gx: Math.ceil(W / 8), gy: Math.ceil(H / 8), gz: w.out_c }); };
+  const SiLU = (fin: any, fout: any) => { const n = feat * plane; ops.push({ pipe: elemPipes.silu, bg: bgE(fin, fout, Wbuf, mkU(H, W, feat, feat, 0, 0)), gx: Math.ceil(W / 8), gy: Math.ceil(H / 8), gz: feat }); };
+  const Gate = (o3: any, x: any, fout: any) => { const n = feat * plane; ops.push({ pipe: elemPipes.gate, bg: bgE(o3, fout, x, mkU(H, W, feat, feat, 0, 0)), gx: Math.ceil(W / 8), gy: Math.ceil(H / 8), gz: feat }); };
+  const SPAB = (blk: string, x: any, out: any, o1: any) => { W3(`${blk}.c1_r`, x, sA); SiLU(sA, o1); W3(`${blk}.c2_r`, o1, sA); SiLU(sA, sB); W3(`${blk}.c3_r`, sB, sC); Gate(sC, x, out); };
+  W3("conv_1", IN, F); SPAB("block_1", F, B1, sB); SPAB("block_2", B1, Pb, sB); SPAB("block_3", Pb, Qb, sB); SPAB("block_4", Qb, Pb, sB); SPAB("block_5", Pb, Qb, sB); SPAB("block_6", Qb, Pb, B5_2);
+  W3("conv_2", Pb, B6);
+  const cb = feat * plane * eb;
+  ops.push({ src: F, dst: CAT, do: 0 * cb, sz: cb }); ops.push({ src: B6, dst: CAT, do: 1 * cb, sz: cb }); ops.push({ src: B1, dst: CAT, do: 2 * cb, sz: cb }); ops.push({ src: B5_2, dst: CAT, do: 3 * cb, sz: cb });
+  W1("conv_cat", CAT, COUT); W3("upsampler", COUT, U12);
+  ops.push({ pipe: elemPipes.pshuffle, bg: bgE(U12, OUT, Wbuf, mkU(H, W, 12, 3, 0, 0)), gx: Math.ceil((2 * W) / 8), gy: Math.ceil((2 * H) / 8), gz: 3 });
+  function recordInto(enc: any) {
+    for (const o of ops) {
+      if (o.src !== undefined) { enc.copyBufferToBuffer(o.src, 0, o.dst, o.do, o.sz); continue; }
+      const cp = enc.beginComputePass(); cp.setPipeline(o.pipe); cp.setBindGroup(0, o.bg); cp.dispatchWorkgroups(o.gx, o.gy, o.gz); cp.end();
+    }
+  }
+  return { IN, OUT, recordInto, OW: 2 * W, OH: 2 * H, eb, f16: g.f16 };
 }

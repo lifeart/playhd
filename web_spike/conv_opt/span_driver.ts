@@ -55,15 +55,15 @@ struct P { H:u32, W:u32, in_c:u32, out_c:u32, w_off:u32, b_off:u32, p6:u32, p7:u
   fout[oc*pl+p] = ${T}(acc);
 }
 
-// SiLU: x*sigmoid(x). n = in_c*H*W (in_c carries the channel count).
-@compute @workgroup_size(64,1,1) fn silu(@builtin(global_invocation_id) g:vec3u){
-  let i=g.x; let n=u.in_c*u.H*u.W; if(i>=n){ return; }
+// SiLU: x*sigmoid(x). 3D grid (x=W, y=H, z=channel) — avoids the 65535 1D-dispatch limit at large H*W.
+@compute @workgroup_size(8,8,1) fn silu(@builtin(global_invocation_id) g:vec3u){
+  if(g.x>=u.W||g.y>=u.H||g.z>=u.in_c){ return; } let i=g.z*u.H*u.W + g.y*u.W + g.x;
   let v=f32(fin[i]); fout[i]=${T}(v*(1.0/(1.0+exp(-v))));
 }
 
-// SPAB gate: (o3 + x) * (sigmoid(o3) - 0.5). fin=o3, fx=x.
-@compute @workgroup_size(64,1,1) fn gate(@builtin(global_invocation_id) g:vec3u){
-  let i=g.x; let n=u.in_c*u.H*u.W; if(i>=n){ return; }
+// SPAB gate: (o3 + x) * (sigmoid(o3) - 0.5). fin=o3, fx=x. 3D grid (same reason).
+@compute @workgroup_size(8,8,1) fn gate(@builtin(global_invocation_id) g:vec3u){
+  if(g.x>=u.W||g.y>=u.H||g.z>=u.in_c){ return; } let i=g.z*u.H*u.W + g.y*u.W + g.x;
   let o3=f32(fin[i]); let xv=f32(fx[i]);
   fout[i]=${T}((o3+xv)*(1.0/(1.0+exp(-o3))-0.5));
 }
@@ -163,11 +163,11 @@ export async function runSpan(g: SpanGPU, lrPlanarF32: Float32Array, trials = 5,
   };
   const SiLU = (fin: GPUBuffer, fout: GPUBuffer, ch = feat) => {
     const ub = mkU(H, W, ch, ch, 0, 0); const n = ch * plane;
-    ops.push({ pipe: pipes.silu, bg: bg(pipes.silu, fin, fout, Wbuf, ub), gx: Math.ceil(n / 64), gy: 1, gz: 1 });
+    ops.push({ pipe: pipes.silu, bg: bg(pipes.silu, fin, fout, Wbuf, ub), gx: Math.ceil(W / 8), gy: Math.ceil(H / 8), gz: ch });
   };
   const Gate = (o3: GPUBuffer, x: GPUBuffer, fout: GPUBuffer, ch = feat) => {
     const ub = mkU(H, W, ch, ch, 0, 0); const n = ch * plane;
-    ops.push({ pipe: pipes.gate, bg: bg(pipes.gate, o3, fout, x, ub), gx: Math.ceil(n / 64), gy: 1, gz: 1 });
+    ops.push({ pipe: pipes.gate, bg: bg(pipes.gate, o3, fout, x, ub), gx: Math.ceil(W / 8), gy: Math.ceil(H / 8), gz: ch });
   };
   const PShuf = (fin: GPUBuffer, fout: GPUBuffer) => {
     const ub = mkU(H, W, 12, 3, 0, 0);
