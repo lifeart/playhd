@@ -1,0 +1,42 @@
+name: Deploy demo to GitHub Pages
+
+# Publishes the in-browser upscaler demo. Heavy/licensed runtime assets (WASM decoder, model
+# weights, demo clip) are NOT in this repo — the player fetches them from the HuggingFace dataset
+# lifeart/playhd-web-assets at runtime (CORS-enabled). This job ships only the (MIT) demo code.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - name: Assemble _site (demo code only; weights/wasm/clip come from HuggingFace)
+        run: |
+          mkdir -p _site/wasm_mv _site/webgpu_warp
+          cp web_spike/wasm_mv/player.html web_spike/wasm_mv/mv_decode.mjs web_spike/wasm_mv/flow.js _site/wasm_mv/
+          cp web_spike/webgpu_warp/span_driver_fast.js \
+             web_spike/webgpu_warp/combo.wgsl \
+             web_spike/webgpu_warp/wtile.wgsl _site/webgpu_warp/
+          printf '%s' '<!doctype html><meta charset="utf-8"><title>playhd — in-browser SD→HD upscaler</title><meta http-equiv="refresh" content="0; url=wasm_mv/player.html?demo"><body style="font:14px system-ui;background:#0c0c0c;color:#ddd;padding:24px">Loading the <a href="wasm_mv/player.html?demo" style="color:#7ce0b0">playhd demo</a>… (needs a WebGPU browser)</body>' > _site/index.html
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
