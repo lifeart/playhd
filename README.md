@@ -1,8 +1,13 @@
 # playhd — browser-native SD→HD video upscaling, paid for by the codec's own motion vectors
 
+### ▶ Live demo: **<https://lifeart.github.io/playhd/>** &nbsp;(WebGPU browser; one-click, runs entirely client-side)
+
 > **Status: research spike, not production.** A de-risking prototype — everything runs and is measured,
 > but it isn't a shipped product or a trained model. See [`web_spike/WRITEUP.md`](web_spike/WRITEUP.md)
 > for the full technical write-up.
+>
+> **Non-commercial demo.** The live demo uses the SPAN model (CC-BY-NC-SA-4.0). The application code here
+> is MIT; the third-party model weights are not. See [Licensing](#whats-not-included-and-why).
 
 Super-resolving every frame of video in a browser is too expensive. So don't — super-resolve only **sparse
 anchor frames** on the GPU (WebGPU/WGSL), and reconstruct everything in between by **warping the previous
@@ -49,11 +54,23 @@ live-action / faces. Open options:
 - **Blender open movies** (Sintel, Tears of Steel, …) — CC-BY: <https://studio.blender.org/films/>
 
 ## What's NOT included (and why)
-- **Super-resolution model weights** — SPAN `2xLiveActionV1`, `realesr-general-x4v3` ("compact"),
-  `RealESRGAN_x4plus`. These are **third-party** weights with their own licenses; this repo ports them to
-  WGSL, it doesn't relicense or redistribute them. Obtain them from their sources (e.g. OpenModelDB /
-  the Real-ESRGAN releases), then regenerate the runtime data with the `export_*` scripts in `web_spike/`.
-- **Video clips** — copyright. Bring your own / use an open clip (above).
+
+This **git repo** holds only the **MIT application code** — no weights, no clips, no compiled WASM. The
+**live demo's runtime assets** are hosted separately on a HuggingFace dataset and fetched at runtime
+(CORS-enabled): **🤗 [lifeart/playhd-web-assets](https://huggingface.co/datasets/lifeart/playhd-web-assets)**.
+Each asset keeps its own license:
+
+| asset | license | source / credit |
+|---|---|---|
+| SPAN `2xLiveActionV1` weights | **CC-BY-NC-SA-4.0** (non-commercial) | jcj83429 · [OpenModelDB](https://openmodeldb.info/models/2x-LiveActionV1-SPAN) |
+| `realesr-general-x4v3` ("compact") weights | **BSD-3-Clause** | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (Xintao Wang et al.) |
+| `mv_decode.wasm` (FFmpeg→WASM decoder) | **LGPL-2.1+** | [FFmpeg](https://ffmpeg.org); build recipe: `web_spike/wasm_mv/build_ffmpeg_wasm.sh` |
+| demo clip | **CC-BY 3.0** | Big Buck Bunny © [Blender Foundation](https://peach.blender.org) |
+
+Because it bundles a CC-BY-NC-SA model, the **demo as a whole is non-commercial**. To run locally instead,
+obtain the model weights from their sources and regenerate the runtime data with the `export_*` scripts in
+`web_spike/`, then serve `web_spike/` (the player falls back to sibling files when not on `*.github.io`).
+Bring your own video clip, or use an open one (above).
 
 ## A note on the honest result
 We measured SPAN vs the compact SR on **real libx264 degradation** (`experiments/r11_span_eval/`): SPAN does
@@ -62,5 +79,7 @@ faces by ~20% LPIPS, loses on texture/high-motion). The player defaults to SPAN 
 talking-head video, and exposes a selector for the rest. Details in the write-up.
 
 ## License
-Original code: **MIT** (see [`LICENSE`](LICENSE)). Third-party model weights and any video clips are **not**
-covered and are **not** redistributed here — see their respective licenses.
+Original code in this repo: **MIT** (see [`LICENSE`](LICENSE)). The third-party runtime assets (model weights,
+WASM decoder, demo clip) are **not** covered by it — each keeps its own license (table above), they live on
+[🤗 lifeart/playhd-web-assets](https://huggingface.co/datasets/lifeart/playhd-web-assets), and because one of
+them (SPAN) is CC-BY-NC-SA-4.0, **the hosted demo is non-commercial**.
