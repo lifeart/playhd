@@ -80,7 +80,7 @@ let curModel = "span";   // anchor model: "span" (native 2×, live-action) | "co
 // HuggingFace dataset (CORS-enabled). Locally they sit beside the page. See README for licenses/attribution.
 const ON_PAGES = location.hostname.endsWith("github.io");
 const HF = "https://huggingface.co/datasets/lifeart/playhd-web-assets/resolve/main/";
-const A = ON_PAGES ? HF : "../";                              // data-asset base (span_data/, compact_data/)
+const ABASE = ON_PAGES ? HF : "../";                         // data-asset base (span_data/, compact_data/) — NB: Player() has a local `A` buffer, don't collide
 const DEMO_CLIP = ON_PAGES ? HF+"clips/BigBuckBunny_640x360_10s_CC-BY.mp4" : "sd600.mp4";
 const $=s=>document.querySelector(s);
 const status=(m)=>{$("#status").textContent=m;};
@@ -132,8 +132,8 @@ async function Player(fileBytes){
   const F16=self.Float16Array; const packW=(f32)=> f16 ? new Uint16Array(new F16(f32).buffer) : f32; const EB=f16?2:4;
   // SPAN anchor (native 2× -> runs on the FULL source; output (2w×2h) == the player's HD texture)
   let spanRun=null, p2tPipe=null, p2tBg=null;
-  { const spanSpec=await (await fetch(A+"span_data/spec.json")).json();   // always init SPAN + compact; selector picks at runtime
-    const spanW=new Float32Array(await (await fetch(A+"span_data/weights.bin")).arrayBuffer());
+  { const spanSpec=await (await fetch(ABASE+"span_data/spec.json")).json();   // always init SPAN + compact; selector picks at runtime
+    const spanW=new Float32Array(await (await fetch(ABASE+"span_data/weights.bin")).arrayBuffer());
     const spanG=await initSpanGPUFast(dev, spanW, {...spanSpec, H:h, W:w}, f16, {OCB:48});
     spanRun=makeSpanRunner(spanG);   // PERSISTENT (buffers+ops once) — no per-frame alloc/leak
     // SPAN OUT (planar 3×OH×OW) -> rgba8 HD texture (GPU, no readback)
@@ -146,8 +146,8 @@ async function Player(fileBytes){
     const p2tU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(p2tU,0,new Uint32Array([spanRun.OW,spanRun.OH,0,0]));
     p2tBg=dev.createBindGroup({layout:p2tPipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:spanRun.OUT}},{binding:1,resource:{buffer:p2tU}}]}); }
   // SR weights + kernel (combo f16 / wtile f32)
-  const wf=new Float32Array(await (await fetch(A+"compact_data/weights.bin")).arrayBuffer());
-  const layers=(await (await fetch(A+"compact_data/layers.json")).json()).layers;
+  const wf=new Float32Array(await (await fetch(ABASE+"compact_data/weights.bin")).arrayBuffer());
+  const layers=(await (await fetch(ABASE+"compact_data/layers.json")).json()).layers;
   const Wg=dev.createBuffer({size:packW(wf).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}); dev.queue.writeBuffer(Wg,0,packW(wf));
   const convCode=await (await fetch(`../webgpu_warp/${f16?"combo":"wtile"}.wgsl`)).text();
   const OCB=f16?64:32, TILE=16;
