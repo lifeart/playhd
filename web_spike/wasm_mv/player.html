@@ -22,6 +22,11 @@
   .tag{display:inline-block;padding:2px 7px;border-radius:5px;font:600 11px/1.4 ui-monospace,monospace}
   .tag.a{background:#16322a;color:var(--acc)}.tag.w{background:#16243a;color:var(--acc2)}
   #status{color:var(--mut);font:12px/1.4 ui-monospace,monospace;margin-top:8px;min-height:16px}
+  #loading{display:none;flex-direction:column;align-items:center;justify-content:center;gap:13px;padding:60px 24px;background:var(--card);border:1px solid var(--line);border-radius:14px}
+  .spinner{width:40px;height:40px;border:4px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:spin .8s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  #loadmsg{font:600 13px ui-monospace,monospace;color:var(--fg)}#loadsub{font:11px ui-monospace,monospace;color:var(--mut)}
+  #loadbar{width:240px;height:6px;background:#222b38;border-radius:4px;overflow:hidden}#loadbar>i{display:block;height:100%;width:0;background:var(--acc);transition:width .25s}
   a{color:var(--acc2)}
 </style></head>
 <body>
@@ -34,6 +39,13 @@
     <div>Drop a video here, or <b>click to choose</b></div>
     <div class="hint">H.264 / .mp4 — SD clips work best (it's an SD→HD upscaler). Processed on-device.</div>
     <input id="file" type="file" accept="video/mp4,video/*,.mp4,.h264" hidden>
+  </div>
+
+  <div id="loading">
+    <div class="spinner"></div>
+    <div id="loadmsg">Loading…</div>
+    <div id="loadbar"><i></i></div>
+    <div id="loadsub"></div>
   </div>
 
   <div id="stage">
@@ -85,6 +97,8 @@ const ABASE = ON_PAGES ? HF : "../";                         // data-asset base 
 const DEMO_CLIP = ON_PAGES ? HF+"clips/BigBuckBunny_640x360_10s_CC-BY.mp4" : "sd600.mp4";
 const $=s=>document.querySelector(s);
 const status=(m)=>{$("#status").textContent=m;};
+// live initialization progress (spinner overlay): prog(message, percent, subtext)
+const prog=(msg,pct,sub)=>{ const m=$("#loadmsg"); if(m&&msg!=null)m.textContent=msg; const b=$("#loadbar")?.firstElementChild; if(b&&pct!=null)b.style.width=pct+"%"; const s=$("#loadsub"); if(s&&sub!=null)s.textContent=sub; };
 
 // ---------- file pick / drag-drop ----------
 const drop=$("#drop"), file=$("#file");
@@ -101,20 +115,23 @@ $("#open").onclick=()=>file.click();
 let app=null;   // the running player
 // convenience: ?demo auto-loads the bundled sample clip (also lets the page be smoke-tested headless)
 { const qp=new URLSearchParams(location.search); if(qp.has("demo")||qp.has("clip")){ const arg=qp.get("clip")||DEMO_CLIP; const url=/^https?:\/\//.test(arg)?arg:("../"+arg); const nm=arg.split("/").pop();   // ?clip=<name|URL> ; full URLs need CORS (e.g. an open Big Buck Bunny clip)
-  (async()=>{ try{ status("loading "+nm+"…"); const b=await (await fetch(url)).blob(); load(new File([b],nm)); }catch(e){ status("no sample clip is bundled (licensing) — drag in any H.264 SD .mp4, or use ?clip=<open-clip-URL>. See the README for openly-licensed test clips."); } })(); } }
+  (async()=>{ try{ status("loading "+nm+"…"); $("#drop").style.display="none"; $("#loading").style.display="flex"; prog("Downloading clip…",4,nm); const b=await (await fetch(url)).blob(); load(new File([b],nm)); }catch(e){ $("#loading").style.display="none"; $("#drop").style.display=""; status("no sample clip is bundled (licensing) — drag in any H.264 SD .mp4, or use ?clip=<open-clip-URL>. See the README for openly-licensed test clips."); } })(); } }
 async function load(f){
   status(`reading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
+  $("#drop").style.display="none"; $("#stage").style.display="none"; $("#loading").style.display="flex";   // show the spinner during init
+  prog("Reading "+f.name+"…", 8, (f.size/1e6).toFixed(1)+" MB"+(ON_PAGES?" · first load also fetches the models (~10 MB, one-time)":""));
   try{ const a=$("#aud"); a.src=URL.createObjectURL(f); a.load(); }catch(e){ console.debug("audio track unavailable (non-fatal):", e); }   // audio playback, synced to the displayed frame
   const buf=new Uint8Array(await f.arrayBuffer());
   if(app) app.stop();
-  try{ app=await Player(buf); $("#drop").style.display="none"; $("#stage").style.display="block"; app.start(); }
-  catch(err){ status("⚠ "+err.message); console.error(err); }
+  try{ app=await Player(buf); prog("Ready",100); $("#loading").style.display="none"; $("#stage").style.display="block"; app.start(); }
+  catch(err){ $("#loading").style.display="none"; $("#drop").style.display=""; status("⚠ "+err.message); console.error(err); }
 }
 
 // ---------- the player: WASM decode -> SR anchor / MV-warp -> split display ----------
 async function Player(fileBytes){
   if(!navigator.gpu) throw new Error("WebGPU not available in this browser.");
   // decoder
+  prog("Loading video decoder…", 18);
   const Dec=await createDecoder({printErr:()=>{}, locateFile:(p)=> (ON_PAGES && p.endsWith(".wasm")) ? HF+"mv_decode.wasm" : p });
   Dec.FS.writeFile("/in.mp4", fileBytes);
   const dopen=Dec.cwrap("mvdec_open","number",["string"]), dnext=Dec.cwrap("mvdec_next","number",[]);
@@ -131,14 +148,17 @@ async function Player(fileBytes){
   if(!w||!h) throw new Error("no video stream.");
 
   // GPU
+  prog("Setting up GPU…", 35);
   const adapter=await navigator.gpu.requestAdapter();
   const f16 = adapter.features.has("shader-f16");
   const dev=await adapter.requestDevice({requiredFeatures: f16?["shader-f16"]:[]});
   const F16=self.Float16Array; const packW=(f32)=> f16 ? new Uint16Array(new F16(f32).buffer) : f32; const EB=f16?2:4;
   // SPAN anchor (native 2× -> runs on the FULL source; output (2w×2h) == the player's HD texture)
   let spanRun=null, p2tPipe=null, p2tBg=null;
+  prog(ON_PAGES?"Downloading SR model… (~1.6 MB)":"Loading SR model…", 55);
   { const spanSpec=await (await fetch(ABASE+"span_data/spec.json")).json();   // always init SPAN + compact; selector picks at runtime
     const spanW=new Float32Array(await (await fetch(ABASE+"span_data/weights.bin")).arrayBuffer());
+    prog("Compiling shaders…", 75);
     const spanG=await initSpanGPUFast(dev, spanW, {...spanSpec, H:h, W:w}, f16, {OCB:48});
     spanRun=makeSpanRunner(spanG);   // PERSISTENT (buffers+ops once) — no per-frame alloc/leak
     // SPAN OUT (planar 3×OH×OW) -> rgba8 HD texture (GPU, no readback)
@@ -151,6 +171,7 @@ async function Player(fileBytes){
     const p2tU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(p2tU,0,new Uint32Array([spanRun.OW,spanRun.OH,0,0]));
     p2tBg=dev.createBindGroup({layout:p2tPipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:spanRun.OUT}},{binding:1,resource:{buffer:p2tU}}]}); }
   // SR weights + kernel (combo f16 / wtile f32)
+  prog(ON_PAGES?"Loading compact model… (~4.6 MB)":"Loading compact model…", 90);
   const wf=new Float32Array(await (await fetch(ABASE+"compact_data/weights.bin")).arrayBuffer());
   const layers=(await (await fetch(ABASE+"compact_data/layers.json")).json()).layers;
   const Wg=dev.createBuffer({size:packW(wf).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}); dev.queue.writeBuffer(Wg,0,packW(wf));
