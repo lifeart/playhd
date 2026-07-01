@@ -233,6 +233,18 @@ INSTANT_INTERP_2X = False
 INTERP_CUT_THRESH = 0.5                 # intra-hole fraction above which the midpoint DUPLICATES (cut guard)
 _MID_GRAIN_SEED_BASE = 1 << 20          # midpoint grain seeds live ABOVE real-frame seeds (no collision)
 
+# R12-E1 -- codec-RESIDUAL reliability gate (default OFF). Replaces derisk.reconstruct's HARD
+# per-pixel occlusion fallback (recon[occ]=perframe[occ], the "jelly"/seam source) with a SOFT
+# residual-reliability lerp (prototype/residual_gate.py). GATED-GO verdict: high-motion LPIPS
+# -29% / DISTS -23%, near-no-op on calm, but carries a +5.8% jelly tOF_true cost that needs a
+# broader multi-clip tOF sweep before flipping default-ON (same graduation path as beta=0.85 /
+# deblock_pre). OFF -> reconstruct is byte-identical to today. ON currently runs the NUMPY
+# reconstruct (the measured, parity-verified path) even under backend='torch' (a GPU port of the
+# soft lerp is a follow-up), so it is a quality knob, not a real-time default. Recommended params
+# when enabled: residual-only, tau_res=10, s_res=5, use_fb=False.
+RESIDUAL_GATE = False
+_RESIDUAL_GATE_CFG = {"tau_res": 10.0, "s_res": 5.0, "use_fb": False}
+
 SAMPLE_MP4 = os.path.join(_REPO, "sample.mp4")
 OUTPUTS_DIR = os.path.join(_HERE, "outputs")
 UPLOADS_DIR = os.path.join(_HERE, "uploads")
@@ -288,13 +300,19 @@ MODE_CONFIG = {
                     grain_motion=True,             # E3 V2: freeze grain on static (region-gated) pixels,
                                                    # fresh per-frame grain only on motion -> removes the
                                                    # ~100% grain-induced static-region flicker.
-                    deblock_pre=None,              # R10-E2 (DEFAULT OFF): codec-artifact-removal
-                                                   # preprocessor before the x4plus anchor. GATED GO
-                                                   # (heavy-compression + low/mid-detail only: LPIPS
-                                                   # -13% / DISTS -17% on the gated heavy subset).
-                                                   # Set e.g. {"model":"scunet_color_real_psnr.pth",
-                                                   # "gate":"blockiness","block_min":1.30} to enable.
-                                                   # None -> byte-identical. See r10_e2_deblock_pre.
+                    # R12-E2: exact bitstream QP (venc_params, threaded as the frame-tuple's 4th
+                    # element) makes the deblock gate RELIABLE, so it is enabled as a SELF-GATING
+                    # opt-in: SCUNet codec-deblock runs BEFORE x4plus ONLY on heavy anchors
+                    # (qp_mean >= qp_min). Verified light-SKIP / heavy-FIRE at qp_min=40 (R12-E2
+                    # crossover): CRF23 clip stays byte-identical (gate never fires), CRF40 fires and
+                    # beats plain x4plus on LPIPS+DISTS. On a source WITHOUT venc_params (qp=None),
+                    # should_deblock is None-safe -> falls back to the LR blockiness proxy.
+                    # RESIDUAL RISK (default-ON): the QP gate alone does NOT guard dense photographic
+                    # texture at heavy CRF (R10 over-smooth case) -> add "skip_texture_varlap" after a
+                    # measured sweep. Set to None to fully disable (byte-identical).
+                    deblock_pre={"model": "scunet_color_real_psnr.pth",
+                                 "gate": "qp", "qp_min": 40},   # R12-E2 qp_mean crossover
+                    residual_gate=(_RESIDUAL_GATE_CFG if RESIDUAL_GATE else None),  # R12-E1 (default OFF)
                     anchor_blend_beta=0.85,        # R8-E3 (ON): global compact<->x4plus anchor lerp
                                                    # out = compact + 0.85*(x4plus-compact). <= x4plus on
                                                    # every measured anchor cell (LPIPS -5.7% mean on
@@ -485,6 +503,39 @@ def probe_total_frames(path, max_frames=None):
 
 
 # --------------------------------------------------------------------------- #
+# R12-E2: exact per-frame QP from the decoder's video-enc-params side-data.
+# --------------------------------------------------------------------------- #
+_VENC_PARAMS_SD = getattr(derisk.SDType, "VIDEO_ENC_PARAMS", None)   # None on builds w/o it
+
+
+def _frame_qp_mean(frame):
+    """Exact per-frame QP = mean of the decoder's absolute per-macroblock QP map (venc_params
+    side-data). Returns None when the codec/build exposes no venc_params, in which case the
+    deblock gate falls back to the LR blockiness proxy (should_deblock is None-safe).
+
+    VERIFIED on PyAV 17.0.1 / libavcodec 62.11: iterate frame.side_data, match the VIDEO_ENC_PARAMS
+    entry, call .qp_map() -> per-MB absolute QP (CRF23 clip: I ~16, P/B ~24-34; CRF40: I ~33-35,
+    P/B ~40-50); fall back to .qp (slice base QP) then None. Cheap: one small ndarray reduce/frame."""
+    if _VENC_PARAMS_SD is None:
+        return None
+    try:
+        for sd in frame.side_data:
+            t = getattr(sd, "type", None)
+            if t == _VENC_PARAMS_SD or getattr(t, "name", "") == "VIDEO_ENC_PARAMS":
+                try:
+                    qm = np.asarray(sd.qp_map())
+                    if qm.size:
+                        return float(qm.mean())
+                except Exception:
+                    pass
+                q = getattr(sd, "qp", None)
+                return float(q) if q is not None else None
+    except Exception:
+        return None
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Streaming GOP decoder: open the container ONCE, yield self-contained chunks in
 # display order. Mirrors derisk.decode_lr_and_mvs (export_mvs, int pict_type map)
 # but never re-decodes from 0 per chunk.
@@ -510,7 +561,10 @@ def stream_gops(path, max_frames=None, soft_cap=SOFT_CAP_FRAMES, detect_cuts=Tru
     cont = av.open(path)
     try:
         vs = cont.streams.video[0]
-        vs.codec_context.options = {"flags2": "+export_mvs"}
+        # R12-E2: also export per-macroblock QP (venc_params) so the deblock gate can use the EXACT
+        # bitstream QP instead of the blockiness proxy. Keeps +export_mvs. No-op on builds without it.
+        vs.codec_context.options = {"flags2": "+export_mvs",
+                                    "export_side_data": "venc_params"}
         det = scene_detect.StreamingCutDetector() if detect_cuts else None
         chunk = []
         produced = 0
@@ -533,7 +587,8 @@ def stream_gops(path, max_frames=None, soft_cap=SOFT_CAP_FRAMES, detect_cuts=Tru
             except Exception:
                 sd = None
             mvs = sd.to_ndarray() if sd is not None else None
-            chunk.append((ptype, img, mvs))
+            qp = _frame_qp_mean(frame)               # R12-E2: exact bitstream per-frame QP (None if absent)
+            chunk.append((ptype, img, mvs, qp))      # 4-tuple: QP at index [3] (consumers 4-tuple-safe)
             produced += 1
         if chunk:
             yield chunk
@@ -791,6 +846,7 @@ def _quality_subchunk(sub, writer, done, total, t0, t_passB):
         sub, None, SCALE, True, cfg["occ"], perframe_cache, set(),
         backend=cfg["backend"], collect_metrics=False, download_output=True,
         region_gate=region_gate,
+        residual_gate=cfg.get("residual_gate"),     # R12-E1 (None -> byte-identical torch path)
     )
     for i in range(len(sub)):
         recon = R[i]["recon"]
@@ -894,7 +950,8 @@ def _run_layered(input_path, out_path, video_tmp, max_frames, t0):
                         plate_base = None         # R4-E1: reset the per-scene plate-validity baseline
                     if rvm_sid != sid:            # thread RVM recurrent state per scene
                         rec, rvm_sid = [None] * 4, sid
-                    for (_ptype, img, _mvs) in sub:
+                    for _f in sub:                    # R12-E2: 4-tuple-safe (optional QP at [3])
+                        img = _f[1]
                         pha, rec = _layered.matte_frame_np(model, img, rec, ratio, device)
                         # R4-E1: plate-validity guard. If the plate does NOT match this frame's
                         # background (a MISSED scene cut -> wrong fixed plate -> silent corruption),
@@ -1032,7 +1089,8 @@ def _auto_scan(clip_path, n, stride):
         n_chunks += 1
         anchors, backbone = anchor_sr.anchor_indices(chunk)
         h_lr, w_lr = chunk[0][1].shape[:2]
-        for i, (pt, lr, mvs) in enumerate(chunk):
+        for i, _f in enumerate(chunk):            # R12-E2: 4-tuple-safe (optional QP at [3])
+            pt, lr, mvs = _f[0], _f[1], _f[2]
             decoded.append((pt, lr, mvs))
             if n_frames % stride == 0:                  # sample subset for the cheap signals
                 g = cv2.cvtColor(lr, cv2.COLOR_RGB2GRAY)
@@ -1384,7 +1442,8 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     tr = time.perf_counter()
                     _, R = derisk.reconstruct(
                         chunk, None, eff_scale, True, cfg["occ"], perframe_cache, set(),
-                        backend=cfg["backend"], collect_metrics=False, download_output=False)
+                        backend=cfg["backend"], collect_metrics=False, download_output=False,
+                        residual_gate=cfg.get("residual_gate"))   # R12-E1 (instant cfg has none -> None)
                     t_recon += time.perf_counter() - tr
 
                     # 3) adaptive safeguard for the B LEAVES (post-reconstruct, correct since a
@@ -1494,6 +1553,7 @@ def process_clip(input_path, mode, max_frames=None, out_path=None, detect_cuts=T
                     chunk, None, SCALE, True, cfg["occ"], perframe_cache, set(),
                     backend=cfg["backend"], collect_metrics=False, download_output=True,
                     region_gate=region_gate,
+                    residual_gate=cfg.get("residual_gate"),   # R12-E1 (None -> byte-identical torch path)
                 )
                 t_recon += time.perf_counter() - tr
 
