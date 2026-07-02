@@ -243,7 +243,9 @@ _MID_GRAIN_SEED_BASE = 1 << 20          # midpoint grain seeds live ABOVE real-f
 # soft lerp is a follow-up), so it is a quality knob, not a real-time default. Recommended params
 # when enabled: residual-only, tau_res=10, s_res=5, use_fb=False.
 RESIDUAL_GATE = False
-_RESIDUAL_GATE_CFG = {"tau_res": 10.0, "s_res": 5.0, "use_fb": False}
+_RESIDUAL_GATE_CFG = {"tau_res": 10.0, "s_res": 5.0}   # residual-only; the fb round-trip term was
+                                                       # deliberately not ported (residual_gate.py
+                                                       # ignores any use_fb key -- R12 review [21])
 
 
 def _resolve_residual_gate(rg):
@@ -548,28 +550,28 @@ def _frame_qp_mean(frame):
     them here would misfire a gate calibrated on H.264's 0-51 scale (R12 review, empirically
     reproduced: near-lossless VP9 read as qp~40).
 
-    VERIFIED on PyAV 17.0.1 / libavcodec 62.11: iterate frame.side_data, match the VIDEO_ENC_PARAMS
-    entry, call .qp_map() -> per-MB absolute QP (CRF23 clip: I ~16, P/B ~24-34; CRF40: I ~33-35,
-    P/B ~40-50); fall back to .qp (slice base QP, H.264 scale) then None."""
+    VERIFIED on PyAV 17.0.1 / libavcodec 62.11: qp_map() -> per-MB absolute QP (CRF23 clip:
+    I ~16, P/B ~24-34; CRF40: I ~33-35, P/B ~40-50); falls back to .qp (slice base QP, H.264
+    scale) then None. Extraction matches experiments/r12_e2_qp_gate/qp_extract.py -- the
+    harness the qp_min=40 crossover was CALIBRATED with (provenance, R12 review [16])."""
     if _VENC_PARAMS_SD is None:
         _qp_warn("no-sdtype", "this PyAV build has no VIDEO_ENC_PARAMS side-data type")
         return None
     try:
-        for sd in frame.side_data:
-            t = getattr(sd, "type", None)
-            if t == _VENC_PARAMS_SD or getattr(t, "name", "") == "VIDEO_ENC_PARAMS":
-                try:
-                    qm = np.asarray(sd.qp_map())
-                    if qm.size:
-                        return float(qm.mean())
-                except Exception as e:                      # noqa: BLE001 -- warn-once, then .qp fallback
-                    _qp_warn("qp-map", f"qp_map() failed ({type(e).__name__}: {e}); using slice base QP")
-                q = getattr(sd, "qp", None)
-                return float(q) if q is not None else None
-    except Exception as e:                                  # noqa: BLE001 -- warn-once, qp=None
-        _qp_warn("side-data", f"side-data walk failed ({type(e).__name__}: {e})")
+        sd = frame.side_data.get(_VENC_PARAMS_SD)   # same idiom as the MOTION_VECTORS read above
+    except Exception as e:                          # noqa: BLE001 -- warn-once, qp=None
+        _qp_warn("side-data", f"side-data lookup failed ({type(e).__name__}: {e})")
         return None
-    return None
+    if sd is None:
+        return None                                 # stream carries no venc_params (legit, no warn)
+    try:
+        qm = np.asarray(sd.qp_map())
+        if qm.size:
+            return float(qm.mean())
+    except Exception as e:                          # noqa: BLE001 -- warn-once, then .qp fallback
+        _qp_warn("qp-map", f"qp_map() failed ({type(e).__name__}: {e}); using slice base QP")
+    q = getattr(sd, "qp", None)
+    return float(q) if q is not None else None
 
 
 # --------------------------------------------------------------------------- #

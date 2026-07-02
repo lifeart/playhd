@@ -643,7 +643,6 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
         PROF.ftype, PROF.fidx = "B", i
         perframe = perframe_cache[i]
         p, f = prev_ip(i), next_ip(i)
-        recon_f32 = perframe.astype(np.float32)                       # bicubic where neither valid
         oracle_f32 = hd_frames[i].astype(np.float32) if has_true else None
         wp = wf = owp = owf = None
         valid_p = valid_f = zero
@@ -664,10 +663,11 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
             a_p, a_f = 1.0, 0.0
         else:
             a_p, a_f = 0.0, 1.0
-        both = valid_p & valid_f
-        only_p = valid_p & ~valid_f
-        only_f = valid_f & ~valid_p
-        none = ~valid_p & ~valid_f                                    # true fallback region
+        none = ~valid_p & ~valid_f                                    # true fallback region (R[i].mask)
+        if _resgate is None or has_true:              # R12 review: these feed ONLY the hard blend
+            both = valid_p & valid_f                  # and the eval-time oracle -- the gated
+            only_p = valid_p & ~valid_f               # pipeline path (has_true=False) never reads
+            only_f = valid_f & ~valid_p               # them, so skip the dead full-HD mask work
         with PROF.time("blend"):
             if _resgate is not None:                     # R12-E1 SOFT reliability budget (opt-in)
                 wsum = np.zeros((h_hd, w_hd), np.float32)
@@ -686,6 +686,7 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
                 acc += (1.0 - wsum)[:, :, None] * perframe.astype(np.float32)  # remainder -> fresh
                 recon = np.clip(acc, 0, 255).astype(np.uint8)
             else:
+                recon_f32 = perframe.astype(np.float32)               # bicubic where neither valid
                 if wp is not None:
                     recon_f32[only_p] = wp.astype(np.float32)[only_p]
                 if wf is not None:
