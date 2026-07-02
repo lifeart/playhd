@@ -207,8 +207,12 @@ def make_synthetic(out_lr, w_lr=640, h_lr=360, scale=3, n=24, fps=30):
 # Decode LR frames + per-frame motion vectors
 # --------------------------------------------------------------------------- #
 def decode_lr_and_mvs(path, start_frame=0, max_frames=None):
-    """Decode LR frames + per-frame MVs in DISPLAY order. Optionally restrict to the
-    window [start_frame, start_frame+max_frames) of a long clip. Decoding still runs
+    """Decode LR frames + per-frame MVs in DISPLAY order, as 3-TUPLES (ptype, lr_rgb, mvs).
+    NOTE (R12): this prototype-eval decoder intentionally keeps the 3-tuple contract; the
+    server's stream_gops yields 4-TUPLES (..., qp). Shared consumers (reconstruct,
+    build_perframe_cache, backbone_indices) are index-based/len-guarded and accept both.
+    Optionally restrict to the window [start_frame, start_frame+max_frames) of a long clip.
+    Decoding still runs
     sequentially from frame 0 (the H.264 reference chain must be reconstructed), but
     frames before the window are decoded WITHOUT the expensive rgb24/MV conversion, and
     we stop as soon as the window is full -- so a window deep into a 50k-frame file is

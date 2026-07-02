@@ -24,6 +24,14 @@ path as beta=0.85 / deblock_pre). See experiments/r12_e1_residual_gate/REPORT.md
 READ-ONLY reuse of derisk primitives (build_lr_flow, warp_lr); derisk is NOT edited by import.
 The forward-backward round-trip term (use_fb) is intentionally NOT ported -- the recommended
 default is residual-only; a use_fb=True cfg is treated as residual-only here (documented).
+
+KNOWN CAVEAT (R12 review, accepted while default-OFF): unlike the hard path, whose occlusion
+mask includes the Ruder fwd-bwd round-trip term (occ_mode='full'/'adaptive'), the soft gate
+weighs warps by the LR residual + intra holes ONLY -- a fwd-bwd-detected occlusion whose LR
+residual is coincidentally small (revealed background matching the occluder at LR) keeps near-
+full warp weight where the hard path forced fresh SR. This is the mechanism behind the measured
++5.8% jelly tOF cost; the multi-clip sweep gating default-ON should decide residual-only vs
+re-adding fb (the experiment's gate_resfb variant) before any default flip.
 """
 import os
 import sys
@@ -51,9 +59,22 @@ def reliability_lr(fx, fy, lr_cur, lr_ref, cfg):
 
 def reliability_hd(mvs, lr_cur, lr_ref, want, w_hd, h_hd, cfg):
     """HD reliability map for one warp direction. Builds this direction's LR flow, forms the
-    LR reliability, and bilinear-upsamples to (w_hd, h_hd) -- the resize of the intra-hole zeros
-    feathers reliability toward 0 near holes/borders (matches the gated_recon soft path)."""
+    LR reliability, bilinear-upsamples to (w_hd, h_hd), then HARD-zeroes the intra-hole pixels
+    at HD -- exactly matching the measured gated_recon soft path (a_hd[hole] = 0.0). The hole
+    mask reproduces derisk.warp_hd's: hole = isnan(INTER_NEAREST-upsampled LR flow), so hole
+    pixels fall fully to fresh SR instead of keeping feathered (~0.3-0.5) trust in an un-warped
+    stale reference (R12 review: the feathered-only port was NOT the code that produced the
+    GATED-GO numbers).
+
+    PERF TODO (opt-in path only): this rebuilds build_lr_flow + one warp_lr that _warp_one just
+    computed for the same (mvs, direction); plumbing fx/fy/react through would roughly halve the
+    gated per-direction cost. Left as-is to keep the shipped math equal to the measured one."""
     h_lr, w_lr = lr_cur.shape[:2]
     fx, fy = derisk.build_lr_flow(mvs, h_lr, w_lr, want=want)
     a = reliability_lr(fx, fy, lr_cur, lr_ref, cfg)
-    return cv2.resize(a, (w_hd, h_hd), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    a_hd = cv2.resize(a, (w_hd, h_hd), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    # HD hole == derisk.warp_hd's hole: NaN of the NEAREST-upsampled flow == NEAREST-resized LR hole.
+    hole_hd = cv2.resize((~np.isfinite(fx)).astype(np.uint8), (w_hd, h_hd),
+                         interpolation=cv2.INTER_NEAREST).astype(bool)
+    a_hd[hole_hd] = 0.0                              # intra hole in HD -> fully fresh (gated_recon parity)
+    return a_hd

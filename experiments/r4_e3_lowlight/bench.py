@@ -148,7 +148,7 @@ def make_denoise_stream(denoise_fn):
 
     def wrapped(*args, **kw):
         for chunk in orig(*args, **kw):
-            yield [(pt, np.ascontiguousarray(denoise_fn(lr)), mvs) for (pt, lr, mvs) in chunk]
+            yield [(pt, np.ascontiguousarray(denoise_fn(lr)), mvs, *rest) for (pt, lr, mvs, *rest) in chunk]  # R12: 4-tuple-safe, preserves qp
     return wrapped
 
 
@@ -198,7 +198,7 @@ def char_fallback(clip_path, n, denoise_fn=None, occ_mode="reactive"):
     fr = []
     for chunk in P.stream_gops(clip_path, max_frames=n):
         if denoise_fn is not None:
-            chunk = [(pt, np.ascontiguousarray(denoise_fn(lr)), mvs) for (pt, lr, mvs) in chunk]
+            chunk = [(pt, np.ascontiguousarray(denoise_fn(lr)), mvs, *rest) for (pt, lr, mvs, *rest) in chunk]  # R12: 4-tuple-safe, preserves qp
         anchors, backbone = anchor_sr.anchor_indices(chunk)
         for i in range(len(chunk)):
             if i in anchors:
