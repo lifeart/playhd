@@ -75,5 +75,31 @@ def selfcheck():
     }
 
 
+# --------------------------------------------------------------------------- #
+# R12-E3 adoption: VMAF-NEG guardrail, re-exported so every harness that already
+# does `import metrics_extra` also gets MX.vmaf_neg / MX.vmaf_neg_single /
+# MX.vmaf_available alongside DISTS+LPIPS. Single source of truth stays in
+# experiments/r12_e3_quality_probes/vmaf_neg.py. USE AS A GUARDRAIL COLUMN ONLY
+# (anti-hallucination), never an optimisation target (VMAF-NEG is itself gameable).
+# --------------------------------------------------------------------------- #
+import os as _os, sys as _sys   # noqa: E402
+_VMAF_DIR = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                          "r12_e3_quality_probes")
+if _VMAF_DIR not in _sys.path:
+    _sys.path.insert(0, _VMAF_DIR)
+try:
+    from vmaf_neg import (vmaf_neg, vmaf_neg_single,          # noqa: E402,F401
+                          available as vmaf_available)
+except Exception as _e:   # loud (no silent swallow): the guardrail column is simply unavailable
+    _VMAF_IMPORT_ERR = _e
+    def vmaf_neg(*_a, **_k):
+        raise RuntimeError(f"vmaf_neg unavailable: {_VMAF_IMPORT_ERR!r}")
+    def vmaf_neg_single(*_a, **_k):
+        raise RuntimeError(f"vmaf_neg unavailable: {_VMAF_IMPORT_ERR!r}")
+    def vmaf_available():
+        return False
+
+
 if __name__ == "__main__":
     print("[selfcheck]", selfcheck())
+    print("[vmaf] available:", vmaf_available())

@@ -1,0 +1,103 @@
+R12-E2 PROPOSED integration of EXACT bitstream-QP gating for deblock_pre.
+DO NOT APPLY BLIND — this is the reviewed proposal the report references. It carries the
+exact per-frame QP (venc_params, method a) from the decoder to the deblock gate. Verified
+behaviour: gate SKIPS light (gated==off, avoids always-on's +31% LPIPS regression on CRF23)
+and FIRES on heavy (CRF40, gated beats off on LPIPS+DISTS). Three small, additive hunks.
+
+Design: carry the per-frame mean per-MB QP as tuple index [3] (I/P/B unchanged), which
+build_perframe_cache already reads (frames[i][3]). The ONLY blocker to a 4-tuple today is two
+rigid 3-tuple unpacks (derisk.scan_source_magnitude, pipeline _run_layered) -> star-unpack them.
+The deblock gate is recalibrated qp_min 30 -> 40 (R12-E2 crossover; see ab/analyze_ab.py).
+
+=============================================================================================
+--- a/server/pipeline_api.py     (stream_gops: also request venc_params, carry per-frame QP)
++++ b/server/pipeline_api.py
+@@ def stream_gops(path, max_frames=None, soft_cap=SOFT_CAP_FRAMES, detect_cuts=True):
+     cont = av.open(path)
+     try:
+         vs = cont.streams.video[0]
+-        vs.codec_context.options = {"flags2": "+export_mvs"}
++        # R12-E2: also export per-macroblock QP (venc_params). PyAV>=? exposes it as
++        # frame.side_data[VIDEO_ENC_PARAMS] with .qp_map() -> ndarray of absolute per-MB QP.
++        vs.codec_context.options = {"flags2": "+export_mvs",
++                                    "export_side_data": "venc_params"}
+         det = scene_detect.StreamingCutDetector() if detect_cuts else None
+         chunk = []
+         produced = 0
+         for frame in cont.decode(vs):
+             if max_frames is not None and produced >= max_frames:
+                 break
+             ptype = {1: "I", 2: "P", 3: "B"}.get(int(frame.pict_type), "?")
+             img = frame.to_ndarray(format="rgb24")
++            qp = _frame_qp_mean(frame)          # R12-E2 exact bitstream QP (None if absent)
+             is_cut = det.update(produced, ptype, img) if det is not None else False
+             if chunk and (ptype == "I" or is_cut
+                           or (len(chunk) >= soft_cap and ptype == "P")):
+                 yield chunk
+                 chunk = []
+             try:
+                 sd = frame.side_data.get(derisk.SDType.MOTION_VECTORS)
+             except Exception:
+                 sd = None
+             mvs = sd.to_ndarray() if sd is not None else None
+-            chunk.append((ptype, img, mvs))
++            chunk.append((ptype, img, mvs, qp))     # 4-tuple: QP at index [3]
+             produced += 1
+         if chunk:
+             yield chunk
+     finally:
+         cont.close()
+
+# NEW module-level helper in server/pipeline_api.py:
++_VENC_SD = getattr(getattr(av.sidedata, "sidedata", None), "Type", None)
++_VENC_SD = getattr(_VENC_SD, "VIDEO_ENC_PARAMS", None) if _VENC_SD else None
++def _frame_qp_mean(frame):
++    """Exact per-frame QP = mean of the decoder's absolute per-MB QP map (venc_params).
++    None when the codec/build exposes no venc_params (caller's gate then falls back to the
++    blockiness proxy). Cheap: one small ndarray reduce per decoded frame."""
++    if _VENC_SD is None:
++        return None
++    ep = frame.side_data.get(_VENC_SD)
++    if ep is None:
++        return None
++    try:
++        import numpy as _np
++        return float(_np.asarray(ep.qp_map()).mean())
++    except Exception:
++        try:
++            return float(ep.qp)          # slice base QP fallback
++        except Exception:
++            return None
+
+=============================================================================================
+--- a/prototype/derisk.py    (make the 3-tuple unpack tolerant of the QP 4th element)
++++ b/prototype/derisk.py
+@@ def scan_source_magnitude(frames):
+     mx, nbad = 0, 0
+-    for _, _, mvs in frames:
++    for _f in frames:            # R12-E2: tuple may carry QP at [3]; take mvs by index
++        mvs = _f[2]
+         if mvs is None or len(mvs) == 0:
+             continue
+# build_perframe_cache ALREADY reads `frames[i][3]` for qp -> no change needed there.
+# (Any other `for a, b, c in frames` over frame tuples must likewise become index-based.)
+
+=============================================================================================
+--- a/server/pipeline_api.py    (_run_layered: same tolerant unpack)
++++ b/server/pipeline_api.py
+@@ (in _run_layered, iterating a sub-chunk)
+-                    for (_ptype, img, _mvs) in sub:
++                    for _f in sub:                 # R12-E2: 4-tuple-safe
++                        img = _f[1]
+
+=============================================================================================
+--- a/server/pipeline_api.py    (MODE_CONFIG["quality"]["deblock_pre"]: recalibrated QP gate)
++++ b/server/pipeline_api.py
+@@ MODE_CONFIG quality:
+-                    deblock_pre=None,   # R10-E2 default-OFF: no reliable gate signal
++                    # R12-E2: exact bitstream QP makes the gate reliable. Enable as a
++                    # default-considerable GATED opt-in (self-restricts to heavy anchors):
++                    deblock_pre={"model": "scunet_color_real_psnr.pth",
++                                 "gate": "qp", "qp_min": 40},   # qp_mean crossover (R12-E2)
+                    # ...still None-safe: on a source with no venc_params, gate 'qp' with
+                    # qp=None falls through to the blockiness proxy (block_min=1.30).

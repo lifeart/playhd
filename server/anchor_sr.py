@@ -303,7 +303,7 @@ def _lr_fallback_mask(frames, i, backbone_idx, occ_mode):
     """Frame i's occlusion-fallback mask at LR (no HD warp). Mirrors the mask reconstruct()
     builds: non-anchor backbone P -> past occlusion; B leaf -> the `none` (past AND future
     occluded). Used for the backbone scan (fraction + tile bbox) and diagnostics."""
-    pt, lr, mvs = frames[i]
+    pt, lr, mvs = frames[i][:3]   # R12-E2: 4-tuple-safe (optional QP at [3] not used here)
     h_lr, w_lr = lr.shape[:2]
 
     def occ_dir(ref_i, want):
@@ -403,7 +403,7 @@ def _softocc_mean_mv(mvs, h_lr, w_lr):
 def _softocc_conf(frames, i, w_hd, h_hd):
     """HD confidence-to-use-SR in [0,1] from the reactive residual (the same signal
     occlusion_mask_lr's reactive term forms). P -> residual vs prev backbone; B/no-MV -> ones."""
-    pt, lr_cur, mvs = frames[i]
+    pt, lr_cur, mvs = frames[i][:3]   # R12-E2: 4-tuple-safe (optional QP at [3] not used here)
     h_lr, w_lr = lr_cur.shape[:2]
     prev_bb = max([b for b in derisk.backbone_indices(frames) if b < i], default=None)
     if pt != "P" or prev_bb is None or mvs is None or len(mvs) == 0:
@@ -435,7 +435,7 @@ def softocc_patch(frames, R, w_hd, h_hd, sr_mode, *, anchors, backbone, reset_id
     for i in range(len(frames)):
         if i in reset_idx:
             ema = None
-        pt, lr_cur, mvs = frames[i]
+        pt, lr_cur, mvs = frames[i][:3]   # R12-E2: 4-tuple-safe (optional QP at [3] not used here)
         is_anchor = i in anchors or R[i].get("mask") is None
         run = is_anchor or motion_gate is None or _softocc_mean_mv(mvs, h_lr, w_lr) > motion_gate
         if run:

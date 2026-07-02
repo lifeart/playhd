@@ -63,24 +63,19 @@
       <label style="display:flex;align-items:center;gap:8px;color:var(--mut);font-size:12px;white-space:nowrap">SR every
         <input id="cad" type="range" min="1" max="16" value="1" style="width:120px;accent-color:var(--acc)">
         <span id="cadv" style="font:600 12px/1 ui-monospace,monospace;color:var(--fg);min-width:96px">frame · pure SR</span></label>
-      <label style="display:flex;align-items:center;gap:6px;color:var(--mut);font-size:12px;white-space:nowrap">model
-        <select id="model" style="background:#1a1a1a;color:var(--fg);border:1px solid #333;border-radius:6px;padding:3px 6px;font:12px ui-monospace,monospace">
-          <option value="span">SPAN · live-action / faces</option>
-          <option value="compact">compact · general / texture</option>
-        </select></label>
       <span id="ftag" class="tag a">anchor</span>
       <div class="meta" id="meta"></div>
     </div>
     <div id="status"></div>
     <audio id="aud" hidden></audio>
     <div id="credits" style="margin-top:10px;color:var(--mut);font-size:11px;line-height:1.6">
-      <b>Non-commercial research demo.</b> Models: <b>SPAN 2xLiveActionV1</b> © jcj83429 —
-      <a href="https://openmodeldb.info/models/2x-LiveActionV1-SPAN" style="color:var(--acc)">CC-BY-NC-SA-4.0</a> ·
-      <b>realesr-general-x4v3</b> (compact) — <a href="https://github.com/xinntao/Real-ESRGAN" style="color:var(--acc)">Real-ESRGAN, BSD-3</a>.
+      <b>Research demo.</b> Model: <b>realesr-general-x4v3</b> (compact) —
+      <a href="https://github.com/xinntao/Real-ESRGAN" style="color:var(--acc)">Real-ESRGAN, BSD-3</a>.
       Decoder: <a href="https://ffmpeg.org" style="color:var(--acc)">FFmpeg (LGPL)</a> → WASM.
       Demo clip: <a href="https://peach.blender.org" style="color:var(--acc)">Big Buck Bunny</a> © Blender Foundation (CC-BY 3.0).
       Code: <a href="https://github.com/lifeart/playhd" style="color:var(--acc)">github.com/lifeart/playhd</a> (MIT) ·
-      assets: <a href="https://huggingface.co/datasets/lifeart/playhd-web-assets" style="color:var(--acc)">🤗 HF</a>.
+      assets: <a href="https://huggingface.co/datasets/lifeart/playhd-web-assets" style="color:var(--acc)">🤗 HF</a>
+      (permissive: BSD-3 model · LGPL decoder · CC-BY clip).
     </div>
   </div>
 </div>
@@ -88,13 +83,13 @@
 <script type="module">
 import createDecoder from "./mv_decode.mjs";
 import { buildLrFlow } from "./flow.js";
-import { initSpanGPUFast, makeSpanRunner } from "../webgpu_warp/span_driver_fast.js";   // SPAN anchor SR (codec-trained, beats compact on LPIPS+DISTS)
-let curModel = "span";   // anchor model: "span" (native 2×, live-action) | "compact" (realesr-general 4×). Runtime selector.
+// Anchor SR: realesr-general-x4v3 ("compact", BSD-3) — the only commercial-clean model ported to WGSL.
+// (The non-commercial SPAN 2xLiveActionV1 path was dropped from the shipped demo — still in git history.)
 // On GitHub Pages the heavy/licensed assets (WASM decoder + model weights + demo clip) are served from a
 // HuggingFace dataset (CORS-enabled). Locally they sit beside the page. See README for licenses/attribution.
 const ON_PAGES = location.hostname.endsWith("github.io");
 const HF = "https://huggingface.co/datasets/lifeart/playhd-web-assets/resolve/main/";
-const ABASE = ON_PAGES ? HF : "../";                         // data-asset base (span_data/, compact_data/) — NB: Player() has a local `A` buffer, don't collide
+const ABASE = ON_PAGES ? HF : "../";                         // data-asset base (compact_data/) — NB: Player() has a local `A` buffer, don't collide
 const DEMO_CLIP = ON_PAGES ? HF+"clips/BigBuckBunny_640x360_10s_CC-BY.mp4" : "sd600.mp4";
 const $=s=>document.querySelector(s);
 const status=(m)=>{$("#status").textContent=m;};
@@ -120,7 +115,7 @@ let app=null;   // the running player
 async function load(f){
   status(`reading ${f.name} (${(f.size/1e6).toFixed(1)} MB)…`);
   $("#drop").style.display="none"; $("#stage").style.display="none"; $("#loading").style.display="flex";   // show the spinner during init
-  prog("Reading "+f.name+"…", 8, (f.size/1e6).toFixed(1)+" MB"+(ON_PAGES?" · first load also fetches the models (~10 MB, one-time)":""));
+  prog("Reading "+f.name+"…", 8, (f.size/1e6).toFixed(1)+" MB"+(ON_PAGES?" · first load also fetches the model (~4.6 MB, one-time)":""));
   try{ const a=$("#aud"); a.src=URL.createObjectURL(f); a.load(); }catch(e){ console.debug("audio track unavailable (non-fatal):", e); }   // audio playback, synced to the displayed frame
   const buf=new Uint8Array(await f.arrayBuffer());
   if(app) app.stop();
@@ -145,7 +140,7 @@ async function Player(fileBytes){
   // SR INPUT resolution = output/MS. For 2× output that's source/2 -> the conv runs on 1/4 the pixels
   // (4× faster) instead of the wasteful "SR full 4× then downscale". srW*MS == the 2× output, exactly.
   const srW=Math.max(8,Math.round(w*scale/MS)), srH=Math.max(8,Math.round(h*scale/MS));
-  const WD=srW*MS, HD=srH*MS, plane=w*h, plane_sr=srW*srH, FC=64;   // WD==2w, HD==2h (== SPAN's OW/OH) for even w/h — guaranteed by H.264 4:2:0
+  const WD=srW*MS, HD=srH*MS, plane_sr=srW*srH, FC=64;   // WD==2w, HD==2h for even w/h — guaranteed by H.264 4:2:0
   if(!w||!h) throw new Error("no video stream.");
 
   // GPU
@@ -154,27 +149,12 @@ async function Player(fileBytes){
   const f16 = adapter.features.has("shader-f16");
   const dev=await adapter.requestDevice({requiredFeatures: f16?["shader-f16"]:[]});
   const F16=self.Float16Array; const packW=(f32)=> f16 ? new Uint16Array(new F16(f32).buffer) : f32; const EB=f16?2:4;
-  // SPAN anchor (native 2× -> runs on the FULL source; output (2w×2h) == the player's HD texture)
-  let spanRun=null, p2tPipe=null, p2tBg=null;
-  prog(ON_PAGES?"Downloading SR model… (~1.6 MB)":"Loading SR model…", 55);
-  { const spanSpec=await (await fetch(ABASE+"span_data/spec.json")).json();   // always init SPAN + compact; selector picks at runtime
-    const spanW=new Float32Array(await (await fetch(ABASE+"span_data/weights.bin")).arrayBuffer());
-    prog("Compiling shaders…", 75);
-    const spanG=await initSpanGPUFast(dev, spanW, {...spanSpec, H:h, W:w}, f16, {OCB:48});
-    spanRun=makeSpanRunner(spanG);   // PERSISTENT (buffers+ops once) — no per-frame alloc/leak
-    // SPAN OUT (planar 3×OH×OW) -> rgba8 HD texture (GPU, no readback)
-    const fT2=f16?"f16":"f32";
-    const p2tMod=dev.createShaderModule({code:`${f16?"enable f16;":""}@group(0)@binding(0) var<storage,read> buf:array<${fT2}>;@group(0)@binding(1) var<uniform> d:vec4u;
-      @vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f{var p=array<vec2f,3>(vec2f(-1,-1),vec2f(3,-1),vec2f(-1,3));return vec4f(p[i],0,1);}
-      @fragment fn fs(@builtin(position) pos:vec4f)->@location(0) vec4f{let x=u32(pos.x);let y=u32(pos.y);let i=y*d.x+x;let pl=d.x*d.y;
-        return vec4f(f32(buf[i]),f32(buf[pl+i]),f32(buf[2u*pl+i]),1.0);}`});
-    p2tPipe=dev.createRenderPipeline({layout:"auto",vertex:{module:p2tMod,entryPoint:"vs"},fragment:{module:p2tMod,entryPoint:"fs",targets:[{format:"rgba8unorm"}]},primitive:{topology:"triangle-list"}});
-    const p2tU=dev.createBuffer({size:16,usage:GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST});dev.queue.writeBuffer(p2tU,0,new Uint32Array([spanRun.OW,spanRun.OH,0,0]));
-    p2tBg=dev.createBindGroup({layout:p2tPipe.getBindGroupLayout(0),entries:[{binding:0,resource:{buffer:spanRun.OUT}},{binding:1,resource:{buffer:p2tU}}]}); }
+  // compact anchor SR (realesr-general-x4v3, BSD-3) — the sole, commercial-clean anchor model.
   // SR weights + kernel (combo f16 / wtile f32)
-  prog(ON_PAGES?"Loading compact model… (~4.6 MB)":"Loading compact model…", 90);
+  prog(ON_PAGES?"Downloading SR model… (~4.6 MB)":"Loading SR model…", 55);
   const wf=new Float32Array(await (await fetch(ABASE+"compact_data/weights.bin")).arrayBuffer());
   const layers=(await (await fetch(ABASE+"compact_data/layers.json")).json()).layers;
+  prog("Compiling shaders…", 80);
   const Wg=dev.createBuffer({size:packW(wf).byteLength,usage:GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST}); dev.queue.writeBuffer(Wg,0,packW(wf));
   const convCode=await (await fetch(`../webgpu_warp/${f16?"combo":"wtile"}.wgsl`)).text();
   const OCB=f16?64:32, TILE=16;
@@ -237,17 +217,6 @@ async function Player(fileBytes){
   function uploadLR(){ const n=w*h; const rgba=new Uint8Array(n*4); const src=Dec.HEAPU8; const p=dRgb(); for(let i=0,j=0,k=p;i<n;i++){rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=src[k++];rgba[j++]=255;}
     dev.queue.writeTexture({texture:lrCur},rgba,{bytesPerRow:w*4,rowsPerImage:h},[w,h]); return rgba; }
   const FAC=Math.max(1,Math.round(w/srW));   // source -> SR-input box-downscale factor (2 for 2× output, 1 for 4×)
-  // SPAN anchor: run the SPAN graph on the FULL source -> 2× RGB -> write into the HD texture (dims match).
-  const spanLP=new Float32Array(3*plane);
-  function srAnchorSpan(dst){   // SPAN on the full source -> OUT(planar) -> dst HD texture, ALL GPU (no readback/sync/CPU-convert)
-    const src=Dec.HEAPU8, p=dRgb();
-    for(let y=0;y<h;y++)for(let x=0;x<w;x++){const o=p+(y*w+x)*3,b=y*w+x;spanLP[b]=src[o]/255;spanLP[plane+b]=src[o+1]/255;spanLP[2*plane+b]=src[o+2]/255;}
-    dev.queue.writeBuffer(spanRun.IN,0,packW(spanLP));
-    const e=dev.createCommandEncoder();
-    spanRun.recordInto(e);   // SPAN graph -> spanRun.OUT (planar)
-    const rp=e.beginRenderPass({colorAttachments:[{view:dst.createView(),loadOp:"clear",storeOp:"store",clearValue:{r:0,g:0,b:0,a:1}}]});rp.setPipeline(p2tPipe);rp.setBindGroup(0,p2tBg);rp.draw(3);rp.end();
-    dev.queue.submit([e.finish()]);
-  }
   function srAnchor(dst){ // box-downscale source -> srIn, conv at srIn, pixelshuffle 4× straight to the output
     const lp=new Float32Array(3*plane_sr); const src=Dec.HEAPU8; const p=dRgb(); const inv=1/(FAC*FAC*255);
     for(let sy=0;sy<srH;sy++)for(let sx=0;sx<srW;sx++){ let r=0,g=0,b=0;
@@ -283,10 +252,10 @@ async function Player(fileBytes){
     // anchor (GPU super-res) on I-frames (no MVs) and every REANCHOR-th frame; propagate the rest by MV-warp
     const isAnchor = dNmv()===0 || (fi % REANCHOR === 0);
     const t=performance.now();
-    if(isAnchor){ if(curModel==="span") await srAnchorSpan(freeHD); else srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
+    if(isAnchor){ srAnchor(freeHD); [prevHD,freeHD]=[freeHD,prevHD]; anchors++; srMsAvg=srMsAvg?srMsAvg*0.8+(performance.now()-t)*0.2:(performance.now()-t); }
     else { warp(prevHD,freeHD); [prevHD,freeHD]=[freeHD,prevHD]; warps++; }
     present(prevHD);
-    $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?("anchor · "+(curModel==="span"?"SPAN":"compact")+" SR"):"propagated · codec MV-warp";
+    $("#ftag").className="tag "+(isAnchor?"a":"w"); $("#ftag").textContent=isAnchor?"anchor · compact SR":"propagated · codec MV-warp";
     $("#meta").innerHTML=`${w}×${h} → ${WD}×${HD} · source ${fps.toFixed(0)} fps<br>frame ${fi} · ${(100*anchors/Math.max(1,anchors+warps)).toFixed(0)}% SR anchors · playing ~${realFps.toFixed(0)} fps · ${f16?"fp16":"fp32"}`;
     fi++;
     // keep audio on the DISPLAYED frame (the loop runs at the upscaler's pace, not necessarily real-time)
@@ -309,7 +278,6 @@ async function Player(fileBytes){
   $("#restart").onclick=()=>{rebuildDecoder();fi=0;anchors=warps=0;aud.currentTime=0;};
   const cadLabel=()=>$("#cadv").textContent = REANCHOR===1 ? "frame · pure SR" : REANCHOR+" frames";
   $("#cad").oninput=e=>{REANCHOR=+e.target.value;cadLabel();}; cadLabel();
-  $("#model").value=curModel; $("#model").onchange=e=>{curModel=e.target.value;};   // SPAN ↔ compact at runtime (R11: SPAN wins faces, compact wins texture)
 
   // headless test hooks (rAF pauses in background tabs; these let us exercise the chain directly)
   window.__stepN=async(n)=>{ for(let i=0;i<n;i++) await step(); return {fi,anchors,warps}; };

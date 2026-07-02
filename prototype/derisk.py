@@ -207,8 +207,12 @@ def make_synthetic(out_lr, w_lr=640, h_lr=360, scale=3, n=24, fps=30):
 # Decode LR frames + per-frame motion vectors
 # --------------------------------------------------------------------------- #
 def decode_lr_and_mvs(path, start_frame=0, max_frames=None):
-    """Decode LR frames + per-frame MVs in DISPLAY order. Optionally restrict to the
-    window [start_frame, start_frame+max_frames) of a long clip. Decoding still runs
+    """Decode LR frames + per-frame MVs in DISPLAY order, as 3-TUPLES (ptype, lr_rgb, mvs).
+    NOTE (R12): this prototype-eval decoder intentionally keeps the 3-tuple contract; the
+    server's stream_gops yields 4-TUPLES (..., qp). Shared consumers (reconstruct,
+    build_perframe_cache, backbone_indices) are index-based/len-guarded and accept both.
+    Optionally restrict to the window [start_frame, start_frame+max_frames) of a long clip.
+    Decoding still runs
     sequentially from frame 0 (the H.264 reference chain must be reconstructed), but
     frames before the window are decoded WITHOUT the expensive rgb24/MV conversion, and
     we stop as soon as the window is full -- so a window deep into a 50k-frame file is
@@ -406,7 +410,7 @@ def scan_source_magnitude(frames):
     codec MV references the nearest past/future reference picture, so display-order-neighbor
     resolution is exact; |source|>1 would mean multi-ref (needs real DPB/POC parsing)."""
     mx, nbad = 0, 0
-    for _, _, mvs in frames:
+    for _pt, _lr, mvs, *_ in frames:            # R12-E2: tolerate the optional QP 4th element
         if mvs is None or len(mvs) == 0:
             continue
         a = np.abs(mvs["source"].astype(int))
@@ -507,7 +511,7 @@ def build_perframe_cache(frames, w_hd, h_hd, sr_mode, half=False, deblock_cfg=No
 
 def backbone_indices(frames):
     """Display-order indices of the I/P reference backbone (B-frames are leaves, never refs)."""
-    return [i for i, (pt, _, _) in enumerate(frames) if pt in ("I", "P")]
+    return [i for i, f in enumerate(frames) if f[0] in ("I", "P")]   # R12-E2: 4-tuple-safe
 
 
 def _apply_region_gate_np(R, N, region_gate, scale):
@@ -548,7 +552,8 @@ def blend_anchor_cache(heavy_cache, compact_cache, beta):
 
 
 def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache, anchor_set,
-                backend="numpy", collect_metrics=True, download_output=True, region_gate=None):
+                backend="numpy", collect_metrics=True, download_output=True, region_gate=None,
+                residual_gate=None):
     """Pure backbone+B reconstruction for an arbitrary ANCHOR SET (Step 4 re-anchoring).
 
     `backend`: 'numpy' (default, the regression guard) or 'torch' (the MPS fast path -- the
@@ -570,10 +575,18 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
     NO SR is run here (uses perframe_cache) -> the anchor sweep is warp/blend only. Returns
     (rows, R). References resolved by display-order neighbor (exact because |source|==1)."""
     MASK_FIRES[0] = MASK_FIRES[1] = 0
-    if backend == "torch":
+    # R12-E1 residual reliability gate (default OFF). When enabled it replaces the HARD per-pixel
+    # occlusion fallback (recon[occ]=perframe[occ]) with a SOFT residual-reliability lerp. The gate
+    # is the numpy path (the measured, parity-verified locus), so an enabled gate runs numpy even
+    # under backend='torch'. residual_gate=None => the torch fast path is chosen unchanged
+    # (byte-identical default). GPU port of the soft lerp is a follow-up.
+    if backend == "torch" and residual_gate is None:
         return reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode,
                                  perframe_cache, anchor_set, collect_metrics=collect_metrics,
                                  download_output=download_output, region_gate=region_gate)
+    _resgate = None
+    if residual_gate is not None:
+        import residual_gate as _resgate   # prototype module, READ-ONLY reuse of derisk primitives
     h_lr, w_lr = frames[0][1].shape[:2]
     w_hd, h_hd = w_lr * scale, h_lr * scale
     has_true = hd_frames is not None
@@ -591,7 +604,7 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
 
     # ----------------- PASS 1: I/P reference backbone (forward chain) -----------------
     for i in backbone_idx:
-        pt, lr, mvs = frames[i]
+        pt, lr, mvs = frames[i][:3]   # R12-E2: 4-tuple-safe (optional QP at [3] not used here)
         PROF.ftype, PROF.fidx = pt, i
         perframe = perframe_cache[i]
         p = prev_ip(i)
@@ -608,9 +621,16 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
             R[p]["recon"], R[p]["oracle"], lr, frames[p][1], mvs, "past",
             scale, use_residual, occ_mode, w_hd, h_hd)
         with PROF.time("blend"):
-            recon[occ] = perframe[occ]                   # fallback: re-run SR
+            if _resgate is not None:                     # R12-E1 SOFT reliability gate (opt-in)
+                a = _resgate.reliability_hd(mvs, lr, frames[p][1], "past",
+                                            w_hd, h_hd, residual_gate)[:, :, None]
+                recon = np.clip(a * recon.astype(np.float32)
+                                + (1.0 - a) * perframe.astype(np.float32),
+                                0, 255).astype(np.uint8)
+            else:
+                recon[occ] = perframe[occ]               # HARD fallback: re-run SR (default/shipping)
             if has_true:
-                oracle[occ] = hd_frames[i][occ]          # fallback: re-run SR (oracle=perfect)
+                oracle[occ] = hd_frames[i][occ]          # oracle (eval-only) keeps the hard fallback
         R[i] = dict(recon=recon, oracle=oracle, perframe=perframe, mask=occ,
                     hole_frac=float(occ.mean()), dist=R[p]["dist"] + 1, type=pt, is_anchor=False)
 
@@ -619,7 +639,7 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
     for i in range(N):
         if frames[i][0] != "B":
             continue
-        pt, lr, mvs = frames[i]
+        pt, lr, mvs = frames[i][:3]   # R12-E2: 4-tuple-safe (optional QP at [3] not used here)
         PROF.ftype, PROF.fidx = "B", i
         perframe = perframe_cache[i]
         p, f = prev_ip(i), next_ip(i)
@@ -649,13 +669,30 @@ def reconstruct(frames, hd_frames, scale, use_residual, occ_mode, perframe_cache
         only_f = valid_f & ~valid_p
         none = ~valid_p & ~valid_f                                    # true fallback region
         with PROF.time("blend"):
-            if wp is not None:
-                recon_f32[only_p] = wp.astype(np.float32)[only_p]
-            if wf is not None:
-                recon_f32[only_f] = wf.astype(np.float32)[only_f]
-            if wp is not None and wf is not None:
-                recon_f32[both] = (a_p * wp.astype(np.float32) + a_f * wf.astype(np.float32))[both]
-            recon = np.clip(recon_f32, 0, 255).astype(np.uint8)
+            if _resgate is not None:                     # R12-E1 SOFT reliability budget (opt-in)
+                wsum = np.zeros((h_hd, w_hd), np.float32)
+                acc = np.zeros((h_hd, w_hd, 3), np.float32)
+                if wp is not None:
+                    rp = _resgate.reliability_hd(mvs, lr, frames[p][1], "past",
+                                                 w_hd, h_hd, residual_gate)
+                    w_pg = (a_p * rp).astype(np.float32)
+                    acc += w_pg[:, :, None] * wp.astype(np.float32); wsum += w_pg
+                if wf is not None:
+                    rf = _resgate.reliability_hd(mvs, lr, frames[f][1], "future",
+                                                 w_hd, h_hd, residual_gate)
+                    w_fg = (a_f * rf).astype(np.float32)
+                    acc += w_fg[:, :, None] * wf.astype(np.float32); wsum += w_fg
+                wsum = np.clip(wsum, 0.0, 1.0)            # reliability budget in [0,1]
+                acc += (1.0 - wsum)[:, :, None] * perframe.astype(np.float32)  # remainder -> fresh
+                recon = np.clip(acc, 0, 255).astype(np.uint8)
+            else:
+                if wp is not None:
+                    recon_f32[only_p] = wp.astype(np.float32)[only_p]
+                if wf is not None:
+                    recon_f32[only_f] = wf.astype(np.float32)[only_f]
+                if wp is not None and wf is not None:
+                    recon_f32[both] = (a_p * wp.astype(np.float32) + a_f * wf.astype(np.float32))[both]
+                recon = np.clip(recon_f32, 0, 255).astype(np.uint8)
         oracle = None
         if has_true:
             if owp is not None:
@@ -740,7 +777,7 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
 
     def warp_one_t(ref_recon, ref_oracle, i, ref_i, want):
         """On-device twin of _warp_one: warp ONE reference by `want` MVs, +residual, +mask."""
-        _, _, mvs = frames[i]
+        mvs = frames[i][2]            # R12-E2: 4-tuple-safe (index, no rigid unpack)
         with PROF.time("build_flow"):
             fx_np, fy_np = build_lr_flow(mvs, h_lr, w_lr, want=want)
             fx, fy = G.flow_to_dev(fx_np, fy_np)
@@ -768,7 +805,7 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
 
     # ----------------- PASS 1: I/P reference backbone (on GPU, resident chain) -----------------
     for i in backbone_idx:
-        pt, lr, mvs = frames[i]
+        pt, lr, mvs = frames[i][:3]   # R12-E2: 4-tuple-safe (optional QP at [3] not used here)
         PROF.ftype, PROF.fidx = pt, i
         p = prev_ip(i)
         is_anchor = (pt == "I") or (p is None) or (i in anchor_set)
@@ -793,7 +830,7 @@ def reconstruct_torch(frames, hd_frames, scale, use_residual, occ_mode, perframe
     for i in range(N):
         if frames[i][0] != "B":
             continue
-        pt, lr, mvs = frames[i]
+        pt, lr, mvs = frames[i][:3]   # R12-E2: 4-tuple-safe (optional QP at [3] not used here)
         PROF.ftype, PROF.fidx = "B", i
         p, f = prev_ip(i), next_ip(i)
         with PROF.time("upload_perframe"):
