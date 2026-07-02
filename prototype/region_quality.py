@@ -111,7 +111,7 @@ def region_masks(frames, h_lr, w_lr, pct_static, pct_dynamic):
     report the actual mean motion inside each so the separation is shown to be real, not a slice."""
     acc = np.zeros((h_lr, w_lr), np.float64)
     cnt = np.zeros((h_lr, w_lr), np.float64)
-    for (pt, _, mvs) in frames:
+    for pt, _lr, mvs, *_ in frames:            # R12-E2: tolerate the optional QP 4th element
         if pt == "I" or mvs is None or len(mvs) == 0:
             continue
         mag, no_mv = motion_mag_lr(mvs, h_lr, w_lr, want="all")

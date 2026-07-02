@@ -84,8 +84,8 @@ verification: [`web_spike/wasm_mv/README.md`](web_spike/wasm_mv/README.md),
                          │ anchor?            │ non-anchor
                    ┌─────▼─────┐        ┌─────▼──────────────────────┐
                    │ GPU SR    │        │ MV → dense flow (flow.js)  │
-                   │ (SPAN /   │        │ → WebGPU warp prev frame   │
-                   │  compact) │        │ + reactive occlusion fill  │
+                   │ (compact  │        │ → WebGPU warp prev frame   │
+                   │  BSD-3)   │        │ + reactive occlusion fill  │
                    └─────┬─────┘        └─────┬──────────────────────┘
                          └────────┬───────────┘
                                   ▼
@@ -98,10 +98,12 @@ verification: [`web_spike/wasm_mv/README.md`](web_spike/wasm_mv/README.md),
   reconstructs it at **mean\|Δ\|=0.49 code values** over covered pixels (visually exact).
 - **Occlusion fallback** — a reactive mask falls back to the current LR frame where the warp has holes (disocclusion).
 
-The SR models are **hand-ported to WGSL** — no ONNX runtime, no tfjs. The SPAN graph
-(Conv3XC → 6×SPAB → conv_cat → pixel-shuffle) is **bit-faithful to PyTorch**: f32 mean\|Δ\|=1.46e-7,
-**f16 mean\|Δ\|=6.17e-4**. The hot 3×3 conv is occupancy-bound (Winograd *lost* 2.9×, layer-fusion *lost*
-13.7×); the measured optimum is the tiled register-blocked kernel at **OCB=48**.
+The SR models are **hand-ported to WGSL** — no ONNX runtime, no tfjs. The port is **bit-faithful to
+PyTorch** (SPAN graph Conv3XC → 6×SPAB → conv_cat → pixel-shuffle: f32 mean\|Δ\|=1.46e-7,
+**f16 mean\|Δ\|=6.17e-4**). The hot 3×3 conv is occupancy-bound (Winograd *lost* 2.9×, layer-fusion *lost*
+13.7×); the measured optimum is the tiled register-blocked kernel at **OCB=48**. The **shipped demo runs the
+permissive `compact` port** (realesr-general-x4v3, BSD-3); the SPAN port stays in the repo for the eval below
+and local use.
 
 ---
 
@@ -139,14 +141,18 @@ SPAN vs compact, per window (Δ = SPAN − compact; **negative = SPAN better**):
 | texture / heavy | +0.0629 | +0.0516 | compact |
 
 **Takeaway:** SPAN is a *content-dependent live-action specialist* — it wins talking-head faces by ~20%
-LPIPS at both compression levels, and loses on texture and high-motion. The player ships SPAN as default
-(the target content is talking-head video) and exposes a **runtime model selector** for the rest.
+LPIPS at both compression levels, and loses on texture and high-motion. **The shipped demo runs only the
+permissive `compact` model (BSD-3).** SPAN (CC-BY-NC-SA-4.0) was dropped from the public player so the demo
+is commercially usable — compact wins overall on LPIPS/DISTS anyway (table above); the talking-head edge is
+the accepted cost. The SPAN WGSL port remains in git history for local, non-commercial use.
 
 ### Performance ladder
 
-SPAN is native ×2, so a ×2 output runs on the full source (640×320 → 1280×640) — **~165–183 ms/anchor**,
-i.e. pure per-frame SR ≈ **6 fps**. Real time comes from **propagation** — the "SR every N frames" knob
-warps more frames between sharp anchors (640×320→1280×640; live GPU-synced one-off measurement):
+This ladder was measured with the SPAN anchor (native ×2, so a ×2 output runs on the full source,
+640×320 → 1280×640) — **~165–183 ms/anchor**, i.e. pure per-frame SR ≈ **6 fps**. The shipped `compact`
+anchor is a lighter net (see the crop-latency column above: 21 ms vs SPAN's 84 ms), so it's at least as
+fast. Real time comes from **propagation** — the "SR every N frames" knob warps more frames between sharp
+anchors (640×320→1280×640; live GPU-synced one-off measurement):
 
 | SR every N | ms/frame | fps | |
 |---:|---:|---:|---|
@@ -155,7 +161,7 @@ warps more frames between sharp anchors (640×320→1280×640; live GPU-synced o
 | **4** | **43** | **23** | real-time, still clean |
 | 8 | 21 | 48 | |
 
-Aggressive propagation doesn't smear here because the anchors are sharp and codec-faithful (SPAN) and the
+Aggressive propagation doesn't smear here because the anchors are sharp and codec-faithful and the
 inter-anchor chains are short.
 
 ---
@@ -190,13 +196,13 @@ cd web_spike && python3 -m http.server 8767
 ```
 
 Drag the divider to compare playhd vs bicubic; the **"SR every N"** slider trades quality for speed
-(propagation); the **model dropdown** switches SPAN ↔ compact. You can also **open your own clip** via a
-CORS-enabled URL: `?clip=<https-url>`.
+(propagation). The anchor SR is the permissive **`compact`** model (BSD-3). You can also **open your own
+clip** via a CORS-enabled URL: `?clip=<https-url>`.
 
 ### Get an openly-licensed test clip
 
-No clip is bundled (the dev clips are copyrighted). Any short H.264 SD `.mp4` works; SPAN favours
-live-action / faces. Open options:
+No clip is bundled (the dev clips are copyrighted). Any short H.264 SD `.mp4` works (live-action / faces
+upscale best). Open options:
 
 - **Big Buck Bunny** — CC-BY 3.0 (Blender Foundation). Small SD/H.264 clips: <https://test-videos.co.uk/bigbuckbunny/mp4-h264>
 - **Blender open movies** (Sintel, Tears of Steel, …) — CC-BY: <https://studio.blender.org/films/>
@@ -208,22 +214,29 @@ live-action / faces. Open options:
 This **git repo** holds only the **MIT application code** — no weights, no clips, no compiled WASM. The
 **live demo's runtime assets** are hosted separately on a HuggingFace dataset and fetched at runtime
 (CORS-enabled): **🤗 [lifeart/playhd-web-assets](https://huggingface.co/datasets/lifeart/playhd-web-assets)**.
-Each asset keeps its own license:
+Every asset the shipped demo fetches is **permissively licensed** (BSD-3 / LGPL / CC-BY) — each keeps its
+own license:
 
 | asset | license | source / credit |
 |---|---|---|
-| SPAN `2xLiveActionV1` weights | **CC-BY-NC-SA-4.0** (non-commercial) | jcj83429 · [OpenModelDB](https://openmodeldb.info/models/2x-LiveActionV1-SPAN) |
-| `realesr-general-x4v3` ("compact") weights | **BSD-3-Clause** | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (Xintao Wang et al.) |
+| `realesr-general-x4v3` ("compact") weights — the anchor SR | **BSD-3-Clause** | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) (Xintao Wang et al.) |
 | `mv_decode.wasm` (FFmpeg→WASM decoder) | **LGPL-2.1+** | [FFmpeg](https://ffmpeg.org); build recipe: `web_spike/wasm_mv/build_ffmpeg_wasm.sh` |
 | demo clip | **CC-BY 3.0** | Big Buck Bunny © [Blender Foundation](https://peach.blender.org) |
 
-Because it bundles a CC-BY-NC-SA model, the **demo as a whole is non-commercial**. To run locally instead,
-obtain the model weights from their sources and regenerate the runtime data with the `export_*` scripts in
-`web_spike/`, then serve `web_spike/` (the player falls back to sibling files when not on `*.github.io`).
+> **Dropped from the shipped demo (commercial-licensing decision):** the SPAN `2xLiveActionV1` weights
+> (**CC-BY-NC-SA-4.0**, non-commercial — jcj83429 · [OpenModelDB](https://openmodeldb.info/models/2x-LiveActionV1-SPAN)).
+> SPAN wins talking-head faces (§3), but its non-commercial license would taint the whole demo, so the
+> public player now runs the permissive `compact` model only. The SPAN WGSL port is still in git history and
+> can be re-enabled locally for non-commercial use.
+
+Because every fetched asset is BSD-3 / LGPL / CC-BY, **the demo as a whole is commercially usable**. To run
+locally instead, obtain the compact model weights from their source and regenerate the runtime data with the
+`export_*` scripts in `web_spike/`, then serve `web_spike/` (the player falls back to sibling files when not
+on `*.github.io`).
 
 **License.** Original code in this repo: **MIT** (see [`LICENSE`](LICENSE)). The third-party runtime assets
 (model weights, WASM decoder, demo clip) are **not** covered by it — each keeps its own license (table
-above), and because one of them (SPAN) is CC-BY-NC-SA-4.0, **the hosted demo is non-commercial**.
+above); all of them are permissive (BSD-3 / LGPL / CC-BY), so **the hosted demo is commercially usable**.
 
 ---
 

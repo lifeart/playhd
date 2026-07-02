@@ -93,7 +93,7 @@ def characterize(clip_path, n):
         n_chunks += 1
         anchors, backbone = anchor_sr.anchor_indices(chunk)
         h_lr, w_lr = chunk[0][1].shape[:2]
-        for i, (pt, lr, mvs) in enumerate(chunk):
+        for i, (pt, lr, mvs, *_) in enumerate(chunk):   # R12: stream_gops yields 4-tuples (qp at [3])
             ptypes.append(pt)
             # edge density (Canny on luma) -> graphic/sharp-edge signal
             g = cv2.cvtColor(lr, cv2.COLOR_RGB2GRAY)
