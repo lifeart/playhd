@@ -228,16 +228,16 @@ the fixed global β=0.85 anchor blend — it is not a re-run of R9-E1's refuted 
 | **`ema_adapt_50` (M2)** | 1.020 | +0.205 | -20.5% | 0.0029 | -12.1% | 0.0375 | -0.8% | 0.0423 | -0.7% | 0.061 | 0.427 |
 | **`ema_adapt_75` (M2)** | 0.997 | +0.182 | -29.4% | 0.0027 | -18.2% | 0.0375 | -0.8% | 0.0424 | -0.5% | 0.064 | 0.641 |
 | `instab_fsr` (M1) | 1.063 | +0.248 | -3.9% | 0.0032 | -3.0% | 0.0377 | -0.3% | 0.0425 | -0.2% | 0.060 | 0.013 |
+| `instab_relaxed` (M1) | 1.047 | +0.232 | -10.1% | 0.0033 | +0.0% | 0.0377 | -0.3% | 0.0424 | -0.5% | 0.064 | 0.025 |
 | *context:* compact per-frame | 1.255 | +0.440 | +70.4% | — | — | — | — | — | — | — | — |
 | *context:* x4plus per-frame | 1.767 | +0.952 | +268.7% | — | — | — | — | — | — | — | — |
 | *context:* bicubic(LR) | 0.815 | 0 (floor) | — | — | — | — | — | — | — | — | — |
 
-*The calm window's last two rows (`instab_relaxed`, `ema_instab_50`) were still
+*The calm window's last row (`ema_instab_50`, M2+M1) was still
 running when this report was written — the box was carrying four sibling experiments (load avg 20)
-and each metric row costs ~2 min there. `instab_fsr` did land and repeats the jelly
-result exactly (−3.9% excess, −0.3% LPIPS = inside the noise); `instab_relaxed`'s firing rate is
-measured (4.1% of pixels, vs 7.2% on jelly). The M1 verdict rests on the jelly window, where the
-mechanism should have been strongest and was not. `python run_ab.py calm`
+and each metric row costs ~2 min there. Both M1 rows landed and repeat the jelly result
+(−3.9% / −10.1% excess at −0.3% LPIPS = inside the noise). The M1 verdict rests on the jelly
+window anyway, where the mechanism should have been strongest and was not. `python run_ab.py calm`
 regenerates the full row set; `analyze.py` / `plot.py` then rebuild these tables from the JSON.*
 
 ### Why this is not a blur-win
