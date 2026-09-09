@@ -10,7 +10,7 @@ measured with a number instead of vibes?
 |---|---|
 | **Is the project's jelly DRIFT or FLICKER?** | **FLICKER — measured, on both windows.** The temporal error the pipeline ADDS over the content floor is *flat* in frames-since-anchor (calm: slope +0.0002 codes/frame, R²=0.000; high-motion: +0.0059/frame, R²=0.081, trend +0.225 codes ≈ the frame-to-frame noise σ 0.224) and it is *concentrated* in the pixels whose source flips between the propagated warp and the fresh per-frame SR: **12.4× the per-pixel flicker of a stably-propagated pixel on calm, 3.5× on high-motion**. Drift is not the problem. The **hard occlusion switch** is. |
 | **M1 — FSR3.1 luma instability factor** | **NO-GO as a lever.** Standalone it is inside the noise (−3.0% excess flicker with FSR's own velocity gate, +0.3% LPIPS); on top of M2 it buys a little extra steadiness but is worse than plain M2 on tLP and LPIPS. Three structural reasons it does not transfer (§3). **Kept as a free diagnostic** — the port is a working per-pixel oscillation detector. |
-| **M2 — per-pixel motion-adaptive EMA** | **GATED-GO** — the first measured jelly reduction in the project: **excess MC-flicker −37.5% (α=0.5) / −57.6% (α=0.75)** on high-motion, with **LPIPS and DISTS vs the x4plus ceiling BOTH improving** (−3.9% / −1.5%) and sharpness held (var-Lap −1.1%). On calm the win is smaller but the same sign: **−20.5% / −29.4% excess flicker**, tLP −12.1%, LPIPS −0.8%, DISTS −0.7%. Cost: **tOF_true +1.7% (jelly) / +5.2% (calm)** — the same currency as R12-E1's +5.8%, so the same graduation path. Landed **default-OFF** (`stabilizer.STAB_ENABLED = False`; OFF-path parity **0 codes** on both windows). |
+| **M2 — per-pixel motion-adaptive EMA** | **GATED-GO** — the first measured jelly reduction in the project: **excess MC-flicker −37.5% (α=0.5) / −57.6% (α=0.75)** on high-motion, with **LPIPS and DISTS vs the x4plus ceiling BOTH improving** (−3.9% / −1.5%) and sharpness held (var-Lap −1.1%). On calm the win is smaller but the same sign: **−20.7% / −29.6% excess flicker**, tLP −12.3%, LPIPS −0.8%, DISTS −0.6%. Cost: **tOF_true +1.7% (jelly) / +5.2% (calm)** — the same currency as R12-E1's +5.8%, so the same graduation path. Landed **default-OFF** (`stabilizer.STAB_ENABLED = False`; OFF-path parity **0 codes** on both windows). |
 
 Measured on real H.264 with the **same clip and windows as R12-E1** (`web_spike/sd600.mp4`,
 jelly = frames 582–621 mean|MV| 6.58, calm = 437–476), the same scale-3 numpy reconstruction,
@@ -153,9 +153,11 @@ pipeline's resolution, and `(1 − disocclusion)` fed from the pipeline's own oc
 | `instab_relaxed` (gate ×5) | 7.2% | −14.5% | +1.0% | −0.0% | −0.1% |
 | `ema_instab_50` (M1 on top of M2) | 7.5% | −47.2% | −6.3% | −3.5% | +1.7% |
 
-Standalone it is inside the noise. On top of M2 it does add something real — at α_mean 0.339 it
-reaches −47.2% excess where plain M2 interpolated to the same α gives ≈ −39% — but it is
-simultaneously *worse* than plain M2 on tLP (−6.3% vs −8.1%) and LPIPS (−3.5% vs −3.9%). For an
+Standalone it is inside the noise on **both** windows (calm: −3.8% / −10.3% excess at −0.2% LPIPS).
+On top of M2 it does add something real — at α_mean 0.339 it reaches −47.2% excess where plain M2
+interpolated to the same α gives ≈ −39%, and the calm window repeats it (−28.3% at α 0.439 vs ≈ −21%
+interpolated) — but on both windows it is simultaneously *worse* than plain M2 on tLP (−6.3% vs
+−8.1% jelly, −9.3% vs −12.3% calm) and on tOF_true (+15.5% vs +5.2% on calm), at equal LPIPS. For an
 extra 4-deep HD history and a per-pixel branch, that is not a trade worth landing.
 
 **Three structural reasons it does not transfer** (all measured, not assumed):
@@ -219,26 +221,20 @@ the fixed global β=0.85 anchor blend — it is not a re-run of R9-E1's refuted 
 | *context:* x4plus per-frame | 4.208 | +0.543 | +67.3% | 0.0038 | −67.0% | 0.0000 | — | 0.0000 | — | 2.115 | — |
 | *context:* bicubic(LR) | 3.666 | 0 (floor) | — | 0.0000 | — | 0.0788 | +122.8% | 0.0724 | +113.9% | 0.000 | — |
 
-### Results — calm window (talking-head, mean|MV| ~1.1)
+### Results — calm window (talking-head, mean|MV| 0.63)
 
 | sequence | MCLF | excess | Δexcess | tLP | ΔtLP | LPIPS vs x4 | ΔLPIPS | DISTS vs x4 | ΔDISTS | tOF_true | ᾱ |
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | `baseline_hard` (shipping) | 1.073 | +0.258 | — | 0.0033 | — | 0.0378 | — | 0.0426 | — | 0.058 | — |
-| `ema_fixed_50` (naive EMA) | 1.027 | +0.212 | -17.8% | 0.0044 | +33.3% | 0.0441 | +16.7% | 0.0443 | +4.0% | 0.107 | 0.484 |
-| **`ema_adapt_50` (M2)** | 1.020 | +0.205 | -20.5% | 0.0029 | -12.1% | 0.0375 | -0.8% | 0.0423 | -0.7% | 0.061 | 0.427 |
-| **`ema_adapt_75` (M2)** | 0.997 | +0.182 | -29.4% | 0.0027 | -18.2% | 0.0375 | -0.8% | 0.0424 | -0.5% | 0.064 | 0.641 |
-| `instab_fsr` (M1) | 1.063 | +0.248 | -3.9% | 0.0032 | -3.0% | 0.0377 | -0.3% | 0.0425 | -0.2% | 0.060 | 0.013 |
-| `instab_relaxed` (M1) | 1.047 | +0.232 | -10.1% | 0.0033 | +0.0% | 0.0377 | -0.3% | 0.0424 | -0.5% | 0.064 | 0.025 |
-| *context:* compact per-frame | 1.255 | +0.440 | +70.4% | — | — | — | — | — | — | — | — |
-| *context:* x4plus per-frame | 1.767 | +0.952 | +268.7% | — | — | — | — | — | — | — | — |
-| *context:* bicubic(LR) | 0.815 | 0 (floor) | — | — | — | — | — | — | — | — | — |
-
-*The calm window's last row (`ema_instab_50`, M2+M1) was still
-running when this report was written — the box was carrying four sibling experiments (load avg 20)
-and each metric row costs ~2 min there. Both M1 rows landed and repeat the jelly result
-(−3.9% / −10.1% excess at −0.3% LPIPS = inside the noise). The M1 verdict rests on the jelly
-window anyway, where the mechanism should have been strongest and was not. `python run_ab.py calm`
-regenerates the full row set; `analyze.py` / `plot.py` then rebuild these tables from the JSON.*
+| `ema_fixed_50` (naive EMA) | 1.027 | +0.212 | -18.0% | 0.0044 | +33.9% | 0.0441 | +16.5% | 0.0443 | +4.0% | 0.107 | 0.484 |
+| **`ema_adapt_50` (M2)** | 1.020 | +0.205 | -20.7% | 0.0029 | -12.3% | 0.0375 | -0.8% | 0.0423 | -0.6% | 0.061 | 0.427 |
+| **`ema_adapt_75` (M2)** | 0.997 | +0.182 | -29.6% | 0.0027 | -16.2% | 0.0375 | -0.9% | 0.0424 | -0.4% | 0.064 | 0.641 |
+| `instab_fsr` (M1) | 1.063 | +0.248 | -3.8% | 0.0032 | -0.4% | 0.0377 | -0.2% | 0.0425 | -0.1% | 0.060 | 0.013 |
+| `instab_relaxed` (M1) | 1.047 | +0.232 | -10.3% | 0.0033 | +1.5% | 0.0377 | -0.3% | 0.0424 | -0.4% | 0.064 | 0.025 |
+| `ema_instab_50` (M2+M1) | 1.000 | +0.185 | -28.3% | 0.0030 | -9.3% | 0.0375 | -0.9% | 0.0423 | -0.6% | 0.067 | 0.439 |
+| *context:* compact per-frame | 1.255 | +0.440 | +70.2% | 0.0034 | +2.9% | 0.0350 | -7.5% | 0.0455 | +6.9% | 0.056 | — |
+| *context:* x4plus per-frame | 1.767 | +0.952 | +268.3% | 0.0040 | +23.2% | 0.0000 | — | 0.0000 | — | 0.053 | — |
+| *context:* bicubic(LR) | 0.815 | 0 (floor) | — | 0.0000 | -100.0% | 0.0889 | +135.2% | 0.0849 | +99.4% | 0.000 | — |
 
 ### Why this is not a blur-win
 
