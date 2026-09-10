@@ -211,7 +211,8 @@ def detect_cut_indices(frames, **kw) -> List[int]:
     """Cut indices for an in-memory list of (ptype, img, mvs) frames (display order)."""
     det = StreamingCutDetector(**kw)
     cuts = []
-    for i, (ptype, img, _mvs) in enumerate(frames):
+    for i, _f in enumerate(frames):            # R12-E2: 4-tuple-safe (optional QP at [3])
+        ptype, img = _f[0], _f[1]
         if det.update(i, ptype, img):
             cuts.append(i)
     return cuts

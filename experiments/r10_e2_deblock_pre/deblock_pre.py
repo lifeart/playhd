@@ -65,13 +65,18 @@ def blockiness(rgb, q=8):
 
 
 def should_deblock(rgb, cfg, qp=None):
-    """Gate: True iff the frame is heavily-enough compressed to benefit from deblocking."""
+    """Gate: True iff the frame is heavily-enough compressed to benefit from deblocking.
+
+    R12 review: the 'qp' gate is STRICT -- qp=None (no venc_params / non-H.264 source) means
+    SKIP, never a silent fall-through to the blockiness proxy (the proxy is the R10-refuted
+    unreliable gate; it conflates texture with compression and mis-fired on light content).
+    Use gate='blockiness' EXPLICITLY if the proxy is genuinely wanted."""
     gate = cfg.get("gate", "qp")
     if gate == "always":
         ok = True
-    elif gate == "qp" and qp is not None:
-        ok = qp >= cfg.get("qp_min", 30)
-    else:  # blockiness proxy (qp unavailable in this synthetic harness; real pipeline has QP)
+    elif gate == "qp":
+        ok = (qp is not None) and qp >= cfg.get("qp_min", 30)
+    else:  # gate == "blockiness": the explicit LR proxy (synthetic harnesses without QP)
         ok = blockiness(rgb) >= cfg.get("block_min", 1.30)
     if not ok:
         return False
@@ -95,11 +100,29 @@ def deblock_neural(rgb, model_fname="scunet_color_real_psnr.pth"):
     return np.ascontiguousarray(out)
 
 
+_LOAD_FAILED = set()   # model_fname -> warned+disabled (R12 review: no mid-render crash, no silence)
+
+
 def apply(rgb_lr, cfg, qp=None):
     """Preprocessor entrypoint. cfg None/empty -> identity (byte-identical OFF path).
-    Returns a (possibly) deblocked uint8 RGB at the SAME size as the input LR."""
+    Returns a (possibly) deblocked uint8 RGB at the SAME size as the input LR.
+
+    R12 review: a loader failure (missing gitignored SCUNet weights / spandrel not installed)
+    WARNS ONCE and no-ops instead of killing the whole render mid-clip with FileNotFoundError
+    (the repo ships code-only; a fresh clone has no weights)."""
     if not cfg:
         return rgb_lr
     if not should_deblock(rgb_lr, cfg, qp=qp):
         return rgb_lr
-    return deblock_neural(rgb_lr, cfg.get("model", "scunet_color_real_psnr.pth"))
+    model = cfg.get("model", "scunet_color_real_psnr.pth")
+    if model in _LOAD_FAILED:
+        return rgb_lr
+    try:
+        return deblock_neural(rgb_lr, model)
+    except (FileNotFoundError, ImportError, OSError) as e:
+        _LOAD_FAILED.add(model)
+        import sys
+        print(f"[deblock_pre] WARNING: cannot load '{model}' ({type(e).__name__}: {e}) -> "
+              f"deblock DISABLED for this run (frames pass through unchanged)",
+              file=sys.stderr, flush=True)
+        return rgb_lr

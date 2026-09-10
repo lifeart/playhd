@@ -246,7 +246,8 @@ class BicubicProducer:
             if self.w_hd is None:
                 h_lr, w_lr = chunk[0][1].shape[:2]
                 self.w_hd, self.h_hd = w_lr * self.scale, h_lr * self.scale
-            for (_pt, lr_rgb, _mvs) in chunk:
+            for _f in chunk:                       # R12-E2: 4-tuple-safe (optional QP at [3])
+                lr_rgb = _f[1]
                 yield cv2.resize(lr_rgb, (self.w_hd, self.h_hd),
                                  interpolation=cv2.INTER_CUBIC)
 

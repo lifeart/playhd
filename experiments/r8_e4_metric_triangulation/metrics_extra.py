@@ -75,5 +75,35 @@ def selfcheck():
     }
 
 
+# --------------------------------------------------------------------------- #
+# R12-E3 adoption: VMAF-NEG guardrail, re-exported so every harness that already
+# does `import metrics_extra` also gets MX.vmaf_neg / MX.vmaf_neg_single /
+# MX.vmaf_available alongside DISTS+LPIPS. Single source of truth stays in
+# experiments/r12_e3_quality_probes/vmaf_neg.py. USE AS A GUARDRAIL COLUMN ONLY
+# (anti-hallucination), never an optimisation target (VMAF-NEG is itself gameable).
+# --------------------------------------------------------------------------- #
+import os as _os   # noqa: E402
+_VMAF_FILE = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                           "r12_e3_quality_probes", "vmaf_neg.py")
+try:
+    # R12 review [18]: load the exact FILE via importlib instead of sys.path.insert -- the
+    # r12_e3 dir also holds generic names (analyze.py, run_ab.py) that a path insert would
+    # let shadow other harnesses' imports as a side effect of importing metrics_extra.
+    import importlib.util as _ilu   # noqa: E402
+    _spec = _ilu.spec_from_file_location("_r12e3_vmaf_neg", _VMAF_FILE)
+    _vm = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_vm)
+    vmaf_neg, vmaf_neg_single, vmaf_available = _vm.vmaf_neg, _vm.vmaf_neg_single, _vm.available
+except Exception as _e:   # loud (no silent swallow): the guardrail column is simply unavailable
+    _VMAF_IMPORT_ERR = _e
+    def vmaf_neg(*_a, **_k):
+        raise RuntimeError(f"vmaf_neg unavailable: {_VMAF_IMPORT_ERR!r}")
+    def vmaf_neg_single(*_a, **_k):
+        raise RuntimeError(f"vmaf_neg unavailable: {_VMAF_IMPORT_ERR!r}")
+    def vmaf_available():
+        return False
+
+
 if __name__ == "__main__":
     print("[selfcheck]", selfcheck())
+    print("[vmaf] available:", vmaf_available())
